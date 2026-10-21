@@ -10,11 +10,19 @@
  * process it is in. steamclient.so calls getpid through its PLT with a call instruction (22 sites, no tail call, in
  * build 1788652215), so the return address is inside steamclient.so.
  *
+ * steamclient.so also signals the pid it got: syscall(SYS_tgkill, getpid(), tid, 0) tells it whether one of its threads
+ * lives, and kill(pid, 0) whether a process it shares memory with does. The guest knows no macOS pid (ESRCH), so every
+ * thread looked dead. A game server, whose engine runs in the game's process (SteamGameServer_Init, as Rocket League's
+ * Steam build calls), then freed what its threads still used and crashed. So the library also gives the guest pid
+ * back to the signals steamclient.so sends to the macOS pid it was given.
+ *
  * Outside LKD (no lkd_host_pid file) the guest pid is the real pid and is returned unchanged. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <link.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
@@ -57,4 +65,33 @@ pid_t getpid(void)
     if (host <= 0) host = pid;
     atomic_store_explicit(&g_cache, (uint64_t)(uint32_t)pid << 32 | (uint32_t)host, memory_order_relaxed);
     return host;
+}
+
+/* The guest pid of this process when pid is the macOS pid getpid() gave steamclient.so in it, else pid. */
+static pid_t guest_pid(pid_t pid)
+{
+    pid_t self = (pid_t)syscall(SYS_getpid);
+    uint64_t c = atomic_load_explicit(&g_cache, memory_order_relaxed);
+    return pid > 0 && (pid_t)(c >> 32) == self && (pid_t)(uint32_t)c == pid ? self : pid;
+}
+
+long syscall(long number, ...)
+{
+    static long (*next)(long, ...);
+    if (!next) next = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+    va_list ap;
+    va_start(ap, number);
+    long a[6];
+    for (int i = 0; i < 6; i++) a[i] = va_arg(ap, long);
+    va_end(ap);
+    if (number == SYS_tgkill && from_steamclient(__builtin_return_address(0))) a[0] = guest_pid((pid_t)a[0]);
+    return next(number, a[0], a[1], a[2], a[3], a[4], a[5]);
+}
+
+int kill(pid_t pid, int sig)
+{
+    static int (*next)(pid_t, int);
+    if (!next) next = (int (*)(pid_t, int))dlsym(RTLD_NEXT, "kill");
+    if (from_steamclient(__builtin_return_address(0))) pid = guest_pid(pid);
+    return next(pid, sig);
 }
