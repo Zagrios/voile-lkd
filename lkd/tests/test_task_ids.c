@@ -315,8 +315,8 @@ LT_TEST(prctl_options)
     LT_EQ(SC2(prctl, LX_PR_GET_TID_ADDRESS, P(&addr)), 0);
     LT_EQ(addr, 0xdead0);
     T->clear_child_tid = 0;
-    LT_ERRNO(SC1(prctl, LX_PR_GET_SECCOMP), LX_EINVAL);  /* modeled kernel without CONFIG_SECCOMP */
-    LT_ERRNO(SC2(prctl, LX_PR_SET_SECCOMP, 1), LX_EINVAL);
+    LT_EQ(SC1(prctl, LX_PR_GET_SECCOMP), LX_SECCOMP_MODE_DISABLED); /* test_task_seccomp.c sets the modes */
+    LT_ERRNO(SC2(prctl, LX_PR_SET_SECCOMP, 3), LX_EINVAL);
     LT_EQ(SC2(prctl, LX_PR_CAPBSET_READ, 0), 1);
     LT_ERRNO(SC2(prctl, LX_PR_CAPBSET_READ, 41), LX_EINVAL);
     LT_ERRNO(SC2(prctl, LX_PR_CAPBSET_DROP, 0), LX_EPERM);

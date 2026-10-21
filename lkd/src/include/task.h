@@ -140,6 +140,11 @@ struct lkd_task {
 
     struct lkd_ptrace_task ptrace; /* ptrace link, see ptrace.h */
     int exit_code;                 /* argument of sys_exit for this thread */
+
+    /* seccomp (task module, src/task/seccomp.c): the filters this thread runs, newest first. A filter is
+     * shared, refcounted, with the threads and children created after it was installed. */
+    struct lkd_seccomp_filter *_Atomic seccomp_filter;
+    _Atomic uint8_t seccomp_mode;  /* LX_SECCOMP_MODE_* */
 };
 
 /* ---- Registry snapshots (readable for any process of the family) ------------------------------- */
@@ -257,6 +262,17 @@ uint32_t lkd_pid_peek(void);
  * exiting thread. */
 int64_t lkd_task_do_exit(lkd_task *t, int exit_code);
 int64_t lkd_task_do_exit_group(lkd_task *t, int wait_status);
+
+/* seccomp (task module), as __secure_computing in kernel/seccomp.c. lkd_seccomp_enter runs t's filters on
+ * the syscall rq before its handler, OWNER, at the instruction pointer the engine reports. It returns 0 when
+ * the call runs, 1 when it is skipped: *ret is then what the syscall returns (a -errno, the syscall number
+ * for SECCOMP_RET_TRAP, whose forced SIGSYS is queued, or LKD_RET_EXIT_THREAD/GROUP when the filter kills).
+ * lkd_seccomp_fork gives a new task its creator's mode and filters (copy_seccomp); lkd_seccomp_release drops
+ * a freed task's filters; lkd_seccomp_status reports the mode and filter count of /proc/<pid>/status. */
+int lkd_seccomp_enter(lkd_task *t, const lkd_sysreq *rq, int64_t *ret);
+void lkd_seccomp_fork(lkd_task *child, lkd_task *parent);
+void lkd_seccomp_release(lkd_task *t);
+void lkd_seccomp_status(lkd_task *t, int *mode, int *filters);
 
 /* One wait notification, produced by the task module for zombies and by the ptrace module for stops. */
 struct lkd_wait_event {

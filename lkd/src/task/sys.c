@@ -850,8 +850,9 @@ LKD_SYSCALL(prctl)
     case LX_PR_GET_NAME:
         return lkd_user_write(a2, t->comm, LKD_COMM_LEN) ? -LX_EFAULT : 0;
     case LX_PR_GET_SECCOMP:
+        return task_seccomp_prctl_get(t);
     case LX_PR_SET_SECCOMP:
-        return -LX_EINVAL; /* modeled kernel: CONFIG_SECCOMP off (no syscall filter can be enforced) */
+        return task_seccomp_prctl_set(t, a2, a3);
     case LX_PR_CAPBSET_READ:
         if (a2 > CAP_LAST_CAP) return -LX_EINVAL;
         return (p->cred.cap_bset >> a2) & 1;

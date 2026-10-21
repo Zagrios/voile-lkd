@@ -117,6 +117,11 @@ lkd_disp lkd_syscall(lkd_task *t, const lkd_sysreq *in, int64_t *rax)
         if (e > 0) { skipped = 1; ret = skip_ret; }
         else { atomic_store(&t->cur_nr, (int64_t)rq.nr); memcpy(t->cur_args, rq.a, sizeof t->cur_args); }
     }
+    /* syscall_trace_enter: seccomp filters the call the tracer may have rewritten. */
+    if (!skipped && atomic_load(&t->seccomp_mode) != LX_SECCOMP_MODE_DISABLED) {
+        int64_t filtered = 0;
+        if (lkd_seccomp_enter(t, &rq, &filtered)) { skipped = 1; ret = filtered; }
+    }
     if (lkd_trace_level() >= 2) lkd_trace_entry(t, &rq);
 
     if (!skipped) ret = lkd_dispatch(t, &rq);

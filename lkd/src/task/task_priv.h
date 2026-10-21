@@ -9,6 +9,7 @@
  *   clone.c    clone, clone3, fork, vfork and the fork hooks
  *   wait.c     wait4, waitid, zombies, reparenting, SIGCHLD
  *   exec.c     execve, execveat, lkd_exec_prepare, exec hooks
+ *   seccomp.c  seccomp, prctl(PR_SET_SECCOMP/PR_GET_SECCOMP) and the filters every syscall runs through
  */
 #ifndef LKD_TASK_PRIV_H
 #define LKD_TASK_PRIV_H
@@ -183,5 +184,11 @@ static inline void lx_rusage_add(struct lx_rusage *a, const struct lx_rusage *b)
 }
 
 /* New API proposed to core for task.h (docs/requests/task-2.md); implemented here. */
+
+/* ---- seccomp (seccomp.c) ------------------------------------------------------------------------- */
+
+void task_seccomp_register(void);
+int64_t task_seccomp_prctl_get(lkd_task *t);
+int64_t task_seccomp_prctl_set(lkd_task *t, uint64_t mode, uint64_t ufilter);
 
 #endif /* LKD_TASK_PRIV_H */

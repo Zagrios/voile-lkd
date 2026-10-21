@@ -282,3 +282,7 @@ LKD_WEAK int64_t lkd_guest_clock_ns(int clockid)
     return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 LKD_WEAK uint32_t lkd_pid_peek(void) { return 0; }
+LKD_WEAK int lkd_seccomp_enter(lkd_task *t, const lkd_sysreq *rq, int64_t *ret) { (void)t; (void)rq; (void)ret; return 0; }
+LKD_WEAK void lkd_seccomp_fork(lkd_task *child, lkd_task *parent) { (void)child; (void)parent; }
+LKD_WEAK void lkd_seccomp_release(lkd_task *t) { (void)t; }
+LKD_WEAK void lkd_seccomp_status(lkd_task *t, int *mode, int *filters) { (void)t; *mode = 0; *filters = 0; }

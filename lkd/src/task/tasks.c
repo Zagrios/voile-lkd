@@ -225,6 +225,7 @@ static lkd_task *task_alloc_pid(lkd_task *parent, uint64_t clone_flags, int32_t 
         /* copy_process: the alternate signal stack is dropped for CLONE_VM without CLONE_VFORK. */
         if ((clone_flags & (LX_CLONE_VM | LX_CLONE_VFORK)) != LX_CLONE_VM) t->altstack = parent->altstack;
         else { t->altstack.ss_sp = 0; t->altstack.ss_size = 0; t->altstack.ss_flags = 2; /* SS_DISABLE */ }
+        lkd_seccomp_fork(t, parent); /* copy_seccomp */
     } else {
         t->altstack.ss_flags = 2; /* SS_DISABLE */
     }
@@ -278,6 +279,7 @@ void lkd_task_put(lkd_task *t)
     if (atomic_fetch_sub(&pr->refs, 1) == 1) proc_free(pr);
     if (t->wake_rd >= 0) close(t->wake_rd);
     if (t->wake_wr >= 0) close(t->wake_wr);
+    lkd_seccomp_release(t);
     t->magic = 0;
     free(t);
 }

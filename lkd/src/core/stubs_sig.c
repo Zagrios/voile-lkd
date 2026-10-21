@@ -78,3 +78,9 @@ LKD_WEAK void lkd_sig_wake_hook(lkd_task *t) { (void)t; }
 LKD_WEAK int lkd_sig_task_stopped(lkd_task *t) { (void)t; return 0; }
 LKD_WEAK size_t lkd_sig_exec_export(lkd_task *t, void *buf, size_t cap) { (void)t; (void)buf; (void)cap; return 0; }
 LKD_WEAK int lkd_sig_exec_import(lkd_task *t, const void *buf, size_t len) { (void)t; (void)buf; return len ? -LX_EINVAL : 0; }
+LKD_WEAK void lkd_sig_force_sync(lkd_task *t, const struct lx_siginfo *info)
+{
+    lkd_log("forced signal with no sig module: tid %d signal %d code %d", t ? t->tid : 0,
+            info ? info->si_signo : 0, info ? info->si_code : 0);
+    abort();
+}

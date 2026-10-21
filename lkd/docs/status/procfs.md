@@ -39,7 +39,7 @@ Dans la construction complète (`cmake --build -- -k 0` puis `tools/run_tests.sh
 
 - stat : `rocket-hyperlinux-20260928/linux-reference/loader-trace/ge-eac-120s-threads.txt:17`. Même nombre de champs (52), mêmes champs fixés à 0 (itrealvalue, kstkesp, kstkeip, nswap, cnswap). Écarts : `flags` (4194560 chez Linux : PF_RANDOMIZE et autres ; LKD met seulement PF_EXITING, pas d'ASLR), `tty_nr` 0 et `tty_pgrp` -1 (aucun terminal de contrôle suivi), `processor` (voir lacunes), `start_data`... viennent de la disposition rapportée par le moteur.
 - maps : `qemu-neptune-graphics-20260930/game-query-fix-20260930T211549Z/outputs/game-process-maps.txt`. Le nom commence au décalage 73 (748 lignes mesurées sur 748), ligne anonyme finie par un espace, `/memfd:nom (deleted)`, `[heap]`, `[vdso]`. Le test applique le même vérificateur de colonnes aux lignes enregistrées et aux lignes de LKD. Écart : LKD fusionne comme Linux les VMA anonymes voisines (mm).
-- status : `linux-reference/pid1-control/pid1-before.txt` (noyau 7.0, x86-64). Mêmes clés dans le même ordre ; absentes chez LKD : exactement `Seccomp` et `Seccomp_filters` (noyau modélisé sans CONFIG_SECCOMP, `task-2.md` point 9). Largeur de 8 colonnes des champs Vm*, 16 chiffres hexadécimaux des ensembles de signaux : identiques. Le test vérifie ces trois points.
+- status : `linux-reference/pid1-control/pid1-before.txt` (noyau 7.0, x86-64). Mêmes clés dans le même ordre, `Seccomp` et `Seccomp_filters` compris (mode et nombre de filtres du thread, `seccomp.c` du module task). Largeur de 8 colonnes des champs Vm*, 16 chiffres hexadécimaux des ensembles de signaux : identiques. Le test vérifie ces trois points.
 
 ## Source de chaque champ de `/proc/cpuinfo`
 

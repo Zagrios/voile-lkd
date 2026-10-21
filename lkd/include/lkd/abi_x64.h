@@ -1231,6 +1231,58 @@ struct lx_mmsghdr { struct lx_msghdr msg_hdr; uint32_t msg_len; uint32_t _pad; }
 #define LX_PTRACE_SYSCALL_INFO_EXIT 2
 #define LX_PTRACE_SYSCALL_INFO_SECCOMP 3
 #define LX_AUDIT_ARCH_X86_64 0xc000003eu
+
+/* seccomp(2) (include/uapi/linux/seccomp.h) and the classic BPF it runs (include/uapi/linux/filter.h,
+ * bpf_common.h). */
+#define LX_SECCOMP_MODE_DISABLED 0
+#define LX_SECCOMP_MODE_STRICT 1
+#define LX_SECCOMP_MODE_FILTER 2
+#define LX_SECCOMP_SET_MODE_STRICT 0
+#define LX_SECCOMP_SET_MODE_FILTER 1
+#define LX_SECCOMP_GET_ACTION_AVAIL 2
+#define LX_SECCOMP_GET_NOTIF_SIZES 3
+#define LX_SECCOMP_FILTER_FLAG_TSYNC (1u << 0)
+#define LX_SECCOMP_FILTER_FLAG_LOG (1u << 1)
+#define LX_SECCOMP_FILTER_FLAG_SPEC_ALLOW (1u << 2)
+#define LX_SECCOMP_FILTER_FLAG_NEW_LISTENER (1u << 3)
+#define LX_SECCOMP_FILTER_FLAG_TSYNC_ESRCH (1u << 4)
+#define LX_SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV (1u << 5)
+#define LX_SECCOMP_RET_KILL_PROCESS 0x80000000u
+#define LX_SECCOMP_RET_KILL_THREAD 0x00000000u
+#define LX_SECCOMP_RET_TRAP 0x00030000u
+#define LX_SECCOMP_RET_ERRNO 0x00050000u
+#define LX_SECCOMP_RET_USER_NOTIF 0x7fc00000u
+#define LX_SECCOMP_RET_TRACE 0x7ff00000u
+#define LX_SECCOMP_RET_LOG 0x7ffc0000u
+#define LX_SECCOMP_RET_ALLOW 0x7fff0000u
+#define LX_SECCOMP_RET_ACTION_FULL 0xffff0000u
+#define LX_SECCOMP_RET_DATA 0x0000ffffu
+#define LX_SYS_SECCOMP 1 /* si_code of the SIGSYS a SECCOMP_RET_TRAP sends */
+#define LX_BPF_MAXINSNS 4096
+#define LX_BPF_MEMWORDS 16
+
+struct lx_sock_filter {
+    uint16_t code;
+    uint8_t jt, jf;
+    uint32_t k;
+};
+struct lx_sock_fprog {
+    uint16_t len;
+    uint8_t _pad[6];
+    uint64_t filter; /* guest address of len struct lx_sock_filter */
+};
+struct lx_seccomp_data {
+    int32_t nr;
+    uint32_t arch;
+    uint64_t instruction_pointer;
+    uint64_t args[6];
+};
+struct lx_seccomp_notif_sizes {
+    uint16_t seccomp_notif, seccomp_notif_resp, seccomp_data;
+};
+_Static_assert(sizeof(struct lx_sock_filter) == 8, "sock_filter");
+_Static_assert(sizeof(struct lx_sock_fprog) == 16, "sock_fprog");
+_Static_assert(sizeof(struct lx_seccomp_data) == 64, "seccomp_data");
 #define LX_NT_PRSTATUS 1
 #define LX_NT_PRFPREG 2
 #define LX_NT_PRPSINFO 3

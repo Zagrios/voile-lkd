@@ -1,8 +1,7 @@
 /* init.c: registration of the task module's syscalls.
  *
  * Deliberately not registered (the dispatcher answers -ENOSYS, counted): rseq (glibc falls back),
- * seccomp (modeled kernel without CONFIG_SECCOMP), pidfd_open (no pidfds), modify_ldt (no LDT in the
- * engine), timer_create/timer_settime/timer_gettime/timer_getoverrun/timer_delete (POSIX timers not
+ * pidfd_open (no pidfds), modify_ldt (no LDT in the engine), timer_create/timer_settime/timer_gettime/timer_getoverrun/timer_delete (POSIX timers not
  * implemented yet), ioprio_get/ioprio_set. See docs/status/task.md. */
 #include "task_priv.h"
 
@@ -24,4 +23,5 @@ void lkd_task_init(void)
     task_wait_register();
     task_exec_register();
     task_wake_register();
+    task_seccomp_register();
 }

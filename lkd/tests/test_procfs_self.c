@@ -204,8 +204,8 @@ LT_TEST(status_fields)
     LT_STREQ(fline(s, "voluntary_ctxt_switches"), "\t42");
     LT_STREQ(fline(s, "nonvoluntary_ctxt_switches"), "\t7");
     LT_CHECK(strstr(fline(s, "SigQ"), "/") != NULL);
-    LT_CHECK(field(s, "Seccomp") == NULL);                      /* no CONFIG_SECCOMP in the modeled kernel */
-    LT_CHECK(field(s, "Seccomp_filters") == NULL);
+    LT_STREQ(fline(s, "Seccomp"), "\t0");                       /* test_task_seccomp.c installs filters */
+    LT_STREQ(fline(s, "Seccomp_filters"), "\t0");
     LT_STREQ(fline(s, "Kthread"), "\t0");
     free(s);
     /* the thread view: Pid is the tid, Tgid stays the process */
@@ -459,8 +459,7 @@ LT_TEST(maps_golden_columns)
 
 /* Golden comparison of status against a status recorded on real Linux
  * (rocket-hyperlinux-20260928/linux-reference/pid1-control/pid1-before.txt, kernel 7.0 OrbStack x86-64):
- * the same keys in the same order. Our status omits exactly Seccomp and Seccomp_filters (the modeled
- * kernel has no CONFIG_SECCOMP) and the line widths of the Vm* fields are the same. */
+ * the same keys in the same order, and the line widths of the Vm* fields are the same. */
 LT_TEST(status_golden_keys)
 {
     static const char *const gkeys[] = { "Name", "Umask", "State", "Tgid", "Ngid", "Pid", "PPid", "TracerPid", "Uid", "Gid",
@@ -474,7 +473,6 @@ LT_TEST(status_golden_keys)
     char *s = slurp("/proc/self/status", &len);
     size_t gi = 0;
     int missing = 0, order_ok = 1;
-    int seen_missing[2] = { 0, 0 };
     for (size_t k = 0; k < sizeof gkeys / sizeof gkeys[0]; k++) {
         char key[64];
         snprintf(key, sizeof key, "%s:\t", gkeys[k]);
@@ -482,16 +480,13 @@ LT_TEST(status_golden_keys)
         int is_start = at && (at == s || at[-1] == '\n');
         if (!is_start) {
             missing++;
-            if (!strcmp(gkeys[k], "Seccomp")) seen_missing[0] = 1;
-            if (!strcmp(gkeys[k], "Seccomp_filters")) seen_missing[1] = 1;
             continue;
         }
         size_t pos = (size_t)(at - s);
         if (pos < gi) order_ok = 0;
         gi = pos;
     }
-    LT_EQ(missing, 2);
-    LT_CHECK(seen_missing[0] && seen_missing[1]);
+    LT_EQ(missing, 0);
     LT_CHECK(order_ok);
     /* widths: "VmRSS:\t     3708 kB" is the recorded shape; ours has the same length for a value < 1e8 kB */
     static const char *const golden_vm = "VmRSS:\t    3708 kB";

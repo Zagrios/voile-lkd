@@ -460,6 +460,21 @@ void lkd_fault(lkd_task *t, int signo, int si_code, uint64_t addr, uint64_t err,
     sig_wakeset_run(&ws);
 }
 
+void lkd_sig_force_sync(lkd_task *t, const struct lx_siginfo *info)
+{
+    if (!t || !info || info->si_signo < 1 || info->si_signo > LX_NSIG) return;
+    struct lkd_sigproc *sp = sig_proc(t->proc);
+    struct sig_wakeset ws = { 0 };
+    sig_lock(sp);
+    struct sig_task *st = sig_task_of(t);
+    st->fault_err = 0;
+    st->fault_trapno = 0;
+    st->fault_addr = 0;
+    sig_force_locked(t, sp, info->si_signo, info, &ws);
+    sig_unlock(sp);
+    sig_wakeset_run(&ws);
+}
+
 /* ---- /proc status ----------------------------------------------------------------------------- */
 
 int lkd_sig_status(lkd_task *t, struct lkd_sig_status *out)

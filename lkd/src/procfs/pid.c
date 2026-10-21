@@ -111,6 +111,7 @@ struct snap {
     struct lx_rlimit rl[LX_RLIM_NLIMITS];
     uint32_t personality;
     uint8_t no_new_privs, dumpable;
+    int seccomp_mode, seccomp_filters;
     int32_t pid, ppid, pgid, sid, nthreads, exit_signal;
     uint64_t start_mono_ns;
     int has_layout;
@@ -141,6 +142,7 @@ static void snap_get(lkd_task *tk, struct snap *s)
     s->personality = p->personality;
     s->no_new_privs = p->no_new_privs;
     s->dumpable = p->dumpable;
+    lkd_seccomp_status(tk, &s->seccomp_mode, &s->seccomp_filters);
     s->pid = p->pid; s->ppid = p->ppid; s->pgid = p->pgid; s->sid = p->sid;
     s->nthreads = p->nthreads;
     s->exit_signal = p->exit_signal;
@@ -274,9 +276,9 @@ static void render_status(const struct lkd_procfs_wire *rq, const struct snap *s
               (unsigned long long)s->cred.cap_inh, (unsigned long long)s->cred.cap_perm,
               (unsigned long long)s->cred.cap_eff, (unsigned long long)s->cred.cap_bset,
               (unsigned long long)s->cred.cap_amb);
-    /* No Seccomp lines: the modeled kernel has no CONFIG_SECCOMP (docs/requests/task-2.md point 9).
-     * prctl(PR_GET_SPECULATION_CTRL) answers "not affected" in the task module. */
+    /* prctl(PR_GET_SPECULATION_CTRL) answers "not affected" in the task module. */
     pb_printf(b, "NoNewPrivs:\t%d\n", s->no_new_privs ? 1 : 0);
+    pb_printf(b, "Seccomp:\t%d\nSeccomp_filters:\t%d\n", s->seccomp_mode, s->seccomp_filters);
     pb_puts(b, "Speculation_Store_Bypass:\tnot vulnerable\nSpeculationIndirectBranch:\tnot affected\n");
     pb_puts(b, "Cpus_allowed:\t");
     int ncpu = lkd_procfs_ncpu();

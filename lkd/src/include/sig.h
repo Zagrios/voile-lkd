@@ -65,6 +65,11 @@ void lkd_sig_set_temp_mask(lkd_task *t, uint64_t mask);
 /* Permanent mask change (rt_sigprocmask). Removes SIGKILL/SIGSTOP. */
 void lkd_sig_set_mask(lkd_task *t, uint64_t mask);
 
+/* A forced synchronous signal that is not an engine fault, with the complete siginfo (the SIGSYS of
+ * seccomp's SECCOMP_RET_TRAP, force_sig_seccomp). OWNER. As lkd_fault: a blocked or ignored signal gets
+ * its default action back, err and trapno of the frame's sigcontext are 0. */
+void lkd_sig_force_sync(lkd_task *t, const struct lx_siginfo *info);
+
 /* ---- Lifecycle hooks used by the task module --------------------------------------------------- */
 
 /* New thread or process: copy the mask, share or copy the actions per clone flags (CLONE_SIGHAND shares;
