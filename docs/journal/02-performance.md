@@ -669,3 +669,46 @@ here. Startup unchanged (20.7 s). In fullscreen, submission → display drops to
 
 To look into: on the external 240 Hz display (XG27AQWMG), wsd displays no more than 173 to 179 fps, with or without pacing,
 even when the game submits more.
+
+## Dead by Daylight reads /proc/self/status every frame (October 23)
+
+Runtime Voile `v26.3.0-18`, Dead by Daylight (Epic, UE5, EAC) on the Linux engine, 240 Hz screen (XG27AQWMG). Tools:
+`FEXDARWIN_PROFILE=1`, `engine-top`, and 8 thread dumps 4 s apart (`FEXDARWIN_DUMP_DIR`, then `touch dump-request`).
+
+Before: in game, a frame every 25 to 28 ms (35 to 40 fps), GPU 8 to 13%. The `GameThread` used 85 to 90% of a core
+and spent 6 to 8.7 s of every 10 s inside `read`, running, not waiting. System time of the game process: 7 to 10 s per
+10 s.
+
+Cause. 7 dumps of 8 caught the `GameThread` in `read` → `pf_generate_pid` → `lkd_mm_stats`: 5 in `resident_bytes`
+(`mach_vm_region`, `mincore`), 2 in `vt_next` (the walk of the VMAs itself). The Wine frames under it are
+`NtQueryInformationProcess(ProcessVmCounters)` → `fill_vm_counters`, which reads `/proc/self/status`: the game calls
+`GetProcessMemoryInfo` every frame. `lkd_mm_stats` walked every VMA (`vt_next` descends from the root, so the walk is
+O(n log n)) and asked the host for the residency of every host region, under the mmap lock. MEASURED in a native test:
+19.5 ms to walk 40,000 host regions with `mach_vm_region`, 0.48 us for one `task_info(TASK_VM_INFO)`. The 100 ms RSS
+cache never served, because each mmap or munmap of the game invalidated it. The lock also held the other threads: mmap
+took 4.4 ms on average, munmap 1 ms, and every munmap walked all VMAs again for VmPeak (`hiwater_before_unmap`).
+
+Fix (voile-lkd `fb0a9af`):
+
+- RSS is the host process's resident memory (`TASK_VM_INFO`: `internal` as RssAnon, the rest as RssFile, RssShmem 0).
+  It includes the engine's own memory (FEX's code cache, LKD), a few hundred MiB for a game of several GiB. The 100 ms
+  cache stays, so `stat` and `status` read back to back agree.
+- The VMA tree keeps the bytes of all VMAs and of the stack, exec and data ones at every insertion, removal and bound
+  change, and around a change of prot or label in place (`vt_account`), as Linux keeps `total_vm`, `stack_vm`,
+  `exec_vm` and `data_vm` (`vm_stat_account`). VmLck is `locked_bytes`. The VMA holding `start_stack` moves to the
+  stack at read time. `vt_check` compares the counters with a walk; test `test_mm_misc` case
+  `vm_counters_follow_the_tree`.
+
+After, same kind of session: a frame every 16.7 ms (60 fps, the game's own limit: the `GameThread` now sleeps 6 to 7 s
+per 10 s in `pselect6`), `GameThread` at 30 to 35% of a core, system time 3.5 to 4.3 s per 10 s, GPU 37 to 40%,
+munmap about 10 us. The user confirmed in game that it runs much better.
+
+Left as they are:
+
+- Hitches of 0.4 to 1.5 s: 13 windows of 120 frames out of 42 hold a frame above 100 ms (27 of 47 before). Loading or
+  shader compilation, not investigated yet.
+- `RHIThread` and `GameThread` still spin in `NtYieldExecution` (`getrusage` + `sched_yield`, 2.5 to 3.3 million
+  `getrusage` calls per 10 s on `RHIThread`), as decided for Rocket League.
+
+Reading Wine's Unix frames in a dump: the printed offset is a file offset, and `ntdll.so` and `win32u.so` map their
+code 0x4000 above it (LOAD segment), so add 0x4000 before looking the address up with `nm`.
