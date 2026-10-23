@@ -26,7 +26,7 @@ enum {
   WSD_HELLO = 1,           /* wsd_hello */
   WSD_WINDOW_CREATE = 2,   /* wsd_window_create + UTF-8 title (rest of payload) */
   WSD_WINDOW_DESTROY = 3,  /* wsd_window */
-  WSD_WINDOW_SHOW = 4,     /* wsd_window_flag (value: 1 show, 0 hide) */
+  WSD_WINDOW_SHOW = 4,     /* wsd_window_flag (value: 1 show and activate, 2 show without activating, 0 hide) */
   WSD_WINDOW_FULLSCREEN = 5, /* wsd_window_flag (value: 1 on, 0 off) */
   WSD_CURSOR_VISIBLE = 6,  /* wsd_window_flag (window ignored, value: visible) */
   WSD_CURSOR_CLIP = 7,     /* wsd_cursor_clip */
@@ -51,7 +51,12 @@ enum {
   WSD_WINDOW_MINIMIZE = 26, /* wsd_window_flag (value: 1 into the Dock, 0 back) */
   WSD_APP_ICON = 27,       /* wsd_app_icon + 1 fd: the Dock and Cmd-Tab icon */
   WSD_OPEN_URL = 28,       /* UTF-8 http or https address: opened in the Mac's default browser */
-  WSD_AUDIO_OPEN_INPUT = 29, /* wsd_audio_open + 1 fd: an input stream (the default microphone) writing a shared ring */
+  WSD_CURSOR_WARP = 29,    /* wsd_cursor_pos: the pointer goes to x,y screen pixels (SetCursorPos) */
+  WSD_CURSOR_DEFINE = 30,  /* wsd_cursor_define + 1 fd: a cursor image the client then sets by its id */
+  WSD_CURSOR_SET = 31,     /* wsd_cursor_set: the cursor shown over the server's windows */
+  WSD_WINDOW_FOCUS = 32,   /* wsd_window: the client activated this window, which becomes the key window */
+  WSD_SCREEN_SAVER = 33,   /* wsd_window_flag (window ignored, value: 1 the display may sleep, 0 it stays on) */
+  WSD_AUDIO_OPEN_INPUT = 34, /* wsd_audio_open + 1 fd: an input stream (the default microphone) writing a shared ring */
 };
 
 /* server -> client */
@@ -72,6 +77,8 @@ enum {
   WSD_EV_FRAME = 114,      /* wsd_window_frame: the user moved or resized the window (MOVE and SIZE flags set) */
   WSD_EV_MINIMIZE = 115,   /* wsd_window_flag (value: 1 the user sent the window to the Dock, 0 it came back) */
   WSD_EV_ZOOM = 116,       /* wsd_window: the user pressed the zoom (green) button */
+  WSD_EV_DISPLAY = 117,    /* wsd_hello_reply: the main screen changed (size, scale, refresh rate or work area) */
+  WSD_EV_APP_DEACTIVATED = 118, /* no payload: another app became the active one (Cmd-Tab, a click, a link opened) */
 };
 
 enum { WSD_FMT_BGRA8 = 1, WSD_FMT_RGBA8 = 2, WSD_FMT_RGB10A2 = 3 };
@@ -83,10 +90,13 @@ enum {
   WSD_STYLE_MINIATURIZABLE = 1u << 3,
   WSD_STYLE_BORDERLESS = 1u << 4, /* overrides the others */
   WSD_STYLE_TOPMOST = 1u << 5,    /* NSFloatingWindowLevel (HWND_TOPMOST) */
+  WSD_STYLE_NOACTIVATE = 1u << 6, /* never the key window (WS_EX_NOACTIVATE) */
 };
 
 /* wsd_ev_key.flags / modifiers mirror NSEventModifierFlags bits 16..23 shifted down by 16. */
-enum { WSD_KEY_DOWN = 1u << 0, WSD_KEY_REPEAT = 1u << 1, WSD_KEY_SYNTHETIC = 1u << 31 };
+/* WSD_KEY_ISO: the key comes from an ISO keyboard, where kVK_ISO_Section is the key left of 1 and kVK_ANSI_Grave the
+ * one right of the left Shift (their places are the other way round on an ANSI keyboard). */
+enum { WSD_KEY_DOWN = 1u << 0, WSD_KEY_REPEAT = 1u << 1, WSD_KEY_ISO = 1u << 2, WSD_KEY_SYNTHETIC = 1u << 31 };
 
 struct wsd_hello { uint32_t version, client_pid; };
 struct wsd_hello_reply {
@@ -176,6 +186,21 @@ struct wsd_audio_open {
   uint64_t size;          /* 64 + ring_frames * frame_bytes */
 };
 struct wsd_audio_stream { uint32_t stream_id; uint32_t reserved; };
+struct wsd_cursor_pos { int32_t x, y; }; /* screen pixels, origin top-left of the main screen */
+/* The cursors of the Mac a client sets by number; WSD_CURSOR_FIRST_DEFINED and up are the client's own images. */
+enum { WSD_CURSOR_ARROW = 0, WSD_CURSOR_IBEAM = 1, WSD_CURSOR_CROSSHAIR = 2, WSD_CURSOR_RESIZE_LEFT_RIGHT = 3,
+       WSD_CURSOR_RESIZE_UP_DOWN = 4, WSD_CURSOR_NOT_ALLOWED = 5, WSD_CURSOR_POINTING_HAND = 6,
+       WSD_CURSOR_CLOSED_HAND = 7, WSD_CURSOR_DRAG_COPY = 8, WSD_CURSOR_DRAG_LINK = 9,
+       WSD_CURSOR_FIRST_DEFINED = 0x100 };
+struct wsd_cursor_define {
+  uint32_t cursor_id;      /* WSD_CURSOR_FIRST_DEFINED or more, chosen by the client; defining it again replaces it */
+  uint32_t width, height;  /* at most 256x256 */
+  uint32_t stride;         /* bytes per row */
+  int32_t hot_x, hot_y;    /* hot spot, pixels from the top-left corner */
+  uint64_t offset;         /* byte offset of the first row within the fd */
+  uint64_t size;           /* stride * height; pixels are BGRA8 with straight (not premultiplied) alpha */
+};
+struct wsd_cursor_set { uint32_t cursor; uint32_t reserved; }; /* WSD_CURSOR_* or a defined id */
 struct wsd_app_icon {
   uint32_t width, height;  /* at most 1024x1024 */
   uint32_t stride;         /* bytes per row */

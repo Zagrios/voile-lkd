@@ -16,6 +16,7 @@
 #include <SDL3/SDL.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/hidsystem/IOHIDLib.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -203,18 +204,34 @@ static void send_state(struct gamepad *g) {
   broadcast(SI_EV_STATE, &g->sent, sizeof(g->sent));
 }
 
+/* The player is there. macOS counts keyboard and pointer events as activity, not a gamepad's reports, and Windows
+ * games keep the display on with calls Wine does not pass on to the Mac (SetThreadExecutionState, an injected mouse
+ * move), so the display could sleep during a game played with a gamepad. Wine's drivers declare activity on
+ * input (winemac.drv's DesktopWindowProc), here at most every 5 seconds; a stick at rest, which drifts a little, is
+ * not activity. */
+static void declare_activity(void) {
+  static Uint64 last;
+  static IOPMAssertionID assertion = kIOPMNullAssertionID;
+  Uint64 now = SDL_GetTicks();
+  if (last && now - last < 5000) return;
+  last = now;
+  IOPMAssertionDeclareUserActivity(CFSTR("Gamepad input"), kIOPMUserActiveLocal, &assertion);
+}
+
 static void gamepad_event(const SDL_Event *ev) {
   struct gamepad *g;
   switch (ev->type) {
   case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
   case SDL_EVENT_GAMEPAD_BUTTON_UP:
     if (!(g = find_gamepad(ev->gbutton.which)) || ev->gbutton.button >= SI_BUTTON_COUNT) return;
+    declare_activity();
     if (ev->gbutton.down) g->state.buttons |= 1u << ev->gbutton.button;
     else g->state.buttons &= ~(1u << ev->gbutton.button);
     send_state(g);
     break;
   case SDL_EVENT_GAMEPAD_AXIS_MOTION:
     if (!(g = find_gamepad(ev->gaxis.which)) || ev->gaxis.axis >= SI_AXIS_COUNT) return;
+    if (ev->gaxis.value > SDL_JOYSTICK_AXIS_MAX / 3 || ev->gaxis.value < SDL_JOYSTICK_AXIS_MIN / 3) declare_activity();
     g->state.axes[ev->gaxis.axis] = ev->gaxis.value;
     g->axes_moved = 1;
     break;

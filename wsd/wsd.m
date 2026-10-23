@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <AudioToolbox/AudioToolbox.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 #include <stdatomic.h>
 #include "wsd_protocol.h"
 
@@ -42,6 +43,12 @@ static BOOL g_relative_global; /* CGAssociateMouseAndMouseCursorPosition(false) 
 static BOOL g_cursor_hide_wanted; /* the client asked for no cursor (WSD_CURSOR_VISIBLE 0) */
 static int g_cursor_hidden;       /* [NSCursor hide] in effect */
 static NSMutableSet *g_clients;
+static BOOL g_caps_told;           /* the Caps Lock state the clients were brought to (-syncCapsLock:) */
+static NSTimeInterval g_warp_time; /* uptime of the last CURSOR_WARP: the mouse moves queued before it are dropped */
+static NSCursor *g_cursor;         /* the cursor over the windows (CURSOR_SET), nil for the arrow */
+static BOOL g_ever_active;         /* wsd has been the active app since it started */
+static BOOL g_terminate_pending;   /* a logout, restart or shutdown waits for the clients to leave */
+static id<NSObject> g_app_nap_off;  /* the activity that keeps App Nap off for as long as wsd runs */
 
 /* A window holding the pointer that shows no new frame for this long gives it back (see -checkStalled:). */
 #define STALL_NS (5 * NSEC_PER_SEC)
@@ -153,10 +160,12 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
  * key and main status by default and then never receives keyboard events (2026-10-03: Rocket League got no keys
  * from the real keyboard, key=0 in every window state, while injected events sent to the window directly worked). */
 @interface WsdNSWindow : NSWindow
+/* WSD_STYLE_NOACTIVATE (WS_EX_NOACTIVATE): a click on the window leaves the keyboard where it was */
+@property BOOL noActivate;
 @end
 @implementation WsdNSWindow
-- (BOOL)canBecomeKeyWindow { return YES; }
-- (BOOL)canBecomeMainWindow { return YES; }
+- (BOOL)canBecomeKeyWindow { return !self.noActivate; }
+- (BOOL)canBecomeMainWindow { return !self.noActivate; }
 @end
 
 @interface WsdWindow : NSObject <NSWindowDelegate>
@@ -192,12 +201,21 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property NSRect overlayPx;
 @property NSRect savedFrame;
 @property NSWindowStyleMask savedStyle;
-@property NSWindowLevel savedLevel;
+/* WINDOW_MINIMIZE ordered it out (no minimize button, so not in the Dock): it shows again when restored */
+@property BOOL minimizedOut;
+@property BOOL topmost; /* WSD_STYLE_TOPMOST (HWND_TOPMOST): above the windows that are not */
 /* the mac keycodes the client was last told are down */
 @property(strong) NSMutableIndexSet *heldKeys;
 - (void)sendEvent:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
 - (void)noteKey:(uint32_t)code down:(BOOL)down;
+- (NSWindowLevel)levelForActive:(BOOL)active;
+- (BOOL)floatsForActive:(BOOL)active;
+- (void)orderInFront:(BOOL)activate;
+- (void)syncCapsLock:(BOOL)on;
+- (void)fitScreen;
 @end
+
+static __weak WsdWindow *g_focus_wanted; /* WINDOW_FOCUS while wsd was not active: made key once it is */
 
 /* Audio output stream (WSD_AUDIO_*): one default-output AudioUnit per stream, whose render callback reads the
  * client's shared ring directly (no copy in between, no message per buffer). CoreAudio converts the client format
@@ -426,6 +444,8 @@ static dispatch_queue_t g_audio_queue;
 @property(strong) NSMutableDictionary<NSNumber *, WsdWindow *> *windows;
 @property(strong) NSMutableDictionary<NSNumber *, WsdBuffer *> *buffers;
 @property(strong) NSMutableDictionary<NSNumber *, WsdAudio *> *audio;
+@property(strong) NSMutableDictionary<NSNumber *, NSCursor *> *cursors; /* CURSOR_DEFINE */
+@property IOPMAssertionID displayAssertion; /* SCREEN_SAVER 0 holds the display on, kIOPMNullAssertionID otherwise */
 @property BOOL dead;
 - (void)send:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
 - (void)close;
@@ -441,6 +461,45 @@ static void sync_cursor(void) {
   if (!hide && g_cursor_hidden) { [NSCursor unhide]; g_cursor_hidden = 0; }
 }
 
+/* The levels of wsd's windows on the active Space, set as Wine's Mac driver sets them (-[WineApplicationController
+ * adjustWindowLevels:]): back to front in the window server's order, each window takes the level its own state asks
+ * for (-levelForActive:) and at least the level of every window behind it, so that a window in front of a fullscreen
+ * one (a dialog, a crash box) rises with it instead of hiding under it, and topmost windows stay above all others.
+ * Windows on other Spaces keep theirs until that Space is the active one. */
+static void adjust_levels(BOOL active) {
+  NSMutableDictionary<NSNumber *, WsdWindow *> *byNumber = [NSMutableDictionary dictionary];
+  for (WsdClient *c in g_clients)
+    for (WsdWindow *w in c.windows.allValues)
+      if (w.window) byNumber[@(w.window.windowNumber)] = w;
+  NSMutableArray<WsdWindow *> *order = [NSMutableArray array]; /* front to back, the floating windows first */
+  NSUInteger floating = 0;
+  for (NSNumber *n in [NSWindow windowNumbersWithOptions:0]) {
+    WsdWindow *w = byNumber[n];
+    if (!w) continue;
+    if ([w floatsForActive:active]) [order insertObject:w atIndex:floating++];
+    else [order addObject:w];
+  }
+  NSWindowLevel maxLevel = NSIntegerMin, maxOther = NSNormalWindowLevel;
+  WsdWindow *prev = nil;
+  for (WsdWindow *w in order.reverseObjectEnumerator) {
+    NSWindowLevel level = [w levelForActive:active], old = w.window.level;
+    BOOL floats = [w floatsForActive:active];
+    if (floats && level <= maxOther) level = maxOther + 1;
+    if (level < maxLevel) level = maxLevel;
+    else maxLevel = level;
+    if (!floats && level > maxOther) maxOther = level;
+    if (level != old) {
+      w.window.level = level;
+      /* raised: to the back of its new level, still in front of the windows set before it; lowered: to the front of
+       * its new level, which going back to front keeps the order */
+      if (level < old) [w.window orderFront:nil];
+      else if (prev) [w.window orderWindow:NSWindowAbove relativeTo:prev.window.windowNumber];
+      else [w.window orderBack:nil];
+    }
+    prev = w;
+  }
+}
+
 /* The screen with the menu bar: the client's display, and the origin of the pixel coordinates wsd exchanges with it.
  * NSScreen.mainScreen is the screen of the key window, which moves (2026-10-04: with Obelisk on the MacBook's screen,
  * Rocket League got 3024x1964 while its window was on a 2560x1440 one, and its picture overflowed). */
@@ -451,6 +510,47 @@ static NSScreen *primary_screen(void) {
 static double backing_scale(NSWindow *w) {
   double s = w ? w.backingScaleFactor : primary_screen().backingScaleFactor;
   return s > 0 ? s : 1.0;
+}
+
+/* What HELLO and EV_DISPLAY give a client: the screen with the menu bar in pixels, and its work area. */
+static struct wsd_hello_reply display_info(void) {
+  NSScreen *sc = primary_screen();
+  double s = backing_scale(nil);
+  NSRect vf = sc.visibleFrame; /* without the menu bar and the Dock */
+  struct wsd_hello_reply r = {WSD_PROTOCOL_VERSION, getpid(), (uint32_t)lround(sc.frame.size.width * s),
+                              (uint32_t)lround(sc.frame.size.height * s), (uint32_t)sc.maximumFramesPerSecond,
+                              (uint32_t)lround(s * 1000), (int32_t)lround((vf.origin.x - sc.frame.origin.x) * s),
+                              (int32_t)lround((NSMaxY(sc.frame) - NSMaxY(vf)) * s),
+                              (uint32_t)lround(vf.size.width * s), (uint32_t)lround(vf.size.height * s)};
+  return r;
+}
+static struct wsd_hello_reply g_display; /* the screen the clients were last told of */
+
+static NSCursor *system_cursor(uint32_t cursor) {
+  switch (cursor) {
+  case WSD_CURSOR_ARROW: return NSCursor.arrowCursor;
+  case WSD_CURSOR_IBEAM: return NSCursor.IBeamCursor;
+  case WSD_CURSOR_CROSSHAIR: return NSCursor.crosshairCursor;
+  case WSD_CURSOR_RESIZE_LEFT_RIGHT: return NSCursor.resizeLeftRightCursor;
+  case WSD_CURSOR_RESIZE_UP_DOWN: return NSCursor.resizeUpDownCursor;
+  case WSD_CURSOR_NOT_ALLOWED: return NSCursor.operationNotAllowedCursor;
+  case WSD_CURSOR_POINTING_HAND: return NSCursor.pointingHandCursor;
+  case WSD_CURSOR_CLOSED_HAND: return NSCursor.closedHandCursor;
+  case WSD_CURSOR_DRAG_COPY: return NSCursor.dragCopyCursor;
+  case WSD_CURSOR_DRAG_LINK: return NSCursor.dragLinkCursor;
+  }
+  return nil;
+}
+
+/* Shows g_cursor at once when the pointer is over the content of one of wsd's windows; anywhere else it comes with
+ * the next -cursorUpdate:, when the pointer enters a window. */
+static void apply_cursor(void) {
+  if (!NSApp.active) return;
+  NSPoint p = NSEvent.mouseLocation;
+  NSWindow *w = [NSApp windowWithWindowNumber:[NSWindow windowNumberAtPoint:p belowWindowWithWindowNumber:0]];
+  if (![w isKindOfClass:WsdNSWindow.class] || !NSPointInRect([w convertPointFromScreen:p], w.contentView.frame))
+    return;
+  [g_cursor ?: NSCursor.arrowCursor set];
 }
 
 /* WSD_STYLE_* to an AppKit style mask: a titled window gets the macOS title bar and buttons; borderless otherwise
@@ -506,8 +606,16 @@ static CAMetalLayer *make_metal_layer(void) {
   *x = (float)(p.x * s);
   *y = (float)((self.bounds.size.height - p.y) * s);
 }
+/* WSD_KEY_ISO for a key of an ISO keyboard. The type comes with each key event: a MacBook's keyboard and an external
+ * one may differ. */
+- (uint32_t)iso:(NSEvent *)e {
+  CGEventRef cg = e.CGEvent;
+  int64_t type = cg ? CGEventGetIntegerValueField(cg, kCGKeyboardEventKeyboardType) : 0;
+  return type && KBGetLayoutType((int16_t)type) == kKeyboardISO ? WSD_KEY_ISO : 0;
+}
 - (void)key:(NSEvent *)e down:(BOOL)down {
-  struct wsd_ev_key k = {self.ww.windowId, (down ? WSD_KEY_DOWN : 0) | (e.isARepeat ? WSD_KEY_REPEAT : 0) | [self synth],
+  struct wsd_ev_key k = {self.ww.windowId,
+                         (down ? WSD_KEY_DOWN : 0) | (e.isARepeat ? WSD_KEY_REPEAT : 0) | [self iso:e] | [self synth],
                          e.keyCode, (uint32_t)(e.modifierFlags >> 16), [self evNs:e]};
   NSData *chars = [e.characters dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
   [self.ww noteKey:e.keyCode down:down];
@@ -522,7 +630,7 @@ static CAMetalLayer *make_metal_layer(void) {
   case kVK_Control: case kVK_RightControl: bit = NSEventModifierFlagControl; break;
   case kVK_Option: case kVK_RightOption: bit = NSEventModifierFlagOption; break;
   case kVK_Command: case kVK_RightCommand: bit = NSEventModifierFlagCommand; break;
-  case kVK_CapsLock: bit = NSEventModifierFlagCapsLock; break;
+  case kVK_CapsLock: [self.ww syncCapsLock:(e.modifierFlags & NSEventModifierFlagCapsLock) != 0]; return;
   case kVK_Function: bit = NSEventModifierFlagFunction; break;
   default: return;
   }
@@ -549,6 +657,11 @@ static CAMetalLayer *make_metal_layer(void) {
     struct wsd_ev_relative r = {w.windowId, [self synth], (float)e.deltaX, (float)e.deltaY, [self evNs:e]};
     [w sendEvent:WSD_EV_RELATIVE payload:&r len:sizeof(r) extra:nil];
     return;
+  }
+  /* the mouse moves macOS queued before a CURSOR_WARP still carry the place the pointer left */
+  if (g_warp_time) {
+    if (e.timestamp <= g_warp_time) return;
+    g_warp_time = 0;
   }
   struct wsd_ev_motion m = {w.windowId, [self synth], 0, 0, [self evNs:e]};
   [self pixelPoint:e x:&m.x y:&m.y];
@@ -577,6 +690,7 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)mouseDragged:(NSEvent *)e { [self motion:e]; }
 - (void)rightMouseDragged:(NSEvent *)e { [self motion:e]; }
 - (void)otherMouseDragged:(NSEvent *)e { [self motion:e]; }
+- (void)cursorUpdate:(NSEvent *)e { [g_cursor ?: NSCursor.arrowCursor set]; }
 - (void)scrollWheel:(NSEvent *)e {
   struct wsd_ev_wheel w = {self.ww.windowId, e.hasPreciseScrollingDeltas | [self synth], (float)e.scrollingDeltaX,
                            (float)e.scrollingDeltaY, [self evNs:e]};
@@ -615,6 +729,16 @@ static CAMetalLayer *make_metal_layer(void) {
   [self noteKey:code down:down];
   [self sendEvent:WSD_EV_KEY payload:&k len:sizeof(k) extra:nil];
 }
+/* Caps Lock is a toggle: macOS sends one flagsChanged for each change, and Wine toggles its state on each press
+ * (server/queue.c, set_input_key_state). Each change is a press and a release, as in Wine's Mac driver
+ * (-[WineWindow flagsChanged:]): a press when it came on and a release when it went off inverted Wine's state every
+ * other time. A change made while another app had the keyboard is given when a window becomes key again. */
+- (void)syncCapsLock:(BOOL)on {
+  if (on == g_caps_told) return;
+  g_caps_told = on;
+  [self sendKey:kVK_CapsLock down:YES];
+  [self sendKey:kVK_CapsLock down:NO];
+}
 /* A key released while another app is in front never reaches the window: leaving it releases every key the client
  * holds down, and coming back presses the modifiers the user still holds (2026-10-09: Obelisk's Shift+Tab overlay
  * took the focus between Shift's press and its release, and the game kept running). Command is left out: Cmd+Tab
@@ -643,6 +767,7 @@ static CAMetalLayer *make_metal_layer(void) {
   struct wsd_window_flag f = {self.windowId, 1};
   [self sendEvent:WSD_EV_FOCUS payload:&f len:sizeof(f) extra:nil];
   [self pressHeldModifiers];
+  [self syncCapsLock:(NSEvent.modifierFlags & NSEventModifierFlagCapsLock) != 0];
 }
 - (void)windowDidResignKey:(NSNotification *)n {
   /* The pointer disassociation is global: leaving the window (Cmd+Tab, another app, a notification) must give the
@@ -719,8 +844,19 @@ static CAMetalLayer *make_metal_layer(void) {
   [self sendEvent:WSD_EV_MINIMIZE payload:&f len:sizeof(f) extra:nil];
 }
 - (void)windowDidDeminiaturize:(NSNotification *)n {
+  [self orderInFront:YES];
   struct wsd_window_flag f = {self.windowId, 0};
   [self sendEvent:WSD_EV_MINIMIZE payload:&f len:sizeof(f) extra:nil];
+}
+/* Shows the window in front of wsd's others: at the level of the front one first, which a window of its own level
+ * would stay under (a fullscreen window above the menu bar), then at the level adjust_levels gives it. Without
+ * activate, the key window stays where it is (Win32 SWP_NOACTIVATE, WS_EX_NOACTIVATE). */
+- (void)orderInFront:(BOOL)activate {
+  NSWindow *front = [NSApp windowWithWindowNumber:[NSWindow windowNumbersWithOptions:0].firstObject.integerValue];
+  if (front && front != self.window && front.level > self.window.level) self.window.level = front.level;
+  if (activate) [self.window makeKeyAndOrderFront:nil];
+  [self.window orderFrontRegardless]; /* cooperative activation may leave the app inactive */
+  adjust_levels(NSApp.active);
 }
 /* The client maximizes and restores the window itself (Win32 SC_MAXIMIZE) and then sets its frame. */
 - (BOOL)windowShouldZoom:(NSWindow *)window toFrame:(NSRect)frame {
@@ -731,6 +867,11 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)setStyle:(uint32_t)style {
   NSWindowStyleMask mask = style_mask(style);
   NSWindow *w = self.window;
+  ((WsdNSWindow *)w).noActivate = (style & WSD_STYLE_NOACTIVATE) != 0;
+  if (self.topmost != !!(style & WSD_STYLE_TOPMOST)) {
+    self.topmost = !self.topmost;
+    adjust_levels(NSApp.active);
+  }
   if (self.fullscreen) { self.savedStyle = mask; return; } /* applied when fullscreen ends */
   if (w.styleMask == mask) return;
   NSRect content = [w contentRectForFrameRect:w.frame];
@@ -743,11 +884,18 @@ static CAMetalLayer *make_metal_layer(void) {
 }
 - (void)minimize:(BOOL)on {
   NSWindow *w = self.window;
-  if (on && !w.miniaturized) {
+  if (on && !w.miniaturized && !self.minimizedOut) {
     if (w.styleMask & NSWindowStyleMaskMiniaturizable) [w miniaturize:nil];
-    else [w orderOut:nil];
+    else {
+      self.minimizedOut = YES;
+      [w orderOut:nil];
+      adjust_levels(NSApp.active);
+    }
   } else if (!on && w.miniaturized) {
     [w deminiaturize:nil];
+  } else if (!on && self.minimizedOut) {
+    self.minimizedOut = NO;
+    [self orderInFront:NO]; /* the client activates it if it should */
   }
 }
 - (void)logState:(const char *)when {
@@ -883,6 +1031,34 @@ static CAMetalLayer *make_metal_layer(void) {
     [self sendFrame];
 }
 
+/* The level the window's own state asks for (adjust_levels may raise it). A fullscreen window rises above the menu
+ * bar and the Dock only while wsd is the active app, as in Wine's Mac driver (-[WineWindow minimumLevelForActive:]).
+ * A level outlives the activation: kept up after Cmd-Tab, the window covered the app the user went to, which had the
+ * keyboard and the mouse under the game's picture (2026-10-23, Rocket League in fullscreen). The presentation options
+ * need nothing of the kind: macOS applies them only while the app is active. */
+- (NSWindowLevel)levelForActive:(BOOL)active {
+  if (self.fullscreen && active) return NSMainMenuWindowLevel + 1;
+  return [self floatsForActive:active] ? NSFloatingWindowLevel : NSNormalWindowLevel;
+}
+
+/* A topmost window floats above the other apps' windows, except a fullscreen one while wsd is not active, as in Wine's
+ * Mac driver by default (TOPMOST_FLOAT_INACTIVE_NONFULLSCREEN). A game in D3D exclusive fullscreen has its window
+ * topmost (Neptune's swapchain sets HWND_TOPMOST, as DXMT and Windows do): floating, it stayed over every app the
+ * player went to (2026-10-23: the browser a game opened, then Discord, came to the front under its picture). */
+- (BOOL)floatsForActive:(BOOL)active {
+  return self.topmost && (active || !self.fullscreen);
+}
+
+/* A fullscreen window keeps covering its screen when that screen changes (resolution, scale). */
+- (void)fitScreen {
+  NSRect want = (self.window.screen ?: primary_screen()).frame;
+  if (!self.fullscreen || NSEqualRects(self.window.frame, want)) return;
+  self.transitioning = YES;
+  [self.window setFrame:want display:YES];
+  self.transitioning = NO;
+  [self sendResize];
+}
+
 - (void)setFullscreenMode:(BOOL)on {
   if (on == self.fullscreen) return;
   NSWindow *w = self.window;
@@ -890,9 +1066,7 @@ static CAMetalLayer *make_metal_layer(void) {
   if (on) {
     self.savedFrame = w.frame;
     self.savedStyle = w.styleMask;
-    self.savedLevel = w.level;
     w.styleMask = NSWindowStyleMaskBorderless;
-    w.level = NSMainMenuWindowLevel + 1;
     [w setFrame:w.screen ? w.screen.frame : primary_screen().frame display:YES];
     @try {
       NSApp.presentationOptions = NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar;
@@ -901,13 +1075,13 @@ static CAMetalLayer *make_metal_layer(void) {
     }
   } else {
     w.styleMask = self.savedStyle;
-    w.level = self.savedLevel;
     [w setFrame:self.savedFrame display:YES];
     NSApp.presentationOptions = NSApplicationPresentationDefault;
   }
   [w makeFirstResponder:self.view];
   self.transitioning = NO;
   self.fullscreen = on;
+  adjust_levels(NSApp.active);
   [self logState:on ? "fullscreen-on" : "fullscreen-off"];
   [self sendResize];
 }
@@ -974,6 +1148,7 @@ static CAMetalLayer *make_metal_layer(void) {
   [self.window orderOut:nil];
   [self.window close];
   self.window = nil;
+  adjust_levels(NSApp.active);
 }
 @end
 
@@ -1032,6 +1207,15 @@ static CAMetalLayer *make_metal_layer(void) {
   [self.buffers removeAllObjects]; /* textures die after in-flight command buffers release them */
   for (WsdAudio *a in self.audio.allValues) dispatch_async(g_audio_queue, ^{ [a teardown]; });
   [self.audio removeAllObjects];
+  if (g_cursor && [self.cursors.allValues containsObject:g_cursor]) {
+    g_cursor = nil;
+    apply_cursor();
+  }
+  [self.cursors removeAllObjects];
+  if (self.displayAssertion) {
+    IOPMAssertionRelease(self.displayAssertion);
+    self.displayAssertion = kIOPMNullAssertionID;
+  }
   for (NSNumber *f in self.fdQueue) close(f.intValue);
   [self.fdQueue removeAllObjects];
   if (self.readSrc) dispatch_source_cancel(self.readSrc);
@@ -1039,6 +1223,11 @@ static CAMetalLayer *make_metal_layer(void) {
   close(self.fd);
   LOG("client %d disconnected", self.pid);
   [g_clients removeObject:self];
+  if (g_terminate_pending && g_clients.count == 0) {
+    g_terminate_pending = NO;
+    LOG("the game is gone, the logout, restart or shutdown goes on");
+    [NSApp replyToApplicationShouldTerminate:YES];
+  }
   if (g_exit_on_disconnect && g_clients.count == 0) {
     restore_input_state();
     exit(0);
@@ -1071,13 +1260,21 @@ static CAMetalLayer *make_metal_layer(void) {
   w.window.tabbingMode = NSWindowTabbingModeDisallowed;
   w.window.title = title;
   w.window.acceptsMouseMovedEvents = YES;
-  if (c->style & WSD_STYLE_TOPMOST) w.window.level = NSFloatingWindowLevel;
+  w.topmost = (c->style & WSD_STYLE_TOPMOST) != 0;
+  ((WsdNSWindow *)w.window).noActivate = (c->style & WSD_STYLE_NOACTIVATE) != 0;
+  w.window.level = [w levelForActive:NO];
   w.window.delegate = w;
   w.view = [[WsdView alloc] initWithFrame:NSMakeRect(0, 0, r.size.width, r.size.height)];
   w.view.owner = w;
   w.view.wantsLayer = YES;
   w.layer = (CAMetalLayer *)w.view.layer;
   w.window.contentView = w.view;
+  /* the cursor the client set shows over the content (-cursorUpdate:) */
+  [w.view addTrackingArea:[[NSTrackingArea alloc]
+                              initWithRect:NSZeroRect
+                                   options:NSTrackingCursorUpdate | NSTrackingActiveInActiveApp | NSTrackingInVisibleRect
+                                     owner:w.view
+                                  userInfo:nil]];
   [w.window makeFirstResponder:w.view];
   w.link = [w.view displayLinkWithTarget:w selector:@selector(tick:)];
   [w.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
@@ -1141,6 +1338,45 @@ static CAMetalLayer *make_metal_layer(void) {
     });
   });
 }
+/* A cursor image (SetCursor with a cursor that is not one of the Mac's): pixels are the game's, which the screen
+ * shows at the backing scale. At most 64 per client. */
+- (void)defineCursor:(const struct wsd_cursor_define *)c {
+  if (!self.fdQueue.count) { [self error:WSD_CURSOR_DEFINE code:-EBADF]; return; }
+  int fd = self.fdQueue.firstObject.intValue;
+  [self.fdQueue removeObjectAtIndex:0];
+  struct stat st;
+  if (c->cursor_id < WSD_CURSOR_FIRST_DEFINED || (!self.cursors[@(c->cursor_id)] && self.cursors.count >= 64) ||
+      !c->width || !c->height || c->width > 256 || c->height > 256 || c->stride < c->width * 4 ||
+      c->size < (uint64_t)c->stride * c->height || c->hot_x < 0 || c->hot_y < 0 || (uint32_t)c->hot_x >= c->width ||
+      (uint32_t)c->hot_y >= c->height || fstat(fd, &st) || (uint64_t)st.st_size < c->offset + c->size) {
+    close(fd);
+    [self error:WSD_CURSOR_DEFINE code:-EINVAL];
+    return;
+  }
+  NSMutableData *pixels = [NSMutableData dataWithLength:(NSUInteger)c->size];
+  ssize_t got = pread(fd, pixels.mutableBytes, (size_t)c->size, (off_t)c->offset);
+  close(fd);
+  if (got != (ssize_t)c->size) { [self error:WSD_CURSOR_DEFINE code:-EIO]; return; }
+  CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)pixels);
+  CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  CGImageRef image = CGImageCreate(c->width, c->height, 8, 32, c->stride, srgb,
+                                   kCGBitmapByteOrder32Little | kCGImageAlphaFirst, provider, NULL, false,
+                                   kCGRenderingIntentDefault);
+  CGColorSpaceRelease(srgb);
+  CGDataProviderRelease(provider);
+  if (!image) { [self error:WSD_CURSOR_DEFINE code:-EINVAL]; return; }
+  double s = backing_scale(nil);
+  NSImage *picture = [[NSImage alloc] initWithCGImage:image size:NSMakeSize(c->width / s, c->height / s)];
+  CGImageRelease(image);
+  NSCursor *cursor = [[NSCursor alloc] initWithImage:picture hotSpot:NSMakePoint(c->hot_x / s, c->hot_y / s)];
+  NSCursor *old = self.cursors[@(c->cursor_id)];
+  self.cursors[@(c->cursor_id)] = cursor;
+  if (old && g_cursor == old) {
+    g_cursor = cursor;
+    apply_cursor();
+  }
+}
+
 /* The Dock and Cmd-Tab icon of the whole server (one game per wsd): the client's program icon. */
 - (void)appIcon:(const struct wsd_app_icon *)a {
   if (!self.fdQueue.count) { [self error:WSD_APP_ICON code:-EBADF]; return; }
@@ -1269,14 +1505,8 @@ static CAMetalLayer *make_metal_layer(void) {
   switch (type) {
   case WSD_HELLO: {
     NEED(wsd_hello);
-    NSScreen *sc = primary_screen();
-    double s = backing_scale(nil);
-    NSRect vf = sc.visibleFrame; /* without the menu bar and the Dock */
-    struct wsd_hello_reply r = {WSD_PROTOCOL_VERSION, getpid(), (uint32_t)lround(sc.frame.size.width * s),
-                                (uint32_t)lround(sc.frame.size.height * s), (uint32_t)sc.maximumFramesPerSecond,
-                                (uint32_t)lround(s * 1000), (int32_t)lround((vf.origin.x - sc.frame.origin.x) * s),
-                                (int32_t)lround((NSMaxY(sc.frame) - NSMaxY(vf)) * s),
-                                (uint32_t)lround(vf.size.width * s), (uint32_t)lround(vf.size.height * s)};
+    struct wsd_hello_reply r = display_info();
+    g_display = r;
     LOG("client %d hello version %u", self.pid, m->version);
     [self send:WSD_EV_HELLO payload:&r len:sizeof(r) extra:nil];
     break;
@@ -1298,16 +1528,17 @@ static CAMetalLayer *make_metal_layer(void) {
     NEED(wsd_window_flag);
     WsdWindow *w = [self win:m->window_id req:type];
     if (!w) break;
+    w.minimizedOut = NO;
     if (m->value) {
-      [NSApp activate];
-      [w.window makeKeyAndOrderFront:nil];
-      [w.window orderFrontRegardless]; /* cooperative activation may leave the app inactive */
+      if (m->value == 1) [NSApp activate];
+      [w orderInFront:m->value == 1];
       [w sendResize];
       [w logState:"show"];
       __weak WsdWindow *ww = w;
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000000000), dispatch_get_main_queue(), ^{ [ww logState:"show+1s"]; });
     } else {
       [w.window orderOut:nil];
+      adjust_levels(NSApp.active);
     }
     break;
   }
@@ -1591,6 +1822,70 @@ static CAMetalLayer *make_metal_layer(void) {
     if (![NSWorkspace.sharedWorkspace openURL:url]) [self error:type code:-EIO];
     break;
   }
+  case WSD_CURSOR_WARP: {
+    NEED(wsd_cursor_pos);
+    /* SetCursorPos, only while wsd is the active app (a game behind another app must not move the user's pointer) and
+     * outside relative mode (the pointer stands still there and the game reads deltas). As in Wine's Mac driver
+     * (-[WineApplicationController setCursorPosition:]), without the 0.25 s after a warp during which macOS keeps the
+     * pointer still, then the mouse moves already queued are dropped (-motion:). */
+    if (!NSApp.active || g_relative_global) break;
+    double s = backing_scale(nil);
+    CGSetLocalEventsSuppressionInterval(0);
+    CGError e = CGWarpMouseCursorPosition(CGPointMake(m->x / s, m->y / s));
+    CGSetLocalEventsSuppressionInterval(0.25);
+    if (e != kCGErrorSuccess) { [self error:type code:-EIO]; break; }
+    g_warp_time = NSProcessInfo.processInfo.systemUptime;
+    CGAssociateMouseAndMouseCursorPosition(true);
+    break;
+  }
+  case WSD_CURSOR_DEFINE: {
+    NEED(wsd_cursor_define);
+    [self defineCursor:m];
+    break;
+  }
+  case WSD_CURSOR_SET: {
+    NEED(wsd_cursor_set);
+    NSCursor *c = m->cursor >= WSD_CURSOR_FIRST_DEFINED ? self.cursors[@(m->cursor)] : system_cursor(m->cursor);
+    if (!c) { [self error:type code:-ENOENT]; break; }
+    g_cursor = c;
+    apply_cursor();
+    break;
+  }
+  case WSD_WINDOW_FOCUS: {
+    NEED(wsd_window);
+    WsdWindow *w = [self win:m->window_id req:type];
+    if (!w || !w.window.visible || ((WsdNSWindow *)w.window).noActivate) break;
+    /* Wine activated the window (SetForegroundWindow, a dialog taking the focus): the key window follows, as Wine's
+     * Mac driver gives it in ActivateWindow. wsd itself becomes active this way only at the game's start; later, a
+     * window activated while another app is in front becomes key once wsd is active again. */
+    if (NSApp.active) [w orderInFront:YES];
+    else if (!g_ever_active) {
+      [NSApp activate];
+      [w orderInFront:YES];
+    } else
+      g_focus_wanted = w;
+    break;
+  }
+  case WSD_SCREEN_SAVER: {
+    NEED(wsd_window_flag);
+    /* SystemParametersInfo(SPI_SETSCREENSAVEACTIVE): while the client asks, the display does not sleep on its own,
+     * as Wine's Mac driver does it (macdrv_SystemParametersInfo); the assertion goes with the client */
+    if (!m->value && !self.displayAssertion) {
+      IOPMAssertionID a = kIOPMNullAssertionID;
+      if (IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
+                                      CFSTR("A Windows game asked to keep the display on"), &a) != kIOReturnSuccess) {
+        [self error:type code:-EIO];
+        break;
+      }
+      self.displayAssertion = a;
+      LOG("client %d: the display stays on", self.pid);
+    } else if (m->value && self.displayAssertion) {
+      IOPMAssertionRelease(self.displayAssertion);
+      self.displayAssertion = kIOPMNullAssertionID;
+      LOG("client %d: the display may sleep again", self.pid);
+    }
+    break;
+  }
   case WSD_QUIT:
     LOG("client %d asked the server to quit", self.pid);
     restore_input_state();
@@ -1639,6 +1934,70 @@ static CAMetalLayer *make_metal_layer(void) {
 
 /* ---------------------------------------------------------------- main */
 
+/* The screen with the menu bar changed (resolution, scale, a screen plugged in or out): fullscreen windows take the
+ * new frame and the clients hear of it (EV_DISPLAY), as Wine's Mac driver tells Wine
+ * (-applicationDidChangeScreenParameters:). A work area alone (the Dock shown or hidden) is not news: the client
+ * gives the game the whole screen. */
+static void screens_changed(void) {
+  for (WsdClient *c in g_clients)
+    for (WsdWindow *w in c.windows.allValues) [w fitScreen];
+  struct wsd_hello_reply r = display_info();
+  if (r.display_width_px == g_display.display_width_px && r.display_height_px == g_display.display_height_px &&
+      r.max_refresh_hz == g_display.max_refresh_hz && r.backing_scale_x1000 == g_display.backing_scale_x1000)
+    return;
+  g_display = r;
+  LOG("main screen now %ux%u px at %u Hz, scale %.2f", r.display_width_px, r.display_height_px, r.max_refresh_hz,
+      r.backing_scale_x1000 / 1000.0);
+  for (WsdClient *c in g_clients) [c send:WSD_EV_DISPLAY payload:&r len:sizeof(r) extra:nil];
+}
+
+/* Back in wsd (Cmd-Tab, the Dock) with none of its windows visible: the largest of those in the Dock or minimized out
+ * of sight comes back, as Wine's Mac driver brings one back (-unminimizeWindowIfNoneVisible). A game in exclusive
+ * fullscreen minimizes itself when it goes to the background (Wine's D3D9, Unreal), and nothing was left to come back
+ * to. The client hears it as the user's restore (EV_MINIMIZE 0). */
+static void unminimize_if_none_visible(void) {
+  WsdWindow *best = nil;
+  double area = 0;
+  for (WsdClient *c in g_clients)
+    for (WsdWindow *w in c.windows.allValues) {
+      if (w.window.visible) return;
+      NSSize sz = w.window.frame.size;
+      if ((w.window.miniaturized || w.minimizedOut) && sz.width * sz.height > area) {
+        area = sz.width * sz.height;
+        best = w;
+      }
+    }
+  if (!best) return;
+  LOG("window %u comes back: no window was visible", best.windowId);
+  if (best.window.miniaturized) {
+    [best.window deminiaturize:nil]; /* -windowDidDeminiaturize: tells the client */
+    return;
+  }
+  best.minimizedOut = NO;
+  [best orderInFront:YES];
+  struct wsd_window_flag f = {best.windowId, 0};
+  [best sendEvent:WSD_EV_MINIMIZE payload:&f len:sizeof(f) extra:nil];
+}
+
+/* Whether the quit is a logout, a restart or a shutdown: the reason the Apple event gives, as Wine's Mac driver reads
+ * it (-applicationShouldTerminate:). */
+static BOOL session_ending(void) {
+  NSAppleEventDescriptor *e = NSAppleEventManager.sharedAppleEventManager.currentAppleEvent;
+  switch ([e attributeDescriptorForKeyword:kAEQuitReason].typeCodeValue) {
+  case kAELogOut:
+  case kAEReallyLogOut:
+  case kAERestart:
+  case kAEShowRestartDialog:
+  case kAEShutDown:
+  case kAEShowShutdownDialog:
+    return YES;
+  }
+  return NO;
+}
+
+/* A logout, restart or shutdown leaves the game the time to close */
+#define SESSION_END_WAIT (30 * NSEC_PER_SEC)
+
 /* Quit (Cmd-Q, the Dock) asks the game to close its windows, as the close button does, instead of ending the server
  * under a running game (which then lost its windows and input but kept running); whoever started the game ends the
  * server after it. Without any window, Quit ends the server. */
@@ -1654,8 +2013,50 @@ static CAMetalLayer *make_metal_layer(void) {
       asked++;
     }
   if (!asked) return NSTerminateNow;
+  /* The Mac waits for the game to close during a logout, restart or shutdown (Wine's Mac driver answers
+   * NSTerminateLater the same way): cancelling stopped the logout as long as a game ran. The answer comes once the
+   * last client is gone, or a refusal after SESSION_END_WAIT if the game is still there (it may be asking the player
+   * something). */
+  if (session_ending()) {
+    if (!g_terminate_pending) {
+      g_terminate_pending = YES;
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SESSION_END_WAIT), dispatch_get_main_queue(), ^{
+        if (!g_terminate_pending) return;
+        g_terminate_pending = NO;
+        LOG("the game is still there, the logout, restart or shutdown is refused");
+        [NSApp replyToApplicationShouldTerminate:NO];
+      });
+    }
+    LOG("logout, restart or shutdown: asked %lu windows to close", (unsigned long)asked);
+    return NSTerminateLater;
+  }
   LOG("quit requested: asked %lu windows to close", (unsigned long)asked);
   return NSTerminateCancel;
+}
+/* The windows above the menu bar (fullscreen, and those in front of one) come down as wsd resigns, before the other
+ * app's windows come to the front (Wine's Mac driver also does it in -applicationWillResignActive:), and go back up
+ * once wsd is active again. */
+- (void)applicationWillResignActive:(NSNotification *)n {
+  adjust_levels(NO);
+}
+/* The game goes to the background as it does on Windows: its client puts the desktop in the foreground, as Wine's Mac
+ * driver does on the same notification (APP_DEACTIVATED, macdrv_app_deactivated), and the game gets WM_ACTIVATEAPP
+ * (it may pause, mute or minimize itself). Wine kept the game in the foreground until then, whatever app the user
+ * was in. */
+- (void)applicationDidResignActive:(NSNotification *)n {
+  for (WsdClient *c in g_clients) [c send:WSD_EV_APP_DEACTIVATED payload:NULL len:0 extra:nil];
+}
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)app hasVisibleWindows:(BOOL)flag {
+  unminimize_if_none_visible();
+  return YES;
+}
+- (void)applicationDidBecomeActive:(NSNotification *)n {
+  if (g_ever_active) unminimize_if_none_visible();
+  g_ever_active = YES;
+  WsdWindow *w = g_focus_wanted;
+  g_focus_wanted = nil;
+  if (w.window.visible && !((WsdNSWindow *)w.window).noActivate) [w orderInFront:YES];
+  adjust_levels(YES);
 }
 @end
 
@@ -1717,6 +2118,7 @@ static void accept_one(int ls) {
   c.fdQueue = [NSMutableArray array];
   c.windows = [NSMutableDictionary dictionary]; c.buffers = [NSMutableDictionary dictionary];
   c.audio = [NSMutableDictionary dictionary];
+  c.cursors = [NSMutableDictionary dictionary];
   c.readSrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0, dispatch_get_main_queue());
   __weak WsdClient *wc = c;
   dispatch_source_set_event_handler(c.readSrc, ^{ [wc readable]; });
@@ -1776,6 +2178,13 @@ int main(int argc, char **argv) {
       restore_input_state();
     }];
 
+    /* windows on the Space just shown may have kept a level of when wsd was active (adjust_levels) */
+    [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification
+                                                                object:nil queue:NSOperationQueue.mainQueue
+                                                            usingBlock:^(NSNotification *note) {
+      adjust_levels(NSApp.active);
+    }];
+
     [NSApplication sharedApplication];
     static WsdAppDelegate *delegate;
     delegate = [WsdAppDelegate new];
@@ -1783,6 +2192,16 @@ int main(int argc, char **argv) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     make_menu();
     [NSApp finishLaunching];
+    /* App Nap would slow wsd down while its windows are covered and nothing plays, with the game waiting on it (its
+     * frames, its input, a match being found meanwhile); Wine's Mac driver turns it off the same way
+     * (-[WineApplicationController transformProcessToForeground:]). Idle system sleep stays allowed. */
+    g_app_nap_off = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                                                                 reason:@"Running a Windows game"];
+    [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                                                      object:nil queue:NSOperationQueue.mainQueue
+                                                  usingBlock:^(NSNotification *note) {
+      screens_changed();
+    }];
 
     static dispatch_source_t acc;
     acc = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)ls, 0, dispatch_get_main_queue());

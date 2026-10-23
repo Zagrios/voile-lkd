@@ -32,10 +32,10 @@ rules that the header cannot express.
 | type | name | payload | effect |
 | --- | --- | --- | --- |
 | 1 | HELLO | `wsd_hello` | replies `EV_HELLO` with the size in pixels, max refresh and backing scale of the screen with the menu bar (the origin of window coordinates, whichever screen has the key window), and its work area (without the menu bar and the Dock; zero from older servers) |
-| 2 | WINDOW_CREATE | `wsd_window_create` + UTF-8 title | NSWindow + layer-backed view with an opaque black `CAMetalLayer`; size in pixels; ids are client-chosen, max 16. `WSD_STYLE_TITLED` gives the macOS title bar (with close, minimize and zoom buttons as `CLOSABLE`, `MINIATURIZABLE`, `RESIZABLE` ask), `BORDERLESS` none |
+| 2 | WINDOW_CREATE | `wsd_window_create` + UTF-8 title | NSWindow + layer-backed view with an opaque black `CAMetalLayer`; size in pixels; ids are client-chosen, max 16. `WSD_STYLE_TITLED` gives the macOS title bar (with close, minimize and zoom buttons as `CLOSABLE`, `MINIATURIZABLE`, `RESIZABLE` ask), `BORDERLESS` none; `TOPMOST` floats above the windows that are not, `NOACTIVATE` never becomes the key window |
 | 3 | WINDOW_DESTROY | `wsd_window` | releases a pending frame, restores relative mode, closes |
-| 4 | WINDOW_SHOW | `wsd_window_flag` | 1: activate app, `makeKeyAndOrderFront`, then one `EV_RESIZE`; 0: `orderOut` |
-| 5 | WINDOW_FULLSCREEN | `wsd_window_flag` | 1: borderless, level `NSMainMenuWindowLevel+1`, frame = screen frame, Dock and menu bar hidden; 0: restore. Exactly one `EV_RESIZE` per transition |
+| 4 | WINDOW_SHOW | `wsd_window_flag` | 1: activate app, in front of the server's windows as the key window, then one `EV_RESIZE`; 2: in front without becoming key and without activating the app (Win32 `SWP_NOACTIVATE`); 0: `orderOut` |
+| 5 | WINDOW_FULLSCREEN | `wsd_window_flag` | 1: borderless, frame = screen frame, Dock and menu bar hidden, above the menu bar while the server is the active app (see Levels); 0: restore. Exactly one `EV_RESIZE` per transition, and one when the screen changes |
 | 6 | CURSOR_VISIBLE | `wsd_window_flag` (window ignored) | `[NSCursor hide]` / `unhide`, balanced |
 | 7 | CURSOR_CLIP | `wsd_cursor_clip` | absolute motion outside the rectangle (window pixels) is clamped (`EV_MOTION.flags` bit 0) and the real pointer is warped back with `CGWarpMouseCursorPosition` |
 | 8 | RELATIVE_MOUSE | `wsd_window_flag` | 1: `CGAssociateMouseAndMouseCursorPosition(false)`; motion is reported only as `EV_RELATIVE` raw deltas (`NSEvent.deltaX/Y`) |
@@ -47,11 +47,16 @@ rules that the header cannot express.
 | 14 | PING | `wsd_ping` | `EV_PONG` with server time |
 | 15 | DEBUG_INJECT | `wsd_window_flag` | test only: synthetic NSEvents fed to the window (1: key, modifiers, buttons, motion, wheel; 2: raw delta; 3: motion outside the clip rect). Every resulting event carries flag bit 31 (`WSD_KEY_SYNTHETIC`) |
 | 16 | QUIT | none | server exits |
-| 25 | WINDOW_SET_STYLE | `wsd_window_flag` | value = `WSD_STYLE_*` frame (TOPMOST ignored); the content keeps its place on screen. While fullscreen, applied when fullscreen ends |
-| 26 | WINDOW_MINIMIZE | `wsd_window_flag` | 1: into the Dock (`miniaturize:`; a window without a minimize button is ordered out), 0: back |
+| 25 | WINDOW_SET_STYLE | `wsd_window_flag` | value = `WSD_STYLE_*`; the content keeps its place on screen. While fullscreen, the frame is applied when fullscreen ends; `TOPMOST` and `NOACTIVATE` at once |
+| 26 | WINDOW_MINIMIZE | `wsd_window_flag` | 1: into the Dock (`miniaturize:`; a window without a minimize button is ordered out), 0: back (an ordered-out window is shown again without becoming key) |
 | 27 | APP_ICON | `wsd_app_icon` + 1 fd | BGRA8 pixels with straight alpha, at most 1024x1024, read once (`pread`): the application icon of the server (Dock, Cmd-Tab) |
 | 28 | OPEN_URL | UTF-8 address | an `http` or `https` address with a host, opened in the Mac's default browser (`NSWorkspace openURL:`); any other is rejected with `-EINVAL`. The guest's `xdg-open` sends it for the links a game opens |
-| 29 | AUDIO_OPEN_INPUT | `wsd_audio_open` + 1 fd | like the audio output open (type 20, see `wsd_protocol.h`), for the default microphone: wsd fills the shared ring, the client reads it and publishes `read_frames`. The frames arrive in the open request's rate, channels and sample format (CoreAudio converts them). START, STOP and CLOSE as for output; RESET is refused with `-EINVAL`, the client resets the ring itself. macOS asks the user for microphone access when the first stream starts |
+| 29 | CURSOR_WARP | `wsd_cursor_pos` | the pointer goes to x,y screen pixels (`CGWarpMouseCursorPosition`, without the 0.25 s macOS holds it still afterwards); mouse moves queued before it are dropped. Ignored while the server is not the active app and in relative mode |
+| 30 | CURSOR_DEFINE | `wsd_cursor_define` + 1 fd | BGRA8 pixels with straight alpha, at most 256x256, read once (`pread`): a cursor of the client, shown at the backing scale, set later by its id (`WSD_CURSOR_FIRST_DEFINED` and up, at most 64 per client; defining an id again replaces it) |
+| 31 | CURSOR_SET | `wsd_cursor_set` | the cursor over the content of the server's windows: one of the Mac's (`WSD_CURSOR_*`) or a defined one; `-ENOENT` for an unknown id. CURSOR_VISIBLE still hides it |
+| 32 | WINDOW_FOCUS | `wsd_window` | the client activated the window: it comes in front as the key window. While another app is active it becomes key once the server is active again; the server activates itself this way only before it was ever active (a game's start). Ignored for a `NOACTIVATE` window |
+| 33 | SCREEN_SAVER | `wsd_window_flag` (window ignored) | 0: the display does not sleep on its own (`PreventUserIdleDisplaySleep`) until 1 or the client leaves |
+| 34 | AUDIO_OPEN_INPUT | `wsd_audio_open` + 1 fd | like the audio output open (type 20, see `wsd_protocol.h`), for the default microphone: wsd fills the shared ring, the client reads it and publishes `read_frames`. The frames arrive in the open request's rate, channels and sample format (CoreAudio converts them). START, STOP and CLOSE as for output; RESET is refused with `-EINVAL`, the client resets the ring itself. macOS asks the user for microphone access when the first stream starts |
 | 18 | PRESENT_REGION | `wsd_present_region` | like PRESENT, but into an overlay plane (a `CAMetalLayer` sublayer) placed at x,y width x height window pixels; used for a D3D swapchain in the client area while the base plane keeps the GDI surface (frame, title). 0x0 removes the plane. `EV_PRESENTED`/`EV_RELEASE` as for PRESENT |
 | 17 | WINDOW_SET_FRAME | `wsd_window_frame` | moves (`WSD_FRAME_MOVE`: content top-left at x,y screen pixels, origin top-left of the screen with the menu bar) and/or resizes (`WSD_FRAME_SIZE`: content width x height pixels, 1..16384). A size change sends exactly one `EV_RESIZE`. When AppKit places the window elsewhere (a title bar is kept below the menu bar and on screen), an `EV_FRAME` gives the frame it got. Rejected with `-EINVAL` while fullscreen |
 
@@ -60,7 +65,7 @@ rules that the header cannot express.
 | type | name | payload |
 | --- | --- | --- |
 | 101 | EV_HELLO | `wsd_hello_reply` |
-| 102 | EV_KEY | `wsd_ev_key` + UTF-8 `NSEvent.characters` (empty for modifiers). `mac_keycode` is the `kVK_*` virtual keycode; modifier keys arrive through `flagsChanged` with `WSD_KEY_DOWN` computed from the modifier bit. No IME/text-input composition yet |
+| 102 | EV_KEY | `wsd_ev_key` + UTF-8 `NSEvent.characters` (empty for modifiers). `mac_keycode` is the `kVK_*` virtual keycode; modifier keys arrive through `flagsChanged` with `WSD_KEY_DOWN` computed from the modifier bit, except Caps Lock, a toggle: a press and a release for each change, and one more pair when a window becomes key if it changed meanwhile. `WSD_KEY_ISO`: the key comes from an ISO keyboard, where `kVK_ISO_Section` and `kVK_ANSI_Grave` swap places. No IME/text-input composition yet |
 | 103 | EV_BUTTON | `wsd_ev_button`: 0 left, 1 right, 2+ `buttonNumber`; position in window pixels, top-left origin |
 | 104 | EV_MOTION | `wsd_ev_motion` absolute, window pixels; bit 0 = clamped by the clip rectangle |
 | 105 | EV_RELATIVE | `wsd_ev_relative` raw deltas (relative mode only) |
@@ -75,6 +80,8 @@ rules that the header cannot express.
 | 114 | EV_FRAME | `wsd_window_frame` (MOVE and SIZE set): the user moved or resized the window, or AppKit placed it (content, screen pixels). Not sent for WINDOW_SET_FRAME that lands where asked, nor while fullscreen or in the Dock |
 | 115 | EV_MINIMIZE | `wsd_window_flag`: 1 the window went into the Dock, 0 it came back (also after WINDOW_MINIMIZE: the client ignores a state it already has) |
 | 116 | EV_ZOOM | `wsd_window`: the zoom (green) button; the client maximizes or restores and sets the frame itself |
+| 117 | EV_DISPLAY | `wsd_hello_reply`: the screen with the menu bar changed size, scale or refresh rate (not sent for its work area alone) |
+| 118 | EV_APP_DEACTIVATED | no payload: another app became the active one (Cmd-Tab, a click elsewhere, a link opened in the browser); the client puts the game in the background |
 
 All times are `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` nanoseconds, the same timebase as
 `mach_absolute_time` and `CACurrentMediaTime`.
@@ -83,7 +90,21 @@ All times are `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` nanoseconds, the same ti
 
 Obelisk starts wsd from a bundle named after the game (`CFBundleName`), so the menu bar, the Dock and Cmd-Tab show
 the game's name; APP_ICON gives its icon. The application menu has Hide and Quit. Quit (Cmd-Q, the Dock) sends
-`EV_CLOSE` to every window instead of ending the server under a running game; with no window it ends the server.
+`EV_CLOSE` to every window instead of ending the server under a running game; with no window it ends the server. A
+logout, restart or shutdown also sends `EV_CLOSE` and waits (`NSTerminateLater`): it goes on once the last client is
+gone, and is refused if a client is still there after 30 seconds. App Nap is off for as long as the server runs.
+Coming back to the server (Cmd-Tab, the Dock) with none of its windows visible brings back the largest window in the
+Dock or minimized out of sight, which its client hears as `EV_MINIMIZE` 0: a game in exclusive fullscreen minimizes
+itself when it goes to the background.
+
+## Levels
+
+As in Wine's Mac driver, a fullscreen window is above the menu bar and the Dock only while the server is the active
+app. Going back to front in the window server's order, every window on the active Space takes at least the level of
+the windows behind it, so a window shown over a fullscreen one rises with it, and `TOPMOST` windows stay above all the
+others. While the server is not active, a `TOPMOST` window still floats above the other apps' windows unless it is
+fullscreen (a game in D3D exclusive fullscreen has its window topmost). The levels are set again when the server resigns or becomes active, when the active Space changes, and when a
+window is shown, hidden, destroyed, or enters or leaves fullscreen.
 
 ## Redisplay
 

@@ -579,3 +579,60 @@ Contexte. Dead by Daylight (Epic, Unreal 5, Easy Anti-Cheat), moteur Linux chois
 Écarté : installer le VC++ de l'installateur du jeu (14.29) dans le préfixe Linux. Le `msvcp140` de Wine annonce 14.51 et le jeu est lié avec 14.44 ; un `msvcp140` natif plus ancien que 14.40 fait justement planter `_Mtx_lock` sur un pointeur nul.
 
 Vérification : l'utilisateur a lancé le jeu, menus aux bonnes couleurs. Reste : le jeu saccade, non mesuré. Installés à la main dans le runtime de dev : `fexdarwin-run` `f8008d33` (sauvegarde `.2a763995`), wsd `e9530034` (sauvegarde `wsd.e293795e`), `nptunix.so` `772e9151` (sauvegarde `.19f082eb`), `windows/{d3d11,dxgi,d3d12}.dll` (sauvegardes `*.dll.20261022`).
+
+## Plein écran : la fenêtre du jeu restait devant les autres apps après Cmd+Tab (2026-10-23)
+
+Contexte. Rocket League en plein écran sur le moteur Linux : après Cmd+Tab, l'autre app devient active et prend le clavier et la souris, mais l'image du jeu reste devant elle. Le navigateur ouvert par un lien du jeu (`OPEN_URL`, `9d09a1d`) restait caché de la même façon.
+
+Cause. LU : `setFullscreenMode:` mettait la fenêtre au niveau `NSMainMenuWindowLevel + 1` (25) pour toute la durée du plein écran, et un niveau ne change pas quand l'app perd la main. Les options de présentation (Dock et barre de menus masqués) n'y sont pour rien : macOS ne les applique que tant que l'app est active. Le driver Mac de Wine fait l'inverse : `-[WineWindow minimumLevelForActive:]` ne monte une fenêtre plein écran qu'avec l'app active, et `adjustWindowLevels:NO` la redescend dans `applicationWillResignActive:`. Même famille : une fenêtre montrée par-dessus la fenêtre plein écran (dialogue, boîte de crash) restait au niveau normal, donc dessous, comme une fenêtre topmost (niveau 3).
+
+MESURE (client de test hors dépôt : trois fenêtres wsd, plein écran puis topmost puis dialogue, un clic et des Cmd+Tab postés, couches lues dans `CGWindowListCopyWindowInfo`) :
+- Ancien wsd : après Cmd+Tab, le jeu reste à 25 devant l'app active et le Dock. Le dialogue est à 0 et le topmost à 3, tous deux sous le jeu. Même sans avoir jamais été active (activation refusée), la fenêtre plein écran couvrait Safari.
+- Nouveau wsd : avec wsd active, topmost 26, dialogue 25, jeu 25, le dialogue devant le jeu. Après Cmd+Tab, le jeu et le dialogue passent à 0 derrière l'autre app et le Dock revient. Au retour, on retrouve le même ordre. Une fois la fenêtre du jeu détruite, le dialogue redescend à 0.
+
+Correctif wsd (`f41caa8`). `adjust_levels` reprend `adjustWindowLevels:` : de l'arrière vers l'avant, dans l'ordre du serveur de fenêtres (Space actif, topmost en tête), chaque fenêtre prend le niveau que son état demande et au moins celui des fenêtres derrière elle, et les topmost restent au-dessus des autres. La passe tourne quand wsd perd ou reprend la main, quand le Space actif change, et quand une fenêtre s'affiche, se cache, est détruite, ou entre ou sort du plein écran. Une fenêtre qui s'affiche prend d'abord le niveau de celle de devant, pour être placée devant elle.
+
+Hors de wsd : le driver (`wineobelisk.drv`) n'envoie pas l'ordre des fenêtres (`insert_after` ignoré) et ne lit `WS_EX_TOPMOST` qu'à la création.
+
+Vérification : l'utilisateur a testé Rocket League en plein écran (Cmd+Tab, lien ouvert depuis le jeu, retour au jeu). Installé à la main dans le runtime de dev : wsd `fdb3ba42` dans `v26.3.0-18` (sauvegarde `wsd.v26.3.0-18`).
+
+## Ce que le driver Mac de Wine faisait et que wsd n'avait pas (2026-10-23)
+
+Contexte. Comparaison de `winemac.drv` (celui du moteur Windows) avec wsd et `wineobelisk.drv` : notre driver avait 10 points d'entrée, winemac une cinquantaine. Repris en un lot, sauf les gros chantiers et le moins prioritaire.
+
+MESURE. Un programme de test (`wsdtest.exe`, hors dépôt) lancé par le `launch.sh` d'Obelisk sur un clone APFS du runtime ; côté Mac, un outil poste touches et clics puis lit les couches du serveur de fenêtres, le pointeur, `NSCursor.currentSystemCursor` et `pmset -g assertions`. Avant → après :
+- pavé numérique 5 : rien → `VK_NUMPAD5`, scan 0x4c. Touche `@ #` d'un clavier ISO : rien → scan 0x29 ; touche à droite de Maj gauche : scan 0x29 → 0x56.
+- Caps Lock basculé quatre fois : état Wine 1,1,1,1,0,0,0,0 → 1,0,1,0 (wineserver bascule à chaque appui, `set_input_key_state`).
+- `SetCursorPos(300,250)` : pointeur immobile → en 300,250.
+- curseur couleur 32×32 du jeu, `IDC_IBEAM` : flèche du Mac → l'image du jeu avec son point chaud, l'I-beam du Mac.
+- popup `WS_EX_NOACTIVATE` montré en `SW_SHOWNOACTIVATE` : devenait fenêtre clé, et l'`EV_FOCUS` qui suivait l'activait aussi dans Wine → laisse le premier plan au jeu.
+- `HWND_TOPMOST` après la création : ignoré → niveau 3, puis 0 avec `HWND_NOTOPMOST`.
+- `SetForegroundWindow` du jeu vers une fenêtre de derrière : le Mac ne suivait pas → elle passe devant.
+- `SPI_SETSCREENSAVEACTIVE` à FALSE puis TRUE : rien → assertion `PreventUserIdleDisplaySleep` prise puis rendue.
+
+Correctifs :
+- wsd (`0083ffe`). Caps Lock en appui et relâche à chaque changement ; `WSD_KEY_ISO` ; `CURSOR_WARP`, `CURSOR_DEFINE`, `CURSOR_SET` ; `WINDOW_SHOW` 2, `WSD_STYLE_NOACTIVATE`, `WINDOW_FOCUS`, `TOPMOST` appliqué ; `EV_DISPLAY` ; `SCREEN_SAVER` ; déconnexion, redémarrage ou arrêt du Mac en `NSTerminateLater` (avant : annulés tant qu'un jeu tournait) ; App Nap coupé.
+- voile-wine `a3ae9c1e336` (`wineobelisk.drv`). Curseurs (table des curseurs système de winemac, sinon l'image), `SetCursorPos`, `ActivateWindow`, montrer sans activer, `WS_EX_TOPMOST` suivi, `SystemParametersInfo`, `EV_DISPLAY` (le processus du bureau appelle `DisplayModeChanged`), table de touches complète de winemac avec l'échange ISO. Bug trouvé au test : `NtUserGetIconInfo` donne les longueurs en caractères, pas en octets ; l'I-beam n'était pas reconnu.
+- obelisk-input (`ded548b`). `IOPMAssertionDeclareUserActivity` sur les boutons et les sticks au-delà d'un tiers, au plus toutes les 5 s.
+
+Régression trouvée par l'utilisateur, corrigée avant le commit. Un jeu en plein écran exclusif D3D (Sugar, DXMT) ouvrait un lien : Safari devenait l'app active, mais restait sous l'image du jeu, et Discord aussi. LU : le swapchain de Neptune met la fenêtre en `HWND_TOPMOST` (`npt_swapchain.c:541`, comme DXMT et Windows), et wsd faisait flotter toute fenêtre topmost, même inactive. Règle reprise de winemac (`TOPMOST_FLOAT_INACTIVE_NONFULLSCREEN`, son réglage par défaut) : une fenêtre topmost plein écran ne flotte plus quand wsd n'est pas actif. MESURE : après Cmd+Tab vers Teams, fenêtre plein écran topmost au niveau 3 devant Teams, puis au niveau 0 derrière avec la règle.
+
+Non testé : App Nap, la déconnexion, la manette, un changement d'écran. Gros chantiers laissés de côté : disposition du clavier (AZERTY, `ToUnicodeEx`), presse-papiers, ordre des fenêtres (`insert_after`) et multi-écran. Reste aussi : Wine n'apprend pas que le jeu passe en arrière-plan (winemac met le premier plan sur le bureau, le jeu reçoit `WM_ACTIVATEAPP(FALSE)`) ; non fait, à décider.
+
+Installés à la main dans le runtime de dev `v26.3.0-18` : `engine/wsd` `bddd403a`, `engine/obelisk-input` `9ed3513b`, `wineobelisk.so` `051329fa` (originaux en `*.v26.3.0-18`).
+
+## Le jeu passe en arrière-plan quand une autre app passe devant (2026-10-23)
+
+Contexte. Le driver ignorait la perte de focus : pour Wine, le jeu restait au premier plan quelle que soit l'app où se trouvait l'utilisateur. Il ne recevait jamais `WM_ACTIVATEAPP(FALSE)` et ne pouvait pas se mettre en pause, couper son son ou se réduire comme sous Windows. winemac le fait (`APP_DEACTIVATED`, `macdrv_app_deactivated` : le premier plan passe au bureau).
+
+MESURE (programme de test hors dépôt par le `launch.sh` d'Obelisk ; retour au jeu en rouvrant l'app comme le Dock, le Cmd+Tab automatisé suivant l'ordre des apps récentes) :
+- avant : après Cmd+Tab, premier plan toujours au jeu, aucun `WM_ACTIVATEAPP` ; un jeu qui se réduit à la désactivation ne se réduisait jamais.
+- après : départ → `WM_ACTIVATEAPP` off, premier plan au bureau ; retour → `WM_ACTIVATEAPP` on, premier plan au jeu, fenêtre plein écran au niveau 25 ; le jeu qui se réduit disparaît, puis revient restauré avec le premier plan.
+
+Trouvé en route. LU : `set_foreground_window` du serveur (`queue.c:3831`) refuse le premier plan à un processus qui ne l'a pas et dont la file n'a pas d'entrée utilisateur plus récente. Le `NtUserSetForegroundWindow` du thread d'événements ne marchait que parce que le jeu n'avait jamais perdu le premier plan ; une fois le bureau au premier plan, le retour était refusé. Comme `macdrv_window_got_focus`, le focus passe maintenant par un message à la fenêtre, dont le thread prend le premier plan avec `NtUserSetForegroundWindowInternal`. Une fenêtre encore réduite le prend après le `SC_RESTORE` posté avant.
+
+Correctifs :
+- wsd (`8d8ab8d`). `EV_APP_DEACTIVATED` à chaque client quand wsd n'est plus actif ; une fenêtre sans bouton de réduction réduite par le client est marquée, et revient avec `WINDOW_MINIMIZE` 0 ; au retour (activation ou clic dans le Dock) sans fenêtre visible, la plus grande réduite revient (`-unminimizeWindowIfNoneVisible` de winemac).
+- voile-wine `29abf1029b0`. `EV_APP_DEACTIVATED` : relâche du curseur et premier plan au bureau dans le processus qui l'a ; focus par `WM_OBELISK_TAKE_FOCUS` ; toute fenêtre réduite passe par `WINDOW_MINIMIZE`.
+
+Vérification : l'utilisateur a essayé ses jeux. Installés à la main dans le runtime de dev `v26.3.0-18` : `engine/wsd` `0801e582`, `wineobelisk.so` `da9930a6`.
