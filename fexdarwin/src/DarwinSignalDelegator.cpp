@@ -17,7 +17,9 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <csignal>
 #include <cstring>
+#include <pthread.h>
 #include <unistd.h>
 
 thread_local GuestThread* CurrentGuestThread = nullptr;
@@ -64,8 +66,9 @@ void DarwinSignalDelegator::Install() {
   struct sigaction Sa {};
   Sa.sa_sigaction = &DarwinSignalDelegator::Handler;
   sigemptyset(&Sa.sa_mask);
-  // SA_NODEFER is not set: faults inside the handler are fatal rather than recursive. SA_ONSTACK keeps the handler off
-  // the (possibly overflowed) guest-thread stack.
+  // SA_NODEFER is not set: a handler does not take its own signal again. macOS then replays a fault of that signal
+  // inside the handler forever, so HandleFault lets SIGBUS through where its own stores may fault. SA_ONSTACK keeps the
+  // handler off the (possibly overflowed) guest-thread stack.
   Sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
   for (int S : {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE}) {
     if (sigaction(S, &Sa, nullptr) != 0) {
@@ -311,10 +314,19 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
       }
     }
 
-    // 3. Unaligned atomic access in JIT code (alignment fault): back-patch the access, as FEX does on Linux.
+    // 3. Unaligned atomic access in JIT code (alignment fault): back-patch the access, as FEX does on Linux. The handler
+    //    stores the atomic's result itself, and a store to a page watched for code faults there. Linux reports that
+    //    fault as SIGSEGV, which reaches step 4 from inside this handler. macOS reports it as SIGBUS, the signal being
+    //    handled: blocked, it would replay the store forever (Hunt: Showdown's Easy Anti-Cheat froze on its splash).
+    //    SIGBUS is let through while the access is emulated.
     if (Sig == SIGBUS && G->CTX->IsAddressInCodeBuffer(Th, PC) && DarwinCtx::IsDataAlignmentFault(Uc)) {
       const auto Type = FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier;
+      sigset_t Bus, Blocked;
+      sigemptyset(&Bus);
+      sigaddset(&Bus, SIGBUS);
+      pthread_sigmask(SIG_UNBLOCK, &Bus, &Blocked);
       auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(Th, Type, PC, DarwinCtx::GPRs(Uc));
+      pthread_sigmask(SIG_SETMASK, &Blocked, nullptr);
       if (Result) {
         DarwinCtx::SetPc(Uc, PC + *Result);
         return true;
