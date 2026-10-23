@@ -1,8 +1,8 @@
-# wine-5 : SIGBUS intermittent dans le dispatcher FEX juste après un fork (hôte build-lead du 21:09)
+# wine-5: intermittent SIGBUS in the FEX dispatcher right after a fork (build-lead host of 21:09)
 
-Demandeur : agent wine-linux. Non bloquant (intermittent), mais il tue des processus Wine.
+Requester: wine-linux agent. Not blocking (intermittent), but it kills Wine processes.
 
-MESURE, deux fois sur une dizaine de lancements Wine depuis l'hôte relinké à 21:09 (logs/wine-linux-https-004.log, logs/wine-linux-m4-gditest-005.log) :
+MEASURED, twice in about ten Wine launches since the host relinked at 21:09 (logs/wine-linux-https-004.log, logs/wine-linux-m4-gditest-005.log):
 ```
 [fexdarwin] FATAL unhandled fault: signal 10 (si_code 1) fault address 0x104e645f4
 [fexdarwin]   host pc=0x104e645f4 sp=0x17c5c2f10 (inside the FEX dispatcher)
@@ -10,16 +10,16 @@ MESURE, deux fois sur une dizaine de lancements Wine depuis l'hôte relinké à 
 [fexdarwin]   guest rsi=0 rdi=0x1200011 rbp=0x3ffffffdfba0 rsp=0x3ffffffdfa40 r8=0 r9=0
 lkd: guest pid 4 (host child) died without exit notification, host status -> wait status 0x8a00
 ```
-rdi = 0x1200011 (CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD) et rax = 0 : c'est l'enfant d'un fork() glibc, au retour de la syscall, rcx = rip. host pc = fault address : SIGBUS en exécutant le code du dispatcher lui-même dans l'enfant (INFERE : page de code JIT ou du dispatcher pas encore exécutable/mappée dans l'enfant, en lien possible avec la correction « invalidation de code depuis les threads de service LKD »). Dans le second cas, l'enfant mort était le wineserver lancé par wine, et tout le lancement échoue.
-Trois `wine cmd /c echo hi` de suite ensuite : 0 erreur (m2-cmd-031..033). Pas de témoin minimal ; une boucle de fork() sous Wine le reproduit au mieux 1 fois sur 5.
+rdi = 0x1200011 (CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD) and rax = 0: this is the child of a glibc fork(), on return from the syscall, rcx = rip. host pc = fault address: SIGBUS while executing the dispatcher's own code in the child (INFERRED: JIT or dispatcher code page not executable/mapped yet in the child, possibly linked to the fix "code invalidation from the LKD service threads"). In the second case, the dead child was the wineserver launched by wine, and the whole launch fails.
+Three `wine cmd /c echo hi` in a row afterwards: 0 errors (m2-cmd-031..033). No minimal witness; a fork() loop under Wine reproduces it at best 1 time in 5.
 
-## Note du mainteneur d'intégration (2026-10-02)
+## Note from the integration maintainer (2026-10-02)
 
-Même période que l'interblocage de fork de mm (témoin w18_forkjit). Corrigé côté LKD : chaque verrou tenu à travers `fork()` est maintenant reconstruit dans l'enfant (`lkd_fork_reinit_mutex`, `lkd_fork_reinit_rwlock`), jamais déverrouillé. mm n'appelle plus `ops->invalidate_code` en tenant le verrou mmap (CONVENTIONS 3.4).
-INFERE : un SIGBUS à l'exécution du dispatcher dans l'enfant (pc = adresse fautive) touche la mémoire de code du JIT du moteur, que LKD ne gère pas (protection MAP_JIT, état d'écriture par thread au moment du fork). Ce n'est pas démontré côté LKD : à revoir côté moteur si l'erreur revient avec un hôte lié à la bibliothèque actuelle.
+Same period as mm's fork deadlock (witness w18_forkjit). Fixed on the LKD side: each lock held across `fork()` is now rebuilt in the child (`lkd_fork_reinit_mutex`, `lkd_fork_reinit_rwlock`), never unlocked. mm no longer calls `ops->invalidate_code` while holding the mmap lock (CONVENTIONS 3.4).
+INFERRED: a SIGBUS while executing the dispatcher in the child (pc = faulting address) touches the engine's JIT code memory, which LKD does not manage (MAP_JIT protection, per-thread write state at the time of the fork). This is not demonstrated on the LKD side: to look at again on the engine side if the error comes back with a host linked against the current library.
 
-## Résolution (2026-10-10)
+## Resolution (2026-10-10)
 
-Cause, côté moteur et pas dans LKD. macOS donne au fil de l'enfant d'un fork l'état d'écriture MAP_JIT que le fil du parent avait à son dernier changement de contexte, pas son état réel (fait F7 de `docs/journal/darwin-process-facts-a.md`, test `tests/darwin-process/f7_fork_jitstate.c`). Le moteur bascule ce mode sans appel système (`JITWriteScope` de FEXCore, quelques dizaines de nanosecondes à chaque traduction, liaison ou déliaison de bloc). Un fil préempté pendant une de ces écritures, puis revenu en exécution, forkait donc un enfant qui ne pouvait pas exécuter le répartiteur : SIGBUS, faute de permission à l'exécution (esr 0x8200000f), sur la première instruction après le retour de la syscall. Fréquence mesurée : une faute pour 30 à 60 démarrages de Wine dans les essais du 2026-10-10, plus sous charge.
+Cause, on the engine side and not in LKD. macOS gives the thread of a fork's child the MAP_JIT write state that the parent's thread had at its last context switch, not its real state (fact F7 of `docs/journal/darwin-process-facts-a.md`, test `tests/darwin-process/f7_fork_jitstate.c`). The engine toggles this mode without a system call (FEXCore's `JITWriteScope`, a few tens of nanoseconds at each block translation, link or unlink). A thread preempted during one of these writes, then back in execution, therefore forked a child that could not execute the dispatcher: SIGBUS, permission fault on execution (esr 0x8200000f), on the first instruction after the return from the syscall. Measured frequency: one fault for 30 to 60 Wine starts in the tests of 2026-10-10, more under load.
 
-Correctif fexdarwin : `ForkChild` repose l'état du fil (`pthread_jit_write_protect_np`, exécution hors d'une écriture) avant tout retour au code JIT. Témoin `tests/glibc-x86_64/src/w33_forkwx.c` : 15 enfants morts sur 600 tours avec l'ancien moteur, 0 après.
+fexdarwin fix: `ForkChild` resets the thread's state (`pthread_jit_write_protect_np`, execution outside a write) before any return to JIT code. Witness `tests/glibc-x86_64/src/w33_forkwx.c`: 15 dead children in 600 rounds with the old engine, 0 after.

@@ -1,151 +1,151 @@
-# Faits Darwin sur l'inspection de processus, les exceptions Mach, le temps et l'identité (rapport B)
+# Darwin facts on process inspection, Mach exceptions, time and identity (report B)
 
-Rapport vivant, mis à jour à chaque jalon. Dernière mise à jour : 2026-10-02 10:20 (brouillon 1, reprise après interruption de la session).
+Living report, updated at each milestone. Last update: 2026-10-02 10:20 (draft 1, resumption after interruption of the session).
 
-Convention : MESURÉ = sortie d'un programme exécuté sur cette machine, journal cité. LU = lecture d'une source ou d'un en-tête. DÉDUIT = inférence, à qualifier. Une section marquée « à compléter » n'a pas encore de mesure.
+Convention: MEASURED = output of a program run on this machine, journal cited. READ = reading of a source or a header. DEDUCED = inference, to be qualified. A section marked "to be completed" has no measurement yet.
 
-Racine de travail : `build/experiments/rocket-wine-fex-darwin-20261002` (notée `$EXP`). Sources des témoins : `$EXP/witnesses/darwin-process/`. Journaux : `$EXP/evidence/darwin-process/`.
+Working root: `build/experiments/rocket-wine-fex-darwin-20261002` (written `$EXP`). Witness sources: `$EXP/witnesses/darwin-process/`. Journals: `$EXP/evidence/darwin-process/`.
 
-## État d'avancement
+## Progress state
 
-| Témoin | Sujet | État |
+| Witness | Subject | State |
 | --- | --- | --- |
-| `h0_sysinfo.sh` | faits d'environnement (SIP, boot-args, version, Rosetta) | exécuté, `evidence/darwin-process/h0_sysinfo.log` |
-| `j1_time_ident.c` | horloges, minuteries, identifiants, limites | source laissée par la tentative interrompue, journal partiel (arrêt dans J2), à relancer |
-| `h1_*` task port, mémoire, états de thread | H | à écrire |
-| `h2_*` ptrace | H | à écrire |
-| `h3_*` proc_pidinfo, sysctl | H | à écrire |
-| `h4_*` canal coopératif | H | à écrire |
-| `i1_*` exceptions Mach contre signaux | I | à écrire |
-| `i2_*` sonde `svc` | I | à écrire |
-| `h5_*` transport de ptrace invité | K | à écrire |
+| `h0_sysinfo.sh` | environment facts (SIP, boot-args, version, Rosetta) | run, `evidence/darwin-process/h0_sysinfo.log` |
+| `j1_time_ident.c` | clocks, timers, identifiers, limits | source left by the interrupted attempt, partial journal (stopped in J2), to be rerun |
+| `h1_*` task port, memory, thread states | H | to be written |
+| `h2_*` ptrace | H | to be written |
+| `h3_*` proc_pidinfo, sysctl | H | to be written |
+| `h4_*` cooperative channel | H | to be written |
+| `i1_*` Mach exceptions versus signals | I | to be written |
+| `i2_*` `svc` probe | I | to be written |
+| `h5_*` guest ptrace transport | K | to be written |
 
-## Faits d'environnement (H0, MESURÉ)
+## Environment facts (H0, MEASURED)
 
-Source : `evidence/darwin-process/h0_sysinfo.log`, exécuté le 2026-10-02 10:11.
+Source: `evidence/darwin-process/h0_sysinfo.log`, run on 2026-10-02 10:11.
 
-- `sw_vers` : macOS 27.0.1, build 26A434. `sysctl kern.osversion` : 26A434.
-- `uname -a` : `Darwin 27.0.0 ... root:xnu-13432.1.9~1/RELEASE_ARM64_T6050 arm64`.
-- Machine : `Mac17,7`, Apple M5 Max, 18 coeurs (2 niveaux de performance, 6 coeurs « Super »), 36 Gio, pages de 16384 octets, `hw.tbfrequency` 24000000.
-- `kern.hv_support` : 1 (HVF disponible ; hors périmètre, noté pour mémoire).
-- SIP : `System Integrity Protection status: enabled.`
-- `boot-args` : `sysctl kern.bootargs` vide ; `nvram boot-args` et `csr-active-config` absents (aucun réglage personnalisé).
-- Mode développeur : `DevToolsSecurity -status` répond « Developer mode is currently disabled ».
-- Droits d'autorisation `system.privilege.taskport` et `system.privilege.taskport.debug` : classe `user`, groupe `_developer`, `authenticate-user` vrai, `allow-root` faux (donc un `task_for_pid` hors du chemin `get-task-allow` demanderait une authentification).
-- Rosetta : présent (`/Library/Apple/usr/libexec/oah/libRosettaRuntime`, `RosettaLinux`, `translate_tool`, paquet `com.apple.pkg.RosettaUpdateAuto`). `sysctl.proc_translated` vaut 0 pour notre shell (processus natif arm64). Aucun `arch -x86_64` n'a été lancé.
-- Utilisateur : uid 501, gid 20, membre de `_developer` et `admin`. Pas de root.
-- Limites système : `kern.maxproc` 9000, `kern.maxprocperuid` 6000, `kern.num_taskthreads` 9216, `kern.num_threads` 46080, `kern.maxfilesperproc` 138240, `kern.argmax` 1048576. `ulimit -n` 1048576 dans ce shell, `ulimit -u` 6000.
-- Outils : Apple clang 21.0.0, Xcode 27.0, SDK 27.0.
+- `sw_vers`: macOS 27.0.1, build 26A434. `sysctl kern.osversion`: 26A434.
+- `uname -a`: `Darwin 27.0.0 ... root:xnu-13432.1.9~1/RELEASE_ARM64_T6050 arm64`.
+- Machine: `Mac17,7`, Apple M5 Max, 18 cores (2 performance levels, 6 "Super" cores), 36 GiB, 16384-byte pages, `hw.tbfrequency` 24000000.
+- `kern.hv_support`: 1 (HVF available; out of scope, noted for the record).
+- SIP: `System Integrity Protection status: enabled.`
+- `boot-args`: `sysctl kern.bootargs` empty; `nvram boot-args` and `csr-active-config` absent (no custom setting).
+- Developer mode: `DevToolsSecurity -status` replies "Developer mode is currently disabled".
+- Authorization rights `system.privilege.taskport` and `system.privilege.taskport.debug`: class `user`, group `_developer`, `authenticate-user` true, `allow-root` false (so a `task_for_pid` outside the `get-task-allow` path would request authentication).
+- Rosetta: present (`/Library/Apple/usr/libexec/oah/libRosettaRuntime`, `RosettaLinux`, `translate_tool`, package `com.apple.pkg.RosettaUpdateAuto`). `sysctl.proc_translated` is 0 for our shell (native arm64 process). No `arch -x86_64` was launched.
+- User: uid 501, gid 20, member of `_developer` and `admin`. No root.
+- System limits: `kern.maxproc` 9000, `kern.maxprocperuid` 6000, `kern.num_taskthreads` 9216, `kern.num_threads` 46080, `kern.maxfilesperproc` 138240, `kern.argmax` 1048576. `ulimit -n` 1048576 in this shell, `ulimit -u` 6000.
+- Tools: Apple clang 21.0.0, Xcode 27.0, SDK 27.0.
 
-## H : inspecter un autre processus (résultats provisoires, h1 et h2 exécutés)
+## H: inspect another process (provisional results, h1 and h2 run)
 
-Témoins : `witnesses/darwin-process/h1_task_inspect.c`, `h2_ptrace.c`, journaux `evidence/darwin-process/h1_task_inspect.log` et `h2_ptrace.log`. Le débogué est le même binaire relancé avec l'argument `debuggee` (signé `com.apple.security.get-task-allow`, thread principal en boucle assembleur à registres connus, un thread bloqué dans `read(2)`, un thread serveur).
+Witnesses: `witnesses/darwin-process/h1_task_inspect.c`, `h2_ptrace.c`, journals `evidence/darwin-process/h1_task_inspect.log` and `h2_ptrace.log`. The debuggee is the same binary relaunched with the argument `debuggee` (signed `com.apple.security.get-task-allow`, main thread in an assembly loop with known registers, one thread blocked in `read(2)`, one server thread).
 
-### H1, task port d'un enfant direct signé get-task-allow (MESURÉ, h1)
+### H1, task port of a direct child signed get-task-allow (MEASURED, h1)
 
-- `task_for_pid(mach_task_self(), pid_enfant)` réussit sans invite : premier appel 1116 us, appels suivants p50 188 us (min 175 us, max 772 us). Le coût de 190 us par appel est celui d'un aller-retour avec taskgated : un traceur doit garder le port, pas le redemander. `pid_for_task` rend le bon pid.
-- `task_name_for_pid`, `task_inspect_for_pid` et `task_read_for_pid` réussissent aussi sur cet enfant, et `mach_vm_read` marche à travers le port `task_read`.
-- `mach_vm_read_overwrite` : 8 octets p50 0,62 us, 64 octets 0,62 us, 4 Kio 0,71 us, 64 Kio 2,33 us (28 Go/s), 1 Mio 28,9 us (36 Go/s). `mach_vm_read` plus `mach_vm_deallocate` de 4 Kio : 1,96 us. `mach_vm_write` de 8 octets : 0,62 us. Contenu relu égal au motif écrit par l'enfant sur 1 Mio.
-- `mach_vm_remap(copy=FALSE)` d'un tampon anonyme de l'enfant dans le traceur réussit (prot courante 3 = rw, max 7) : le mapping est partagé (une écriture de l'enfant est vue par le traceur, une écriture du traceur est vue par l'enfant), et une lecture de 8 octets à travers ce mapping coûte moins que la résolution de l'horloge (41 ns). C'est le chemin le plus rapide pour un futur `/proc/<pid>/mem` ou PEEK en rafale.
-- `mach_vm_write` directement sur une page en lecture seule échoue avec `KERN_INVALID_ADDRESS` (kr=1, pas `KERN_PROTECTION_FAILURE`). `mach_vm_protect(RW|VM_PROT_COPY)`, écriture, puis retour en lecture seule fonctionne (sémantique de POKE sur page non inscriptible).
-- Écriture dans une page de code `__TEXT` du débogué : `mach_vm_protect(RW|COPY)`, `mach_vm_write` et le retour en R-X réussissent, mais l'enfant meurt de `SIGBUS` (Bus error: 10) dès qu'il exécute la page modifiée, avec ou sans `ptrace(PT_ATTACHEXC)` préalable. Un POKETEXT sur du code Mach-O signé n'est donc pas possible. Le code de l'exception reste à capturer (h6).
-- `mach_vm_region` : 66 régions parcourues en 0,054 ms (0,8 us par appel). `mach_vm_region_recurse` : 192 régions feuilles en 18,4 ms (le sous-mapping du cache partagé coûte cher). `task_info(TASK_DYLD_INFO)` et `TASK_VM_INFO` fonctionnent (taille virtuelle du débogué : environ 466 Gio, taille de page 16384).
-- `task_threads` rend 3 threads ; `THREAD_IDENTIFIER_INFO.thread_id` côté traceur est égal à `pthread_threadid_np` côté enfant ; `THREAD_EXTENDED_INFO.pth_name` rend le nom du thread (équivalent de `/proc/pid/task/tid/comm`) ; `THREAD_BASIC_INFO.run_state` donne l'état (1 running, 3 waiting).
-- `thread_get_state(ARM_THREAD_STATE64)` sur le thread principal : les 26 registres constants x1..x17, x19..x26, x28 sont relus exactement, pc dans la boucle, x27 cohérent avec le compteur en mémoire (écart 1), `ARM_NEON_STATE64` v0..v7 exact, `ARM_EXCEPTION_STATE64` (esr 0x56000080 = dernier `svc #0x80`), `ARM_DEBUG_STATE64` (130 mots, mdscr_el1 = 0). `thread_get_state` marche aussi sur un thread qui tourne, sans `thread_suspend` (p50 0,67 us, p90 7,8 us).
-- Latences : `thread_suspend` p50 0,38 us (p90 4,5), `thread_get_state` sur thread suspendu p50 0,62 us, `thread_resume` p50 0,38 us, cycle complet p50 1,46 us, p90 7,96 us, p99 11,7 us. `task_suspend` plus `task_resume` p50 0,79 us. Pendant `task_suspend` l'enfant ne répond plus ; après `task_resume` il répond.
-- Un thread bloqué dans `read(2)` montre pc = `read`+8 (juste après le `svc #0x80`), x16 = 3 (numéro de syscall BSD) et x0 = le descripteur : l'état d'un thread dans un appel système est lisible sans coopération.
-- `thread_set_state(pc = fonction, x0..x2)` sur un thread qui tourne le redirige : la fonction cible reçoit bien les trois arguments (équivalent de SETREGS plus CONT).
+- `task_for_pid(mach_task_self(), child_pid)` succeeds without prompt: first call 1116 us, following calls p50 188 us (min 175 us, max 772 us). The cost of 190 us per call is that of a round trip with taskgated: a tracer must keep the port, not request it again. `pid_for_task` returns the right pid.
+- `task_name_for_pid`, `task_inspect_for_pid` and `task_read_for_pid` also succeed on this child, and `mach_vm_read` works through the `task_read` port.
+- `mach_vm_read_overwrite`: 8 bytes p50 0.62 us, 64 bytes 0.62 us, 4 KiB 0.71 us, 64 KiB 2.33 us (28 GB/s), 1 MiB 28.9 us (36 GB/s). `mach_vm_read` plus `mach_vm_deallocate` of 4 KiB: 1.96 us. `mach_vm_write` of 8 bytes: 0.62 us. Content read back equal to the pattern written by the child over 1 MiB.
+- `mach_vm_remap(copy=FALSE)` of an anonymous buffer of the child into the tracer succeeds (current prot 3 = rw, max 7): the mapping is shared (a write by the child is seen by the tracer, a write by the tracer is seen by the child), and an 8-byte read through this mapping costs less than the clock resolution (41 ns). This is the fastest path for a future `/proc/<pid>/mem` or burst PEEK.
+- `mach_vm_write` directly on a read-only page fails with `KERN_INVALID_ADDRESS` (kr=1, not `KERN_PROTECTION_FAILURE`). `mach_vm_protect(RW|VM_PROT_COPY)`, write, then back to read-only works (POKE semantics on a non-writable page).
+- Write into a `__TEXT` code page of the debuggee: `mach_vm_protect(RW|COPY)`, `mach_vm_write` and the return to R-X succeed, but the child dies of `SIGBUS` (Bus error: 10) as soon as it runs the modified page, with or without a prior `ptrace(PT_ATTACHEXC)`. A POKETEXT on signed Mach-O code is therefore not possible. The exception code remains to be captured (h6).
+- `mach_vm_region`: 66 regions walked in 0.054 ms (0.8 us per call). `mach_vm_region_recurse`: 192 leaf regions in 18.4 ms (the sub-mapping of the shared cache is expensive). `task_info(TASK_DYLD_INFO)` and `TASK_VM_INFO` work (virtual size of the debuggee: about 466 GiB, page size 16384).
+- `task_threads` returns 3 threads; `THREAD_IDENTIFIER_INFO.thread_id` on the tracer side equals `pthread_threadid_np` on the child side; `THREAD_EXTENDED_INFO.pth_name` returns the thread name (equivalent of `/proc/pid/task/tid/comm`); `THREAD_BASIC_INFO.run_state` gives the state (1 running, 3 waiting).
+- `thread_get_state(ARM_THREAD_STATE64)` on the main thread: the 26 constant registers x1..x17, x19..x26, x28 are read back exactly, pc in the loop, x27 consistent with the counter in memory (difference 1), `ARM_NEON_STATE64` v0..v7 exact, `ARM_EXCEPTION_STATE64` (esr 0x56000080 = last `svc #0x80`), `ARM_DEBUG_STATE64` (130 words, mdscr_el1 = 0). `thread_get_state` also works on a running thread, without `thread_suspend` (p50 0.67 us, p90 7.8 us).
+- Latencies: `thread_suspend` p50 0.38 us (p90 4.5), `thread_get_state` on a suspended thread p50 0.62 us, `thread_resume` p50 0.38 us, full cycle p50 1.46 us, p90 7.96 us, p99 11.7 us. `task_suspend` plus `task_resume` p50 0.79 us. During `task_suspend` the child no longer responds; after `task_resume` it responds.
+- A thread blocked in `read(2)` shows pc = `read`+8 (just after the `svc #0x80`), x16 = 3 (BSD syscall number) and x0 = the descriptor: the state of a thread in a system call is readable without cooperation.
+- `thread_set_state(pc = function, x0..x2)` on a running thread redirects it: the target function does receive the three arguments (equivalent of SETREGS plus CONT).
 
-### H2, ptrace entre un processus et ses enfants (MESURÉ, h2)
+### H2, ptrace between a process and its children (MEASURED, h2)
 
-- `ptrace(PT_ATTACHEXC)` et `ptrace(10 = PT_ATTACH)` d'un parent sur son enfant signé get-task-allow réussissent sans invite (21 us) ; `waitpid(WUNTRACED)` rapporte un arrêt `SIGSTOP`.
-- Requêtes inexistantes sur arm64 : `PT_READ_I/D/U` et `PT_WRITE_I/D/U` rendent `EINVAL`, de même `PT_THUPDATE` avec mes arguments et toutes les requêtes 15 à 29 et 32 à 40 ; `PT_FORCEQUOTA` rend `EPERM`. Il n'existe ni GETREGS, ni SETREGS, ni PEEK, ni POKE, ni SYSCALL, ni SEIZE, ni options d'événements : tout cela doit passer par Mach ou par un canal coopératif.
-- Mode classique (`PT_TRACE_ME` dans l'enfant, puis un signal) : arrêt de signal rapporté par `waitpid` avec le numéro du signal, tous les threads de l'enfant sont arrêtés, `PT_CONTINUE` avec `data=0` supprime le signal, avec `data=signal` il est délivré (l'enfant meurt de SIGUSR1). L'`exec` produit un arrêt `SIGTRAP`, sans code d'événement.
-- `PT_STEP` en mode classique fonctionne : le pc avance de 4 octets par pas ; 5000 pas consécutifs, aller-retour `PT_STEP` plus `waitpid` p50 10,75 us, p90 14,1 us, p99 20,8 us. Le pas porte sur le premier thread (thread principal).
-- Mode exception (`PT_ATTACHEXC`) : l'arrêt `SIGSTOP` du début n'arrête que le thread qui a pris le signal (le thread serveur continue de répondre) ; un signal ultérieur est rapporté à `waitpid` mais `PT_CONTINUE` et `PT_DETACH` rendent ensuite `ESRCH`, et l'enfant reste bloqué. Ce mode exige un gestionnaire d'exceptions Mach côté traceur (h6).
-- `PT_DENY_ATTACH` dans l'enfant : un `PT_ATTACHEXC` ultérieur rend `EBUSY` et le noyau envoie `SIGSEGV` au traceur, qui meurt. `task_for_pid` continue à réussir sur ce débogué.
-- Un frère (pas le parent) peut attacher : `ppid` du traceur devient le pid du frère pendant la trace (style BSD, le noyau reparente le tracé), le parent d'origine reçoit `ECHILD` sur `waitpid`, le `ppid` revient après `PT_DETACH`.
+- `ptrace(PT_ATTACHEXC)` and `ptrace(10 = PT_ATTACH)` from a parent on its child signed get-task-allow succeed without prompt (21 us); `waitpid(WUNTRACED)` reports a `SIGSTOP` stop.
+- Requests that do not exist on arm64: `PT_READ_I/D/U` and `PT_WRITE_I/D/U` return `EINVAL`, likewise `PT_THUPDATE` with my arguments and all requests 15 to 29 and 32 to 40; `PT_FORCEQUOTA` returns `EPERM`. There is no GETREGS, no SETREGS, no PEEK, no POKE, no SYSCALL, no SEIZE, no event options: all of this must go through Mach or through a cooperative channel.
+- Classic mode (`PT_TRACE_ME` in the child, then a signal): signal stop reported by `waitpid` with the signal number, all the child's threads are stopped, `PT_CONTINUE` with `data=0` suppresses the signal, with `data=signal` it is delivered (the child dies of SIGUSR1). The `exec` produces a `SIGTRAP` stop, without event code.
+- `PT_STEP` in classic mode works: the pc advances 4 bytes per step; 5000 consecutive steps, round trip `PT_STEP` plus `waitpid` p50 10.75 us, p90 14.1 us, p99 20.8 us. The step applies to the first thread (main thread).
+- Exception mode (`PT_ATTACHEXC`): the initial `SIGSTOP` stop stops only the thread that took the signal (the server thread keeps responding); a later signal is reported to `waitpid` but `PT_CONTINUE` and `PT_DETACH` then return `ESRCH`, and the child stays blocked. This mode requires a Mach exception handler on the tracer side (h6).
+- `PT_DENY_ATTACH` in the child: a later `PT_ATTACHEXC` returns `EBUSY` and the kernel sends `SIGSEGV` to the tracer, which dies. `task_for_pid` keeps succeeding on this debuggee.
+- A sibling (not the parent) can attach: the tracer's `ppid` becomes the sibling's pid during the trace (BSD style, the kernel reparents the tracee), the original parent gets `ECHILD` on `waitpid`, the `ppid` comes back after `PT_DETACH`.
 
-### H3, proc_pidinfo et sysctl sans task port (MESURÉ, h3)
+### H3, proc_pidinfo and sysctl without task port (MEASURED, h3)
 
-Témoin `h3_pidinfo.c`, journal `h3_pidinfo.log`. Cible : l'enfant débogué (8 threads), le processus parent (même uid, non débogable) et le pid 1 (root).
+Witness `h3_pidinfo.c`, journal `h3_pidinfo.log`. Target: the debugged child (8 threads), the parent process (same uid, not debuggable) and pid 1 (root).
 
-- Sur l'enfant et sur le parent, tous les flavors essayés réussissent sans task port : `PROC_PIDLISTFDS`, `TASKALLINFO`, `TBSDINFO`, `TASKINFO`, `LISTTHREADS`, `REGIONINFO`, `REGIONPATHINFO`, `VNODEPATHINFO`, `T_SHORTBSDINFO`, `UNIQIDENTIFIERINFO`, `ARCHINFO`, `LISTTHREADIDS` (28), `PLATFORMINFO` (30), plus `proc_pidpath`. Sur le pid 1 (autre uid) seuls `T_SHORTBSDINFO`, `UNIQIDENTIFIERINFO`, `PLATFORMINFO` et `proc_pidpath` répondent, le reste rend `EPERM`.
-- `PROC_PIDLISTTHREADIDS` rend les identifiants 64 bits des threads, égaux aux `pthread_threadid_np` de l'enfant (3 correspondances sur 3 connues) ; `PROC_PIDLISTTHREADS` rend des poignées de threads (pointeurs), pas des identifiants. `PROC_PIDTHREADID64INFO(tid)` rend nom, état (`pth_run_state` 1 running, 3 waiting), priorité, temps utilisateur et système : base de `/proc/pid/task/tid/{comm,stat}`.
-- `PROC_PIDREGIONPATHINFO` parcourt les 76 régions de l'enfant en 1,2 ms (16 us par région, chemins de fichier inclus pour 4 régions) sans task port, et `PROC_PIDREGIONINFO` parcourt les 61 régions du processus parent (non débogable, même uid) : un `/proc/<pid>/maps` pour tout processus de l'utilisateur est possible sans droits, la fin du parcours rend `EINVAL`.
-- `PROC_PIDVNODEPATHINFO` donne le répertoire courant, `proc_pidpath` le chemin de l'exécutable, `PROC_PIDLISTFDS` plus `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` les descripteurs et leurs chemins, `KERN_PROCARGS2` argc, chemin et arguments (aussi sur le parent ; sur le pid 1 `EINVAL`). `kinfo_proc` donne comm, état, ppid, pgid, uid, nombre de groupes.
-- Latences (p50) : `PROC_PIDTBSDINFO` 0,17 us, `PIDTHREADID64INFO` 0,17 us, liste des identifiants de threads 0,21 us, `PIDLISTFDS` 0,25 us, `PIDREGIONINFO` 0,42 us, `PIDTASKINFO` 0,46 us, `proc_pidpath` 0,88 us, `KERN_PROCARGS2` 2,67 us, `sysctl KERN_PROC_PID` 7,2 us.
-- Limite : il n'y a pas de notion de `Tgid` ni de `PPid` namespacés, et `pbi_status` (SRUN=2) ne distingue pas les états Linux R, S, D, T ; ceux-ci viennent de `pth_run_state` par thread.
+- On the child and on the parent, all the flavors tried succeed without task port: `PROC_PIDLISTFDS`, `TASKALLINFO`, `TBSDINFO`, `TASKINFO`, `LISTTHREADS`, `REGIONINFO`, `REGIONPATHINFO`, `VNODEPATHINFO`, `T_SHORTBSDINFO`, `UNIQIDENTIFIERINFO`, `ARCHINFO`, `LISTTHREADIDS` (28), `PLATFORMINFO` (30), plus `proc_pidpath`. On pid 1 (other uid) only `T_SHORTBSDINFO`, `UNIQIDENTIFIERINFO`, `PLATFORMINFO` and `proc_pidpath` respond, the rest returns `EPERM`.
+- `PROC_PIDLISTTHREADIDS` returns the 64-bit identifiers of the threads, equal to the child's `pthread_threadid_np` (3 matches out of 3 known); `PROC_PIDLISTTHREADS` returns thread handles (pointers), not identifiers. `PROC_PIDTHREADID64INFO(tid)` returns name, state (`pth_run_state` 1 running, 3 waiting), priority, user and system time: basis of `/proc/pid/task/tid/{comm,stat}`.
+- `PROC_PIDREGIONPATHINFO` walks the 76 regions of the child in 1.2 ms (16 us per region, file paths included for 4 regions) without task port, and `PROC_PIDREGIONINFO` walks the 61 regions of the parent process (not debuggable, same uid): a `/proc/<pid>/maps` for any process of the user is possible without rights, the end of the walk returns `EINVAL`.
+- `PROC_PIDVNODEPATHINFO` gives the current directory, `proc_pidpath` the path of the executable, `PROC_PIDLISTFDS` plus `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` the descriptors and their paths, `KERN_PROCARGS2` argc, path and arguments (also on the parent; on pid 1 `EINVAL`). `kinfo_proc` gives comm, state, ppid, pgid, uid, number of groups.
+- Latencies (p50): `PROC_PIDTBSDINFO` 0.17 us, `PIDTHREADID64INFO` 0.17 us, list of thread identifiers 0.21 us, `PIDLISTFDS` 0.25 us, `PIDREGIONINFO` 0.42 us, `PIDTASKINFO` 0.46 us, `proc_pidpath` 0.88 us, `KERN_PROCARGS2` 2.67 us, `sysctl KERN_PROC_PID` 7.2 us.
+- Limit: there is no notion of namespaced `Tgid` or `PPid`, and `pbi_status` (SRUN=2) does not distinguish the Linux states R, S, D, T; these come from `pth_run_state` per thread.
 
-### H4, canal coopératif contre task port (MESURÉ, h4)
+### H4, cooperative channel versus task port (MEASURED, h4)
 
-Témoin `h4_coop_channel.c`. La cible est un binaire lancé par exec qui possède 4 Mio de mémoire privée ; le traceur veut `len` octets à une adresse de cette mémoire. Temps de la requête à l'arrivée des octets dans le tampon du traceur, p50 en us :
+Witness `h4_coop_channel.c`. The target is a binary launched by exec that owns 4 MiB of private memory; the tracer wants `len` bytes at an address of this memory. Time from the request to the arrival of the bytes in the tracer's buffer, p50 in us:
 
-| Méthode | 8 o | 4 Kio | 64 Kio | 1 Mio |
+| Method | 8 B | 4 KiB | 64 KiB | 1 MiB |
 | --- | --- | --- | --- | --- |
-| lecture directe d'un mapping partagé (shm) | 0,00 | 0,04 | 0,54 | 10,8 |
-| `mach_vm_remap` de la mémoire privée de la cible (lecture par memcpy) | 0,00 | 0,04 | 0,50 | 10,8 |
-| `mach_vm_read_overwrite` (task port) | 0,75 | 0,75 | 22,6 | 68,9 |
-| requête/réponse, attente active sur mémoire partagée | 0,12 | 0,46 | 1,79 | 25,5 |
-| pipe, notification seule (données en mémoire partagée) | 4,21 | 4,29 | 7,58 | 44,6 |
-| pipe, données dans la réponse | 4,29 | 4,42 | 7,12 | 121,7 |
-| sémaphore POSIX nommé, deux sens | 4,17 | 4,21 | 7,04 | 44,4 |
-| socketpair AF_UNIX stream | 4,79 | 5,58 | 7,54 | 44,3 |
-| socketpair AF_UNIX dgram | 5,12 | 5,83 | 7,42 | 44,2 |
-| message Mach (données en ligne dans la réponse) | 6,29 | 6,79 | 20,25 | non mesuré |
-| futex `os_sync_wait_on_address` avec `SHARED`, deux sens | 6,08 | 6,25 | 7,29 | 45,6 |
-| mutex et variable de condition `PTHREAD_PROCESS_SHARED` | 7,79 | 7,58 | 8,08 | 44,9 |
+| direct read of a shared mapping (shm) | 0.00 | 0.04 | 0.54 | 10.8 |
+| `mach_vm_remap` of the target's private memory (read by memcpy) | 0.00 | 0.04 | 0.50 | 10.8 |
+| `mach_vm_read_overwrite` (task port) | 0.75 | 0.75 | 22.6 | 68.9 |
+| request/reply, busy wait on shared memory | 0.12 | 0.46 | 1.79 | 25.5 |
+| pipe, notification only (data in shared memory) | 4.21 | 4.29 | 7.58 | 44.6 |
+| pipe, data in the reply | 4.29 | 4.42 | 7.12 | 121.7 |
+| named POSIX semaphore, both directions | 4.17 | 4.21 | 7.04 | 44.4 |
+| socketpair AF_UNIX stream | 4.79 | 5.58 | 7.54 | 44.3 |
+| socketpair AF_UNIX dgram | 5.12 | 5.83 | 7.42 | 44.2 |
+| Mach message (inline data in the reply) | 6.29 | 6.79 | 20.25 | not measured |
+| futex `os_sync_wait_on_address` with `SHARED`, both directions | 6.08 | 6.25 | 7.29 | 45.6 |
+| mutex and condition variable `PTHREAD_PROCESS_SHARED` | 7.79 | 7.58 | 8.08 | 44.9 |
 
-- Aucun effet mesurable de la classe de QoS (par défaut contre `USER_INTERACTIVE`) sur ces temps. p99 des chemins bloquants : 9 à 12 us.
-- Un réveil inter-processus bloquant coûte environ 4 us (pipe, sémaphore) à 6 us (futex partagé, message Mach). Le futex partagé n'est pas plus rapide qu'un pipe. L'attente active descend à 0,12 us mais occupe un coeur.
-- `shm_open` plus `ftruncate` plus `mmap(MAP_SHARED)` et `sem_open` nommés fonctionnent sans droit particulier ; les mutex et conditions `PTHREAD_PROCESS_SHARED` fonctionnent dans la page partagée.
-- `mach_vm_read_overwrite` du task port a un coût fixe d'environ 0,6 us (aller-retour noyau) puis monte avec la taille (36 Go/s en gros transfert) : c'est le meilleur chemin sans coopération de mapping, 5 à 10 fois plus rapide qu'un aller-retour par socket ou pipe.
+- No measurable effect of the QoS class (default versus `USER_INTERACTIVE`) on these times. p99 of the blocking paths: 9 to 12 us.
+- A blocking inter-process wakeup costs about 4 us (pipe, semaphore) to 6 us (shared futex, Mach message). The shared futex is not faster than a pipe. Busy waiting goes down to 0.12 us but occupies a core.
+- Named `shm_open` plus `ftruncate` plus `mmap(MAP_SHARED)` and `sem_open` work without any particular entitlement; `PTHREAD_PROCESS_SHARED` mutexes and conditions work in the shared page.
+- The task port's `mach_vm_read_overwrite` has a fixed cost of about 0.6 us (kernel round trip) then grows with size (36 GB/s in bulk transfer): it is the best path without mapping cooperation, 5 to 10 times faster than a round trip through socket or pipe.
 
-### H5, passage de ports Mach sans launchd et sans task_for_pid (MESURÉ, h6_port_inherit)
+### H5, passing Mach ports without launchd and without task_for_pid (MEASURED, h6_port_inherit)
 
-Témoin `h6_port_inherit.c`.
+Witness `h6_port_inherit.c`.
 
-- L'enfant peut donner son propre `mach_task_self()` au parent par message (`MACH_MSG_TYPE_COPY_SEND` dans un descripteur de port) : le port est déplaçable, et le parent obtient `pid_for_task`, `mach_vm_read`, `task_threads` et `thread_get_state` qui réussissent. C'est vrai pour l'enfant signé get-task-allow et aussi pour l'enfant signé sans aucun entitlement (copie `.noent`, signature ad hoc non durcie). Pas d'invite. L'attachement coopératif fournit donc le droit d'inspection sans `task_for_pid`, et sans get-task-allow, pour nos propres binaires Mach-O non durcis. À ne pas généraliser à un binaire à runtime durci ou de plateforme : non testé.
-- Moyen de transporter le premier port : l'emplacement spécial `TASK_BOOTSTRAP_PORT`, hérité par `fork` (le parent y place temporairement son port, puis le restaure) ou fixé par `posix_spawnattr_setspecialport_np(TASK_BOOTSTRAP_PORT)`. Les deux fonctionnent pour un enfant forké et pour un enfant exec. `TASK_ACCESS_PORT` fait échouer `posix_spawn` avec `EINVAL`. `mach_ports_register` plus `mach_ports_lookup` rendent un port à l'enfant, mais les messages envoyés dessus n'arrivent pas chez le parent : inutilisable.
-- `bootstrap_register` depuis un outil signé ad hoc réussit (`kr=0`), `bootstrap_look_up` retrouve le nom, `bootstrap_check_in` rend 1103 (service actif) : un rendez-vous par nom dans la session de l'utilisateur est disponible sans plist launchd, le nom disparaît avec le port.
-- Un port d'exception posé au niveau tâche est hérité par `fork` et par `fork` plus `exec`. Un traceur qui l'a posé reçoit les fautes de ses descendants (avec leurs ports de contrôle dans le message), l'équivalent de `PTRACE_O_TRACEFORK` pour les exceptions.
+- The child can give its own `mach_task_self()` to the parent by message (`MACH_MSG_TYPE_COPY_SEND` in a port descriptor): the port is movable, and the parent gets `pid_for_task`, `mach_vm_read`, `task_threads` and `thread_get_state` that succeed. This holds for the child signed get-task-allow and also for the child signed without any entitlement (`.noent` copy, non-hardened ad hoc signature). No prompt. Cooperative attachment therefore provides the inspection right without `task_for_pid`, and without get-task-allow, for our own non-hardened Mach-O binaries. Not to be generalized to a binary with hardened runtime or a platform binary: not tested.
+- Means of carrying the first port: the special slot `TASK_BOOTSTRAP_PORT`, inherited by `fork` (the parent temporarily places its port there, then restores it) or set by `posix_spawnattr_setspecialport_np(TASK_BOOTSTRAP_PORT)`. Both work for a forked child and for an exec'd child. `TASK_ACCESS_PORT` makes `posix_spawn` fail with `EINVAL`. `mach_ports_register` plus `mach_ports_lookup` give a port to the child, but the messages sent on it do not reach the parent: unusable.
+- `bootstrap_register` from an ad hoc signed tool succeeds (`kr=0`), `bootstrap_look_up` finds the name, `bootstrap_check_in` returns 1103 (service active): a rendezvous by name in the user's session is available without a launchd plist, the name disappears with the port.
+- An exception port set at task level is inherited by `fork` and by `fork` plus `exec`. A tracer that set it receives the faults of its descendants (with their control ports in the message), the equivalent of `PTRACE_O_TRACEFORK` for exceptions.
 
-### H6, le modèle débogueur par exceptions Mach sur une tâche étrangère (MESURÉ, h7_foreign_exc)
+### H6, the debugger model through Mach exceptions on a foreign task (MEASURED, h7_foreign_exc)
 
-Témoin `h7_foreign_exc.c`. Le traceur pose `task_set_exception_ports` sur la tâche de son enfant get-task-allow et sert les exceptions dans un thread gestionnaire.
+Witness `h7_foreign_exc.c`. The tracer sets `task_set_exception_ports` on the task of its get-task-allow child and serves the exceptions in a handler thread.
 
-- `brk #0x77` : `EXC_BREAKPOINT`, codes `[1, pc]`, `pc` pointant sur le `brk` ; `udf #0x1234` : `EXC_BAD_INSTRUCTION`, codes `[1, mot d'instruction]` ; `ldr` en 0x10 : `EXC_BAD_ACCESS`, codes `[1 (KERN_INVALID_ADDRESS), adresse]`. Le gestionnaire réécrit x0 et `pc+4`, répond `KERN_SUCCESS` et l'enfant reprend avec l'état réécrit, pour les trois comportements (`EXCEPTION_STATE_IDENTITY`, `EXCEPTION_STATE`, `EXCEPTION_DEFAULT`). Les messages `DEFAULT` et `STATE_IDENTITY` transportent le port de contrôle de la tâche fautive (utilisable par `mach_vm_read`).
-- Coût d'une exception inter-processus : commande par pipe plus exception plus réponse, p50 11,7 us (STATE_IDENTITY), 10,7 us (STATE), 12,0 us (DEFAULT), contre 5,9, 4,7 et 6,0 us pour la même commande sans exception : environ 6 us par exception.
-- Écriture sur page en lecture seule : `EXC_BAD_ACCESS`, codes `[2 (KERN_PROTECTION_FAILURE), adresse]`. Le traceur rend la page inscriptible par `mach_vm_protect` dans l'enfant et répond : l'instruction est rejouée et réussit (p50 14,0 us pour la commande entière, environ 8 us par faute). C'est le mécanisme de protection en écriture à la granularité de page hôte (16 Kio).
-- Exécution de la page de code modifiée de h1 : `EXC_BAD_ACCESS` avec `KERN_PROTECTION_FAILURE` sur la recherche d'instruction (adresse = pc), puis `SIGBUS` : une page signée modifiée n'est plus exécutable, même après `mach_vm_protect(R-X)`.
-- Pas matériel : `thread_set_state(ARM_DEBUG_STATE64)` avec `mdscr_el1` bit 0 donne un `EXC_BREAKPOINT` (codes `[1, 0]`) par instruction. Le noyau efface le bit à chaque pas : le gestionnaire doit le réarmer avant de répondre. 20 000 pas à 9,3 us par pas ; 3,1 % des exceptions sont répétées au même pc sans progression (un client de pas doit le tolérer) et toutes les autres avancent d'exactement une instruction (compteur de boucle exact).
-- Points d'arrêt et points de surveillance matériels : `bvr0`/`bcr0` (valeur 0x1e5) sur `hi_target_fn` donne `EXC_BREAKPOINT` `[1, pc]` ; `wvr0`/`wcr0` (valeur 0x1ff5, écriture sur 8 octets) donne `EXC_BREAKPOINT` `[0x102, adresse de donnée]`. `hw.optional.breakpoint` vaut 6 et `hw.optional.watchpoint` vaut 4 sur cette machine : de quoi émuler les 4 registres de débogage x86 DR0 à DR3 sous réserve de la différence de largeur.
-- `PT_ATTACHEXC` plus port d'exception : le `SIGSTOP` d'attache et les signaux ultérieurs arrivent comme `EXC_SOFTWARE`, codes `[0x10003 (EXC_SOFT_SIGNAL), numéro de signal]`. Répondre seulement `KERN_SUCCESS` laisse le signal être délivré (l'enfant meurt de SIGUSR1) ; `ptrace(PT_THUPDATE, pid, port_du_thread, 0)` avant de répondre supprime le signal (l'enfant survit) ; avec `data=SIGUSR1` il le délivre. C'est un arrêt de livraison de signal avec choix du signal injecté, comme `PTRACE_CONT` avec signal.
+- `brk #0x77`: `EXC_BREAKPOINT`, codes `[1, pc]`, `pc` pointing at the `brk`; `udf #0x1234`: `EXC_BAD_INSTRUCTION`, codes `[1, instruction word]`; `ldr` at 0x10: `EXC_BAD_ACCESS`, codes `[1 (KERN_INVALID_ADDRESS), address]`. The handler rewrites x0 and `pc+4`, replies `KERN_SUCCESS` and the child resumes with the rewritten state, for the three behaviors (`EXCEPTION_STATE_IDENTITY`, `EXCEPTION_STATE`, `EXCEPTION_DEFAULT`). The `DEFAULT` and `STATE_IDENTITY` messages carry the control port of the faulting task (usable by `mach_vm_read`).
+- Cost of an inter-process exception: command through pipe plus exception plus reply, p50 11.7 us (STATE_IDENTITY), 10.7 us (STATE), 12.0 us (DEFAULT), versus 5.9, 4.7 and 6.0 us for the same command without exception: about 6 us per exception.
+- Write on a read-only page: `EXC_BAD_ACCESS`, codes `[2 (KERN_PROTECTION_FAILURE), address]`. The tracer makes the page writable through `mach_vm_protect` in the child and replies: the instruction is replayed and succeeds (p50 14.0 us for the whole command, about 8 us per fault). This is the write-protection mechanism at host page granularity (16 KiB).
+- Execution of h1's modified code page: `EXC_BAD_ACCESS` with `KERN_PROTECTION_FAILURE` on the instruction fetch (address = pc), then `SIGBUS`: a modified signed page is no longer executable, even after `mach_vm_protect(R-X)`.
+- Hardware step: `thread_set_state(ARM_DEBUG_STATE64)` with `mdscr_el1` bit 0 gives one `EXC_BREAKPOINT` (codes `[1, 0]`) per instruction. The kernel clears the bit at each step: the handler must rearm it before replying. 20,000 steps at 9.3 us per step; 3.1% of the exceptions are repeated at the same pc without progress (a step client must tolerate it) and all the others advance by exactly one instruction (exact loop counter).
+- Hardware breakpoints and watchpoints: `bvr0`/`bcr0` (value 0x1e5) on `hi_target_fn` gives `EXC_BREAKPOINT` `[1, pc]`; `wvr0`/`wcr0` (value 0x1ff5, write on 8 bytes) gives `EXC_BREAKPOINT` `[0x102, data address]`. `hw.optional.breakpoint` is 6 and `hw.optional.watchpoint` is 4 on this machine: enough to emulate the 4 x86 debug registers DR0 to DR3, subject to the width difference.
+- `PT_ATTACHEXC` plus exception port: the attach `SIGSTOP` and the later signals arrive as `EXC_SOFTWARE`, codes `[0x10003 (EXC_SOFT_SIGNAL), signal number]`. Replying only `KERN_SUCCESS` lets the signal be delivered (the child dies of SIGUSR1); `ptrace(PT_THUPDATE, pid, thread_port, 0)` before replying suppresses the signal (the child survives); with `data=SIGUSR1` it delivers it. This is a signal-delivery stop with choice of the injected signal, like `PTRACE_CONT` with signal.
 
-## I : exceptions Mach et pièges (à compléter)
+## I: Mach exceptions and traps (to be completed)
 
-À compléter : ports d'exception pour soi, état réécrit, comparaison signaux contre Mach, sonde `svc #0` en processus enfant.
+To be completed: exception ports for oneself, rewritten state, comparison of signals versus Mach, `svc #0` probe in a child process.
 
-## J : temps et identité
+## J: time and identity
 
-Résultats partiels de la tentative interrompue (`evidence/darwin-process/j1_time_ident.log`, 2026-10-02 09:59, arrêt pendant J2). À refaire, la relance complète est en cours.
+Partial results of the interrupted attempt (`evidence/darwin-process/j1_time_ident.log`, 2026-10-02 09:59, stopped during J2). To be redone, the full rerun is in progress.
 
-- MESURÉ `mach_timebase_info` : 125/3, soit 41,67 ns par tick (24 MHz).
-- MESURÉ résolution : `CLOCK_REALTIME` et `CLOCK_MONOTONIC` avancent par pas de 1000 ns (microseconde). `CLOCK_MONOTONIC_RAW`, `CLOCK_UPTIME_RAW` et `mach_absolute_time` avancent par pas de 41 ns.
-- MESURÉ coût d'un appel : `CLOCK_MONOTONIC_RAW_APPROX` 4,8 ns, `mach_absolute_time` 5,0 ns, `CLOCK_REALTIME` 12,8 ns, `CLOCK_MONOTONIC` 18,3 ns, `CLOCK_THREAD_CPUTIME_ID` 133 ns, `CLOCK_PROCESS_CPUTIME_ID` 469 ns.
-- MESURÉ `CLOCK_MONOTONIC` retarde de 5,893 s sur `CLOCK_UPTIME_RAW` après 177 906 s d'activité, et vaut le temps de l'horloge murale depuis `kern.boottime` (177 901,0 s). DÉDUIT : `CLOCK_MONOTONIC` est discipliné sur l'heure murale (dérive d'environ 33 ppm de l'oscillateur brut), alors que `CLOCK_MONOTONIC_RAW` égale `mach_absolute_time`. À confirmer à la relance.
-- MESURÉ identifiants d'horloge 1, 2, 3, 7, 10, 11, 13 à 15, 17 à 19 : `EINVAL`. Il n'existe pas de `CLOCK_BOOTTIME`, `CLOCK_REALTIME_COARSE`, `CLOCK_MONOTONIC_COARSE` ni d'identifiants dynamiques de type Linux.
-- MESURÉ minuteries au QoS par défaut, dépassement de la durée demandée : `nanosleep` 20 us : p50 6,7 us ; 100 us : p50 28,0 us ; 1000 us : p50 255,8 us (p99 264,5 us).
-- ANOMALIE à vérifier : `mrs cntfrq_el0` rend 1 000 000 000 et `mrs cntvct_el0` rend 41 alors que `mach_absolute_time` vaut 4,27e12 (24 MHz). Le registre de compteur lu en EL0 n'est donc pas la source de `mach_absolute_time` sur cette machine. Conséquence potentielle pour l'émulation de RDTSC : lire `mach_absolute_time` et non `cntvct_el0`. À mesurer proprement à la relance.
+- MEASURED `mach_timebase_info`: 125/3, that is 41.67 ns per tick (24 MHz).
+- MEASURED resolution: `CLOCK_REALTIME` and `CLOCK_MONOTONIC` advance in steps of 1000 ns (microsecond). `CLOCK_MONOTONIC_RAW`, `CLOCK_UPTIME_RAW` and `mach_absolute_time` advance in steps of 41 ns.
+- MEASURED cost of a call: `CLOCK_MONOTONIC_RAW_APPROX` 4.8 ns, `mach_absolute_time` 5.0 ns, `CLOCK_REALTIME` 12.8 ns, `CLOCK_MONOTONIC` 18.3 ns, `CLOCK_THREAD_CPUTIME_ID` 133 ns, `CLOCK_PROCESS_CPUTIME_ID` 469 ns.
+- MEASURED `CLOCK_MONOTONIC` lags `CLOCK_UPTIME_RAW` by 5.893 s after 177,906 s of activity, and equals the wall-clock time since `kern.boottime` (177,901.0 s). DEDUCED: `CLOCK_MONOTONIC` is disciplined to wall-clock time (drift of about 33 ppm from the raw oscillator), while `CLOCK_MONOTONIC_RAW` equals `mach_absolute_time`. To be confirmed at the rerun.
+- MEASURED clock identifiers 1, 2, 3, 7, 10, 11, 13 to 15, 17 to 19: `EINVAL`. There is no `CLOCK_BOOTTIME`, `CLOCK_REALTIME_COARSE`, `CLOCK_MONOTONIC_COARSE` nor Linux-style dynamic identifiers.
+- MEASURED timers at default QoS, overshoot of the requested duration: `nanosleep` 20 us: p50 6.7 us; 100 us: p50 28.0 us; 1000 us: p50 255.8 us (p99 264.5 us).
+- ANOMALY to be checked: `mrs cntfrq_el0` returns 1,000,000,000 and `mrs cntvct_el0` returns 41 while `mach_absolute_time` is 4.27e12 (24 MHz). The counter register read at EL0 is therefore not the source of `mach_absolute_time` on this machine. Potential consequence for RDTSC emulation: read `mach_absolute_time` and not `cntvct_el0`. To be measured properly at the rerun.
 
-## K : transport de ptrace invité coopératif (à compléter)
+## K: cooperative guest ptrace transport (to be completed)
 
-À compléter : prototype mémoire partagée + socket + primitive de type futex, allers-retours d'arrêt et de reprise en microsecondes.
+To be completed: prototype of shared memory + socket + futex-type primitive, stop and resume round trips in microseconds.
 
-## Implications pour ptrace, procfs et signaux sur Darwin (à compléter)
+## Implications for ptrace, procfs and signals on Darwin (to be completed)
 
-À compléter après les mesures H, I, J et K. Aucune conclusion n'est tirée avant.
+To be completed after the H, I, J and K measurements. No conclusion is drawn before.
 
-## Questions ouvertes
+## Open questions
 
-- À compléter.
+- To be completed.

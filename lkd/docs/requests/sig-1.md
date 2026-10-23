@@ -1,22 +1,22 @@
-# Demandes de sig au noyau commun (core)
+# Requests from sig to the common kernel (core)
 
-Demandeur : sig. Date : 2026-10-02.
+Requester: sig. Date: 2026-10-02.
 
-## 1. Opérations atomiques sur un mot invité avec récupération de faute
+## 1. Atomic operations on a guest word with fault recovery
 
-Besoin : FUTEX_WAKE_OP, LOCK_PI, UNLOCK_PI et la liste robuste font un compare-and-swap sur un mot invité. Aujourd'hui `src/sig/futex.c` (`cmpxchg_word`) valide par `lkd_mm_check_range(gva, 4, 1)` puis fait l'atomique hôte sur `lkd_g2h(gva)`. Un `munmap` concurrent entre les deux ferait planter le processus hôte (le contrôle est consultatif, CONVENTIONS 2.6).
+Need: FUTEX_WAKE_OP, LOCK_PI, UNLOCK_PI and the robust list do a compare-and-swap on a guest word. Today `src/sig/futex.c` (`cmpxchg_word`) validates with `lkd_mm_check_range(gva, 4, 1)` then does the host atomic on `lkd_g2h(gva)`. A concurrent `munmap` between the two would crash the host process (the check is advisory, CONVENTIONS 2.6).
 
-Demande : dans `usermem.c`, dans la plage de PC récupérable, `int lkd_user_cmpxchg32(uint64_t gva, uint32_t *expected, uint32_t desired)` qui rend 0 (échangé), 1 (valeur différente, `*expected` mis à jour) ou `-LX_EFAULT`. sig remplacera `cmpxchg_word` par cet appel.
+Request: in `usermem.c`, in the recoverable PC range, `int lkd_user_cmpxchg32(uint64_t gva, uint32_t *expected, uint32_t desired)` which returns 0 (swapped), 1 (different value, `*expected` updated) or `-LX_EFAULT`. sig will replace `cmpxchg_word` with this call.
 
-## 2. Crochet de réveil pour les attentes futex partagées
+## 2. Wake hook for shared futex waits
 
-Besoin : une attente futex sur une clé partagée dort sur `os_sync_wait_on_address(SHARED)` (seul moyen de réveil depuis un autre processus). `lkd_task_wake` n'écrit que dans le tube de la tâche, qui ne réveille pas cette attente. sig sonne lui-même la tâche quand il met un signal en file (`sig_ring_futex`), mais un réveil venu d'un autre module (ptrace, task) n'est vu qu'au bout d'une tranche de 50 ms.
+Need: a futex wait on a shared key sleeps on `os_sync_wait_on_address(SHARED)` (the only way to be woken from another process). `lkd_task_wake` writes only into the task's pipe, which does not wake this wait. sig rings the task itself when it queues a signal (`sig_ring_futex`), but a wakeup coming from another module (ptrace, task) is seen only at the end of a 50 ms slice.
 
-Demande : que `lkd_task_wake(t)` appelle aussi `lkd_sig_wake_hook(t)`, faible et vide dans core, fort dans sig (il sonnera `sig_ring_futex`). Async-signal-safe : une écriture atomique et `os_sync_wake_by_address_all`.
+Request: that `lkd_task_wake(t)` also call `lkd_sig_wake_hook(t)`, weak and empty in core, strong in sig (it will ring `sig_ring_futex`). Async-signal-safe: an atomic write and `os_sync_wake_by_address_all`.
 
-## 3. Ajouts à `src/include/sig.h`
+## 3. Additions to `src/include/sig.h`
 
-Fonctions déjà définies (fortes) dans sig, à déclarer pour les autres modules :
+Functions already defined (strong) in sig, to declare for the other modules:
 
 ```c
 /* 'T' (LKD_PS_STOPPED) while t is parked in a job-control stop, else 0. ANY, lock-free. task uses it
@@ -28,14 +28,14 @@ size_t lkd_sig_exec_export(lkd_task *t, void *buf, size_t cap);
 int lkd_sig_exec_import(lkd_task *t, const void *buf, size_t len);
 ```
 
-Correction de commentaire : `lkd_sig_exec_reset` dit « pending cleared of ignored ». Linux garde les signaux en attente à l'exec (`flush_signal_handlers` ne touche que les actions) ; sig suit Linux.
+Comment fix: `lkd_sig_exec_reset` says "pending cleared of ignored". Linux keeps pending signals at exec (`flush_signal_handlers` touches only the actions); sig follows Linux.
 
-## 4. Défaut dans `LKD_BUG`
+## 4. Defect in `LKD_BUG`
 
-`lkd_internal.h` : `lkd_log("BUG %s:%d: " __VA_ARGS__)` n'ajoute ni `__FILE__` ni `__LINE__`, d'où l'avertissement `-Wformat-insufficient-args` et un affichage indéfini. sig n'utilise plus la macro.
+`lkd_internal.h`: `lkd_log("BUG %s:%d: " __VA_ARGS__)` adds neither `__FILE__` nor `__LINE__`, hence the `-Wformat-insufficient-args` warning and undefined output. sig no longer uses the macro.
 
 
-## Traitée le 2026-10-02 (mainteneur d'intégration)
+## Handled on 2026-10-02 (integration maintainer)
 
-Point 1 : `lkd_user_cmpxchg32` (`src/core/usermem.c`, routine LL/SC dans la plage de PC récupérable, déclarée dans `lkd_internal.h`) ; `cmpxchg_word` de sig l'utilise. Test : `test_core_usermem` cas `cmpxchg32_swaps_and_recovers_faults` (PROT_NONE et lecture seule : EFAULT sans plantage). Point 2 : `lkd_task_wake` appelle `lkd_sig_wake_hook` (faible dans core, sig sonne l'attente futex partagée). Test : `test_sig_futex` (réveil par `lkd_task_wake` d'une attente partagée en 21 ms au lieu de la tranche de 50 ms). Point 3 : déclarations ajoutées à `sig.h`, commentaire de `lkd_sig_exec_reset` corrigé. Point 4 : `LKD_BUG(cond, fmt, ...)` imprime fichier et ligne. Test : `test_core_usermem` cas `bug_macro_prints_file_and_line`.
-Au passage (MESURE) : `test_sig_futex` cas `mutex_contention` bloquait environ une fois sur 20 (réveil perdu). Cause : le raccourci « pas d'attente dans le seau » de `do_wake` lisait le compteur sans verrou alors que l'attente lit le mot avant d'être comptée. Raccourci retiré : 0 blocage sur 60 exécutions.
+Point 1: `lkd_user_cmpxchg32` (`src/core/usermem.c`, LL/SC routine in the recoverable PC range, declared in `lkd_internal.h`); sig's `cmpxchg_word` uses it. Test: `test_core_usermem` case `cmpxchg32_swaps_and_recovers_faults` (PROT_NONE and read-only: EFAULT without a crash). Point 2: `lkd_task_wake` calls `lkd_sig_wake_hook` (weak in core, sig rings the shared futex wait). Test: `test_sig_futex` (wakeup by `lkd_task_wake` of a shared wait in 21 ms instead of the 50 ms slice). Point 3: declarations added to `sig.h`, comment of `lkd_sig_exec_reset` fixed. Point 4: `LKD_BUG(cond, fmt, ...)` prints file and line. Test: `test_core_usermem` case `bug_macro_prints_file_and_line`.
+Along the way (MEASURED): `test_sig_futex` case `mutex_contention` hung about once in 20 (lost wakeup). Cause: the "no waiter in the bucket" shortcut of `do_wake` read the counter without a lock while the wait reads the word before being counted. Shortcut removed: 0 hangs in 60 runs.

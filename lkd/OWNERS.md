@@ -1,10 +1,10 @@
-# Propriété des modules LKD
+# Ownership of the LKD modules
 
-Un syscall n'a qu'un propriétaire : le module qui l'enregistre dans `lkd_<module>_init()`. `lkd_init()` échoue avec `-EEXIST` si deux modules enregistrent le même numéro, et `tools/owners_check.py` (lancé par `check.sh`) refuse un nom présent dans deux listes ci-dessous. Un module qui veut un syscall d'un autre écrit une demande dans `docs/requests/<module>-<n>.md`.
+A syscall has only one owner: the module that registers it in `lkd_<module>_init()`. `lkd_init()` fails with `-EEXIST` if two modules register the same number, and `tools/owners_check.py` (run by `check.sh`) refuses a name present in two of the lists below. A module that wants a syscall of another one writes a request in `docs/requests/<module>-<n>.md`.
 
-Chaque module écrit uniquement dans `src/<module>/`, `tests/test_<module>_*.c`, `docs/status/<module>.md` et `docs/requests/<module>-*.md`. Le noyau commun (`core`) possède `include/`, `src/core/`, `src/include/`, `tests/support/`, `tests/ltest.h`, `tests/test_core_*.c`, `CMakeLists.txt`, les scripts et `docs/CONVENTIONS.md`.
+Each module writes only in `src/<module>/`, `tests/test_<module>_*.c`, `docs/status/<module>.md` and `docs/requests/<module>-*.md`. The common kernel (`core`) owns `include/`, `src/core/`, `src/include/`, `tests/support/`, `tests/ltest.h`, `tests/test_core_*.c`, `CMakeLists.txt`, the scripts and `docs/CONVENTIONS.md`.
 
-## Syscalls par module
+## Syscalls per module
 
 <!-- owners:begin -->
 core: restart_syscall
@@ -16,33 +16,33 @@ net: socket socketpair bind listen accept accept4 connect getsockname getpeernam
 ptrace: ptrace
 <!-- owners:end -->
 
-Les 84 syscalls non attribués (`python3 tools/owners_check.py --list-unowned`) répondent `-ENOSYS` de façon visible et comptée (`LKD_LOG_ENOSYS=1` les nomme à la première occurrence). Ce sont surtout des appels de noyau privilégiés (`mount`, `umount2`, `pivot_root`, `swapon`, `reboot`, `init_module`, `bpf`, `perf_event_open`, `fanotify_init`...) pour lesquels Linux répond `-EPERM` à un utilisateur sans capacité, les IPC System V de files et de sémaphores (`msg*`, `sem*`), `io_uring_*` et `io_*` (AIO), `mq_*`, `userfaultfd`, `landlock_*`. Le chef de projet décide, preuves en main (compteurs ENOSYS d'un vrai lancement), lesquels reçoivent un propriétaire ; un `-EPERM` honnête pour un non-root est la réponse prévue pour les appels privilégiés.
+The 84 unassigned syscalls (`python3 tools/owners_check.py --list-unowned`) answer `-ENOSYS` in a visible and counted way (`LKD_LOG_ENOSYS=1` names them at the first occurrence). They are mostly privileged kernel calls (`mount`, `umount2`, `pivot_root`, `swapon`, `reboot`, `init_module`, `bpf`, `perf_event_open`, `fanotify_init`...) for which Linux answers `-EPERM` to a user without the capability, System V message queue and semaphore IPC (`msg*`, `sem*`), `io_uring_*` and `io_*` (AIO), `mq_*`, `userfaultfd`, `landlock_*`. The project lead decides, with evidence in hand (ENOSYS counters from a real launch), which ones get an owner; an honest `-EPERM` for a non-root user is the planned answer for privileged calls.
 
-`procfs` n'a aucun syscall : il sert `/proc`, `/dev` et `/sys` par l'interface de montage virtuel de `vfs.h`.
+`procfs` has no syscall: it serves `/proc`, `/dev` and `/sys` through the virtual mount interface of `vfs.h`.
 
-## Cas partagés (qui implémente quoi)
+## Shared cases (who implements what)
 
-| Sujet | Syscall | Fonction de coopération | Propriétaire de la fonction |
+| Topic | Syscall | Cooperation function | Owner of the function |
 | --- | --- | --- | --- |
-| clone | task | `lkd_mm_clone`, `lkd_fdtable_clone`, `lkd_fsctx_clone`, `lkd_sighand_clone`, `lkd_ptrace_task_init` (séquence dans `task.h`) | mm, fs, fs, sig, ptrace |
-| fork hôte | task (clone sans CLONE_VM) | `lkd_fork_host` puis hooks `lkd_<m>_fork_*` | core orchestre, chaque module ses verrous |
-| wait4 et waitid | task | `lkd_ptrace_wait_event`, `lkd_ptrace_has_tracees` | ptrace |
-| réveil de wait4 | (aucun) | `lkd_task_wake_waiters(pid)` | task |
-| SIGCHLD | (aucun) | `lkd_sig_child_event` | sig |
-| signal fatal | (aucun) | `lkd_task_do_exit_group` | task |
-| futex et clear_child_tid | futex (sig), exit (task) | `lkd_futex_wake_addr`, `lkd_futex_exit_robust_list` | sig |
-| clé de futex partagé | futex (sig) | `lkd_mm_futex_key` | mm |
-| set_robust_list | task (stocke dans la tâche) | parcours à la sortie : sig | sig |
-| signalfd | signalfd (sig) | objet fd par `fd.h`, côté poll par `lkd_net_make_notify_pipe` | sig, net |
-| epoll sur objets | epoll (net) | `lkd_fd_ops.poll`, `notify_fd` | fs et sig fournissent l'objet |
-| mmap d'un fichier | mmap (mm) | `lkd_fd_ops.mmap_fd`, `lkd_fdobj_reopen` | fs |
-| scellés memfd | fcntl (fs) | `lkd_mm_has_writable_shared_mapping` | mm |
+| clone | task | `lkd_mm_clone`, `lkd_fdtable_clone`, `lkd_fsctx_clone`, `lkd_sighand_clone`, `lkd_ptrace_task_init` (sequence in `task.h`) | mm, fs, fs, sig, ptrace |
+| host fork | task (clone without CLONE_VM) | `lkd_fork_host` then hooks `lkd_<m>_fork_*` | core orchestrates, each module its own locks |
+| wait4 and waitid | task | `lkd_ptrace_wait_event`, `lkd_ptrace_has_tracees` | ptrace |
+| wait4 wakeup | (none) | `lkd_task_wake_waiters(pid)` | task |
+| SIGCHLD | (none) | `lkd_sig_child_event` | sig |
+| fatal signal | (none) | `lkd_task_do_exit_group` | task |
+| futex and clear_child_tid | futex (sig), exit (task) | `lkd_futex_wake_addr`, `lkd_futex_exit_robust_list` | sig |
+| shared futex key | futex (sig) | `lkd_mm_futex_key` | mm |
+| set_robust_list | task (stores it in the task) | walk at exit: sig | sig |
+| signalfd | signalfd (sig) | fd object through `fd.h`, poll side through `lkd_net_make_notify_pipe` | sig, net |
+| epoll on objects | epoll (net) | `lkd_fd_ops.poll`, `notify_fd` | fs and sig provide the object |
+| mmap of a file | mmap (mm) | `lkd_fd_ops.mmap_fd`, `lkd_fdobj_reopen` | fs |
+| memfd seals | fcntl (fs) | `lkd_mm_has_writable_shared_mapping` | mm |
 | /proc/pid/maps | (procfs) | `lkd_mm_render_maps`, `lkd_mm_remote_render_maps` | mm |
-| /proc/pid/mem, PEEK, POKE | ptrace, procfs | `lkd_mm_remote_read/write` (invalide le code) | mm |
-| contrôle d'accès ptrace | procfs, mm | `lkd_ptrace_check_access` | ptrace |
-| execve | task | `lkd_exec_prepare` (task), `lkd_exec_commit` (core: hooks), `ops->exec_image` (moteur), `lkd_exec_finish` (task puis ptrace) | task |
-| procfs d'un autre processus | (procfs) | `lkd_proc_lookup`, `lkd_tid_lookup`, `lkd_proc_list` | task |
+| /proc/pid/mem, PEEK, POKE | ptrace, procfs | `lkd_mm_remote_read/write` (invalidates the code) | mm |
+| ptrace access control | procfs, mm | `lkd_ptrace_check_access` | ptrace |
+| execve | task | `lkd_exec_prepare` (task), `lkd_exec_commit` (core: hooks), `ops->exec_image` (engine), `lkd_exec_finish` (task then ptrace) | task |
+| procfs of another process | (procfs) | `lkd_proc_lookup`, `lkd_tid_lookup`, `lkd_proc_list` | task |
 
-## Fichiers du noyau commun que les modules lisent sans les modifier
+## Common kernel files that the modules read without modifying them
 
-`include/lkd/lkd.h`, `include/lkd/abi_x64.h`, `include/lkd/xlate.h`, `include/lkd/syscall_nr.h` (généré), `src/include/*.h`, `tests/ltest.h`, `tests/support/fake_engine.{h,c}`.
+`include/lkd/lkd.h`, `include/lkd/abi_x64.h`, `include/lkd/xlate.h`, `include/lkd/syscall_nr.h` (generated), `src/include/*.h`, `tests/ltest.h`, `tests/support/fake_engine.{h,c}`.

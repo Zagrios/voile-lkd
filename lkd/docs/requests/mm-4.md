@@ -1,12 +1,12 @@
-# Demande mm-4 (task, ptrace, procfs, moteur) : contrats de mm à connaître
+# Request mm-4 (task, ptrace, procfs, engine): mm contracts to know
 
-1. Références : `lkd_mm_task_exit(t)` (crochet de sortie) rend la référence de `t->mm` et met `t->mm` à NULL. task ne doit pas faire `lkd_mm_put(t->mm)` lui-même. Un seul espace d'adressage vivant par processus hôte : un second `lkd_mm_create()` rend NULL avec errno EBUSY tant que le premier existe.
-2. fork : sans CLONE_VM, `lkd_mm_clone(parent, flags)` rend `parent` avec une référence (la copie de l'enfant), `lkd_mm_fork_child` la ré-identifie. Les verrous pris par `lkd_mm_fork_prepare` sont relâchés dans l'enfant par le thread qui a forké (réinitialiser un rwlock tenu échoue avec EBUSY sur macOS : MESURE, blocage de l'enfant dans `test_mm_fork` avant correction).
-3. ptrace et procfs : `lkd_mm_remote_read/write` suivent la règle FOLL_FORCE de PEEK/POKE et de /proc/<pid>/mem (écriture dans du code en lecture seule, lecture de PROT_NONE) et invalident le code traduit de la cible avant de répondre. `process_vm_readv/writev` n'utilisent pas FOLL_FORCE. Le transport est un fil de service par processus (socket AF_UNIX `$TMPDIR/lkdmm.<pid hôte>.sock`), démarré pour tout espace d'adressage de production ; le pid invité est traduit par `lkd_proc_lookup().host_pid`.
-4. Moteur : la mémoire invitée n'est jamais exécutable côté hôte (mm ne pose que r et w). Si le moteur protège des pages pour détecter le code automodifiable, il ne doit pas appeler `mprotect` lui-même sur la fenêtre : mm recalcule la protection hôte d'une page de 16 Kio à chaque mmap, mprotect, munmap et écrasera la sienne. Question ouverte pour le chef : ajouter un compteur « page surveillée par le JIT » dans mm, que mm respecterait (retirer w tant qu'il est posé).
-5. Le moteur classe SEGV_MAPERR / SEGV_ACCERR avec `lkd_mm_find(mm, addr, 0, &vi)`.
+1. References: `lkd_mm_task_exit(t)` (exit hook) gives back the reference of `t->mm` and sets `t->mm` to NULL. task must not do `lkd_mm_put(t->mm)` itself. A single live address space per host process: a second `lkd_mm_create()` returns NULL with errno EBUSY as long as the first one exists.
+2. fork: without CLONE_VM, `lkd_mm_clone(parent, flags)` returns `parent` with a reference (the child's copy), `lkd_mm_fork_child` re-identifies it. The locks taken by `lkd_mm_fork_prepare` are released in the child by the thread that forked (reinitializing a held rwlock fails with EBUSY on macOS: MEASURED, child blocked in `test_mm_fork` before the fix).
+3. ptrace and procfs: `lkd_mm_remote_read/write` follow the FOLL_FORCE rule of PEEK/POKE and of /proc/<pid>/mem (write into read-only code, read of PROT_NONE) and invalidate the target's translated code before answering. `process_vm_readv/writev` do not use FOLL_FORCE. The transport is one service thread per process (AF_UNIX socket `$TMPDIR/lkdmm.<host pid>.sock`), started for every production address space; the guest pid is translated by `lkd_proc_lookup().host_pid`.
+4. Engine: guest memory is never executable on the host side (mm sets only r and w). If the engine protects pages to detect self-modifying code, it must not call `mprotect` itself on the window: mm recomputes the host protection of a 16 KiB page at each mmap, mprotect, munmap and will overwrite the engine's. Open question for the lead: add a "page watched by the JIT" counter in mm, which mm would respect (remove w as long as it is set).
+5. The engine classifies SEGV_MAPERR / SEGV_ACCERR with `lkd_mm_find(mm, addr, 0, &vi)`.
 
 
-## Traitée le 2026-10-02 (mainteneur d'intégration)
+## Handled on 2026-10-02 (integration maintainer)
 
-Informations. Point 4 : réglé par les pages surveillées de mm (`src/mm/watch.c`).
+Information. Point 4: settled by mm's watched pages (`src/mm/watch.c`).

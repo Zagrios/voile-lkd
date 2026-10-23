@@ -1,20 +1,20 @@
-# Statut du module fs (LKD)
+# Status of the fs module (LKD)
 
-Date : 2026-10-02. Jalons 1 et 2 atteints : vfs, table de descripteurs, objets fichier, tube, memfd et scellés, 100 syscalls enregistrés, 6 programmes de test, arbre Debian testé.
+Date: 2026-10-02. Milestones 1 and 2 reached: vfs, descriptor table, file objects, pipe, memfd and seals, 100 syscalls registered, 6 test programs, Debian tree tested.
 
-## Ce qui existe
+## What exists
 
-Fichiers (`src/fs/`, 5500 lignes) : `vfs.c` (montages, fsctx, résolution), `fdtable.c`, `file.c` (fichiers, répertoires, O_PATH, flux hôtes, réouverture, contrôles mmap), `dir.c` (getdents), `pipe.c`, `memfd.c`, `tty.c`, `sys_open.c`, `sys_rw.c`, `sys_stat.c`, `sys_path.c`, `sys_misc.c`, `xattr.c`, `fs_init.c`, `fs_priv.h`, `lkd_fs.h` (services pour moteur, mm, procfs), `NOTICE`.
+Files (`src/fs/`, 5500 lines): `vfs.c` (mounts, fsctx, resolution), `fdtable.c`, `file.c` (files, directories, O_PATH, host streams, reopening, mmap checks), `dir.c` (getdents), `pipe.c`, `memfd.c`, `tty.c`, `sys_open.c`, `sys_rw.c`, `sys_stat.c`, `sys_path.c`, `sys_misc.c`, `xattr.c`, `fs_init.c`, `fs_priv.h`, `lkd_fs.h` (services for the engine, mm, procfs), `NOTICE`.
 
-Imports HyperLinux : la boucle de résolution de `vfs.c` (`hl_vfs_resolve_at`) et la traduction termios de `syscall_io.c`, marqués « imported from HL » et listés dans `src/fs/NOTICE`. Le reste est écrit pour LKD.
+HyperLinux imports: the resolution loop of `vfs.c` (`hl_vfs_resolve_at`) and the termios translation of `syscall_io.c`, marked "imported from HL" and listed in `src/fs/NOTICE`. The rest is written for LKD.
 
-Syscalls enregistrés (100, tous ceux de `OWNERS.md` sauf `tee`) : open openat openat2 creat close close_range read write readv writev pread64 pwrite64 preadv pwritev preadv2 pwritev2 lseek stat fstat lstat newfstatat statx statfs fstatfs ustat access faccessat faccessat2 readlink readlinkat getcwd chdir fchdir chroot rename renameat renameat2 mkdir mkdirat rmdir unlink unlinkat link linkat symlink symlinkat chmod fchmod fchmodat fchmodat2 chown fchown lchown fchownat umask truncate ftruncate fallocate fsync fdatasync sync syncfs getdents getdents64 dup dup2 dup3 fcntl flock ioctl pipe pipe2 utime utimes utimensat futimesat sendfile copy_file_range splice vmsplice memfd_create mknod mknodat les 12 xattr fadvise64 readahead sync_file_range name_to_handle_at open_by_handle_at.
+Registered syscalls (100, all those of `OWNERS.md` except `tee`): open openat openat2 creat close close_range read write readv writev pread64 pwrite64 preadv pwritev preadv2 pwritev2 lseek stat fstat lstat newfstatat statx statfs fstatfs ustat access faccessat faccessat2 readlink readlinkat getcwd chdir fchdir chroot rename renameat renameat2 mkdir mkdirat rmdir unlink unlinkat link linkat symlink symlinkat chmod fchmod fchmodat fchmodat2 chown fchown lchown fchownat umask truncate ftruncate fallocate fsync fdatasync sync syncfs getdents getdents64 dup dup2 dup3 fcntl flock ioctl pipe pipe2 utime utimes utimensat futimesat sendfile copy_file_range splice vmsplice memfd_create mknod mknodat the 12 xattr fadvise64 readahead sync_file_range name_to_handle_at open_by_handle_at.
 
-## Tests (MESURE)
+## Tests (MEASURED)
 
-Construction complète de l'arbre (`cmake --build`, tous modules) : 24 programmes sur 24 passent. Programmes fs :
+Complete build of the tree (`cmake --build`, all modules): 24 programs out of 24 pass. fs programs:
 
-| Programme | Assertions | Cas |
+| Program | Assertions | Cases |
 | --- | --- | --- |
 | `test_fs_vfs` | 135 | 11 |
 | `test_fs_fd` | 101 | 9 |
@@ -24,48 +24,48 @@ Construction complète de l'arbre (`cmake --build`, tous modules) : 24 programme
 | `test_fs_glibc` | 64 | 6 |
 | total | 747 | 53 |
 
-Les mêmes tests passent aussi avec une construction privée cœur + fs (remplaçants faibles de sig, mm, task), ce qui vérifie que fs ne dépend pas du comportement d'un module particulier.
+The same tests also pass with a private core + fs build (weak stand-ins for sig, mm, task), which checks that fs does not depend on the behavior of a particular module.
 
-Couverture : racine invitée temporaire avec liens relatifs et absolus, ".." après un lien, boucles (40 liens acceptés, 41 refusés), évasion impossible, montages liés, répertoires synthétiques, montage virtuel avec liens magiques et réouverture indépendante, chroot, openat2 RESOLVE_* ; partage d'offset par dup et par fork, limites RLIMIT_NOFILE et fd jusqu'à 65535, close_range, CLOEXEC et exec, verrous POSIX vus d'un enfant avec le bon pid, flock ; disposition octet par octet de `struct stat` (144 octets) et de `statx` (256 octets) ; getdents et getdents64 (taille d'enregistrement, d_off, d_type, reprise après lseek, tampon trop petit) ; tubes (capacité 65536, EOF, EPIPE et SIGPIPE, attente et interruption, splice) ; memfd et scellés ; séquence ld.so de glibc 2.41 sur `rocket-hyperlinux-20260928/linux-root/rootfs` monté en lecture seule (`/etc/ld.so.cache` absent : ENOENT, `/lib/x86_64-linux-gnu/libc.so.6` ouvert, 832 octets lus, newfstatat AT_EMPTY_PATH taille 1995216, pread64 des en-têtes de programme, readlink de `/lib64/ld-linux-x86-64.so.2`, getcwd, 730 entrées de répertoire). L'arbre Debian n'a pas été modifié (MESURE : `find -newer` vide).
+Coverage: temporary guest root with relative and absolute links, ".." after a link, loops (40 links accepted, 41 refused), escape impossible, bind mounts, synthetic directories, virtual mount with magic links and independent reopening, chroot, openat2 RESOLVE_*; offset sharing through dup and through fork, RLIMIT_NOFILE limits and fds up to 65535, close_range, CLOEXEC and exec, POSIX locks seen from a child with the right pid, flock; byte-by-byte layout of `struct stat` (144 bytes) and of `statx` (256 bytes); getdents and getdents64 (record size, d_off, d_type, resume after lseek, buffer too small); pipes (capacity 65536, EOF, EPIPE and SIGPIPE, wait and interruption, splice); memfd and seals; glibc 2.41 ld.so sequence on `rocket-hyperlinux-20260928/linux-root/rootfs` mounted read-only (`/etc/ld.so.cache` missing: ENOENT, `/lib/x86_64-linux-gnu/libc.so.6` opened, 832 bytes read, newfstatat AT_EMPTY_PATH size 1995216, pread64 of the program headers, readlink of `/lib64/ld-linux-x86-64.so.2`, getcwd, 730 directory entries). The Debian tree was not modified (MEASURED: `find -newer` empty).
 
-## Faits hôtes mesurés (MESURE, macOS 27, ce Mac)
+## Measured host facts (MEASURED, macOS 27, this Mac)
 
-- Capacité d'un tube hôte : 65536 octets (remplissage non bloquant), comme Linux.
-- APFS de la racine invitée et de `/tmp` : insensible à la casse (`pathconf _PC_CASE_SENSITIVE` = 0), conservant la casse.
-- Fichier supprimé : `F_GETPATH` rend encore l'ancien chemin, `st_nlink` vaut 0 ; `ftruncate` répété et `mmap MAP_SHARED` fonctionnent.
-- `kern.maxfilesperproc` = 138240 ; `setrlimit(RLIMIT_NOFILE, 138240)` accepté.
-- `F_SETNOSIGPIPE` fonctionne sur un tube ; l'écriture sans lecteur rend EPIPE sans tuer le processus.
-- `flock` et les verrous `fcntl` POSIX d'un même fichier entrent en conflit sous macOS (Linux les garde indépendants).
+- Capacity of a host pipe: 65536 bytes (non-blocking fill), as on Linux.
+- APFS of the guest root and of `/tmp`: case-insensitive (`pathconf _PC_CASE_SENSITIVE` = 0), case-preserving.
+- Deleted file: `F_GETPATH` still returns the old path, `st_nlink` is 0; repeated `ftruncate` and `mmap MAP_SHARED` work.
+- `kern.maxfilesperproc` = 138240; `setrlimit(RLIMIT_NOFILE, 138240)` accepted.
+- `F_SETNOSIGPIPE` works on a pipe; a write without a reader returns EPIPE without killing the process.
+- `flock` and POSIX `fcntl` locks on the same file conflict under macOS (Linux keeps them independent).
 
-## Écarts connus (honnêtes, documentés dans le code)
+## Known differences (honest, documented in the code)
 
-1. Casse : un chemin invité d'une autre casse trouve le fichier (Linux : ENOENT) ; deux noms qui ne diffèrent que par la casse ne peuvent pas coexister. Rien n'est simulé ; `test_fs_vfs` enregistre ce comportement.
-2. Chemins hôtes limités à 1024 octets (PATH_MAX de macOS) : un chemin invité valide plus long rend ENAMETOOLONG.
-3. Course entre la marche et l'appel hôte : un lien posé entre les deux fait échouer l'appel (O_NOFOLLOW), sans évasion.
-4. Répertoire ouvert puis renommé : les *at relatifs utilisent le chemin invité mémorisé à l'ouverture.
-5. Tubes créés par LKD : le fd hôte est toujours non bloquant, O_NONBLOCK invité est dans l'objet ; un F_SETFL O_NONBLOCK n'est donc pas vu par un processus forké qui partage le tube. Atomicité PIPE_BUF : macOS ne garantit que 512 octets pour une écriture non bloquante.
-6. Flux hôtes partagés (tty, tube du lanceur) : attente interruptible puis lecture ; un autre lecteur peut prendre les données entre les deux et la lecture hôte bloque alors sans être interruptible.
-7. FIFO : un lecteur bloquant n'attend pas l'arrivée d'un écrivain à l'ouverture.
-8. flock et verrous POSIX d'un même fichier se gênent (voir mesure). Verrous bloquants (F_SETLKW, flock) : essais répétés toutes les 5 ms, interruptibles, sans détection d'interblocage EDEADLK.
-9. pipe2 O_DIRECT (mode paquet) : EINVAL. F_SETPIPE_SZ au-delà de 65536 : EPERM (fs.pipe-max-size vaut 65536 ici). splice, sendfile et copy_file_range copient par un tampon noyau (pas de zéro copie) ; tee n'est pas enregistré (ENOSYS compté).
-10. SIGIO : O_ASYNC refusé par ENOSYS sur tubes, flux et objets des autres modules (accepté sur fichiers ordinaires, où Linux ne fait rien non plus). F_SETOWN, F_SETSIG mémorisés ; F_SETLEASE (autre que F_UNLCK) et F_NOTIFY rendent EINVAL comme un noyau où leases et dnotify sont désactivés.
-11. memfd : scellés partagés entre processus forkés par une zone MAP_SHARED, perdus lors d'une ré-exécution hôte. Les écritures par un mapping partagé inscriptible d'un AUTRE processus de la famille ne sont pas vues par la requête EBUSY (elle ne connaît que l'espace d'adressage de l'appelant). MFD_HUGETLB : EINVAL. Attributs étendus user.* d'un memfd : non conservés (EOPNOTSUPP).
-12. Réouverture par /proc d'un fichier supprimé : duplication avec offset privé ; le mode d'accès ne peut pas dépasser celui de la description d'origine (EACCES). Tube : seule la même extrémité se rouvre (ENXIO sinon).
-13. O_TMPFILE : EOPNOTSUPP (glibc retombe sur un fichier nommé). name_to_handle_at : EOPNOTSUPP ; open_by_handle_at : EPERM sans capacité.
-14. Propriétaire : le compte hôte du runtime est présenté comme l'identité invitée (1000 par défaut), root reste 0, tout autre propriétaire devient 65534. chown vers un autre utilisateur : EPERM. Un invité root (euid 0) reste soumis aux droits hôtes de l'utilisateur.
-15. fsync ne force pas l'écriture du cache du disque (pas de F_FULLFSYNC) ; fallocate réserve au mieux (F_PREALLOCATE), APFS peut encore rendre ENOSPC plus tard ; PUNCH_HOLE écrit des zéros quand F_PUNCHHOLE refuse la plage.
-16. Ré-exécution hôte (execve) : la table de descripteurs invités n'est pas encore exportée (voir `docs/requests/fs-task.md` §4).
-17. Positions de répertoire et état des objets sans fd hôte : propres au processus, non partagés après fork (règle de `fd.h`).
-18. SCM_RIGHTS (2026-10-10) : un répertoire synthétique ou virtuel et un descripteur O_PATH partent en enregistrement (`LKD_FDREC_FS`, chemin invité global et drapeaux) et le récepteur rouvre ce chemin (`fs_rec_import`, `sys_open.c`). C'est une nouvelle description, avec sa propre position. Un descripteur hôte de caractère sans chemin invité qui est le jumeau d'un périphérique émulé devient ce périphérique (`fs_wrap_host_fd` appelle `lkd_procfs_dev_adopt`). Voir `net.md`.
+1. Case: a guest path with a different case finds the file (Linux: ENOENT); two names that differ only by case cannot coexist. Nothing is simulated; `test_fs_vfs` records this behavior.
+2. Host paths limited to 1024 bytes (macOS PATH_MAX): a longer valid guest path returns ENAMETOOLONG.
+3. Race between the walk and the host call: a link placed between the two makes the call fail (O_NOFOLLOW), without escape.
+4. Directory opened then renamed: the relative *at calls use the guest path remembered at open time.
+5. Pipes created by LKD: the host fd is always non-blocking, the guest O_NONBLOCK is in the object; an F_SETFL O_NONBLOCK is therefore not seen by a forked process that shares the pipe. PIPE_BUF atomicity: macOS only guarantees 512 bytes for a non-blocking write.
+6. Shared host streams (tty, launcher pipe): interruptible wait then read; another reader can take the data between the two and the host read then blocks without being interruptible.
+7. FIFO: a blocking reader does not wait for a writer to arrive at open time.
+8. flock and POSIX locks on the same file interfere (see measurement). Blocking locks (F_SETLKW, flock): repeated attempts every 5 ms, interruptible, without EDEADLK deadlock detection.
+9. pipe2 O_DIRECT (packet mode): EINVAL. F_SETPIPE_SZ beyond 65536: EPERM (fs.pipe-max-size is 65536 here). splice, sendfile and copy_file_range copy through a kernel buffer (no zero copy); tee is not registered (ENOSYS counted).
+10. SIGIO: O_ASYNC refused with ENOSYS on pipes, streams and objects of the other modules (accepted on regular files, where Linux does nothing either). F_SETOWN, F_SETSIG remembered; F_SETLEASE (other than F_UNLCK) and F_NOTIFY return EINVAL like a kernel where leases and dnotify are disabled.
+11. memfd: seals shared between forked processes through a MAP_SHARED area, lost on a host re-exec. Writes through a writable shared mapping of ANOTHER process of the family are not seen by the EBUSY query (it only knows the caller's address space). MFD_HUGETLB: EINVAL. user.* extended attributes of a memfd: not kept (EOPNOTSUPP).
+12. Reopening a deleted file through /proc: duplication with a private offset; the access mode cannot exceed that of the original description (EACCES). Pipe: only the same end can be reopened (ENXIO otherwise).
+13. O_TMPFILE: EOPNOTSUPP (glibc falls back to a named file). name_to_handle_at: EOPNOTSUPP; open_by_handle_at: EPERM without capability.
+14. Owner: the host account of the runtime is presented as the guest identity (1000 by default), root stays 0, any other owner becomes 65534. chown to another user: EPERM. A root guest (euid 0) stays subject to the user's host permissions.
+15. fsync does not force the disk cache to be written (no F_FULLFSYNC); fallocate reserves on a best-effort basis (F_PREALLOCATE), APFS can still return ENOSPC later; PUNCH_HOLE writes zeros when F_PUNCHHOLE refuses the range.
+16. Host re-exec (execve): the guest descriptor table is not exported yet (see `docs/requests/fs-task.md` §4).
+17. Directory positions and state of objects without a host fd: specific to the process, not shared after fork (rule of `fd.h`).
+18. SCM_RIGHTS (2026-10-10): a synthetic or virtual directory and an O_PATH descriptor are sent as a record (`LKD_FDREC_FS`, global guest path and flags) and the receiver reopens that path (`fs_rec_import`, `sys_open.c`). It is a new description, with its own position. A host character descriptor without a guest path that is the twin of an emulated device becomes that device (`fs_wrap_host_fd` calls `lkd_procfs_dev_adopt`). See `net.md`.
 
-## Demandes écrites
+## Written requests
 
-- `docs/requests/fs-1.md` (core) : exposer `lkd_config_get`, rendre `lkd_fs.h` incluable, précisions de `vfs.h`, commentaire de `fd.h` sur les tubes, symboles `lkd_sys_*` du test du noyau, `fake_make_task`.
-- `docs/requests/fs-engine.md` : `lkd_fs_open_host_file`, `lkd_fs_open_guest_file`, `lkd_fs_install_stdio`, `lkd_fs_wrap_host_fd`, effets de `lkd_init` sur l'hôte, ignorer SIGPIPE hôte.
-- `docs/requests/fs-procfs.md` : usage de l'interface de montage, liens magiques fd/N, fdinfo, mounts.
-- `docs/requests/fs-mm.md` : `lkd_fs_mmap_check`, sémantique attendue de `lkd_mm_has_writable_shared_mapping`.
-- `docs/requests/fs-task.md` : références fdt/fsctx, RLIMIT_NOFILE, exec ; coopération F_SETFL avec net.
+- `docs/requests/fs-1.md` (core): expose `lkd_config_get`, make `lkd_fs.h` includable, clarifications of `vfs.h`, comment of `fd.h` on pipes, `lkd_sys_*` symbols of the kernel test, `fake_make_task`.
+- `docs/requests/fs-engine.md`: `lkd_fs_open_host_file`, `lkd_fs_open_guest_file`, `lkd_fs_install_stdio`, `lkd_fs_wrap_host_fd`, effects of `lkd_init` on the host, ignore host SIGPIPE.
+- `docs/requests/fs-procfs.md`: use of the mount interface, fd/N magic links, fdinfo, mounts.
+- `docs/requests/fs-mm.md`: `lkd_fs_mmap_check`, expected semantics of `lkd_mm_has_writable_shared_mapping`.
+- `docs/requests/fs-task.md`: fdt/fsctx references, RLIMIT_NOFILE, exec; F_SETFL cooperation with net.
 
-## Suite possible
+## Possible next steps
 
-Export/import de la table pour l'exec hôte ; pid de ".." et inode synthétiques ; `tee` ; mesure de performance de la marche (un lstat par composant) sur un lancement réel de Wine.
+Export/import of the table for the host exec; pid of ".." and synthetic inodes; `tee`; performance measurement of the walk (one lstat per component) on a real Wine launch.

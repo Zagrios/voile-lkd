@@ -1,74 +1,74 @@
-# Décision d'architecture, 2 octobre 2026
+# Architecture decision, October 2, 2026
 
-Document de travail de la lignée Wine et FEX sur Darwin. Il fixe ce qui est établi, ce qui est choisi, et comment on le vérifie. Les rapports détaillés sont dans le même dossier. Chaque affirmation renvoie à un rapport ou à un journal ; ce qui n'est pas mesuré est dit.
+Working document of the Wine and FEX line on Darwin. It sets down what is established, what is chosen, and how it is verified. The detailed reports are in the same folder. Each claim points to a report or a log; what is not measured is said.
 
-## 1. Faits établis
+## 1. Established facts
 
-1. Le runtime installé est entièrement x86_64 sous Rosetta. Aucun PE arm64, aucune tranche arm64 de D3DMetal (`wine-macos-bridge.md` §0 points 1 et 3).
-2. Sous Rosetta, un `syscall` brut de numéro Linux lève SIGSYS. Wine macOS le redirige vers son dispatcher NT, et les numéros Linux recouvrent les identifiants NT (`wine-macos-bridge.md` §0 point 5). Le bootstrapper PE d'EAC émet lui-même des `syscall` Linux (319, 1) depuis son image. Le module EAC doit donc vivre dans un processus qui offre une vraie personnalité Linux.
-3. Un processus arm64 macOS ne mappe rien sous 4 Gio. Réduire `__PAGEZERO` fait refuser l'exécution par le noyau. Wine a besoin de 0x7ffe0000 (`USER_SHARED_DATA`) et son préchargeur de 0x10000-0x68000000 et 0x7f000000-0x7fff0000 (`fexcore-darwin-port.md`, `wine-macos-bridge.md` §3). Un invité à adresse identique à l'hôte ne peut pas héberger Wine.
-4. L'espace utilisateur arm64 va jusqu'à 0x7ffffe000000 ; une réservation `PROT_NONE` de 2^46 octets réussit, 2^47 échoue ; l'espace libre est surtout en haut (`fexcore-darwin-port.md`).
-5. Pages hôte de 16 Kio ; `mmap`, `munmap` et `mprotect` arrondissent à 16 Kio et refusent une adresse non alignée ; un offset de fichier de 0x1000 donne EINVAL (`hl-reuse-core.md` annexe A). Seule une cible x86_64 sous Rosetta obtient des pages de 4 Kio (`posix_spawnattr_set_4k_page_size_np` répond EBADMACHO pour arm64, `darwin-memory-facts-a.md`).
-6. `x18` est remis à zéro par le noyau : le JIT ne peut pas l'utiliser (`fexcore-darwin-port.md`).
-7. FEXCore 0df84d3 se compile en bibliothèque statique sur macOS arm64 avec 13 fichiers modifiés (`fexcore-darwin-port.md`, jalon 1). Aucun témoin n'a encore été exécuté au moment de cette fiche.
-8. HyperLinux compte 40 617 lignes de C. 25 objets sur 39 n'ont aucun symbole HVF. Un banc a exécuté ses vrais objets vfs, fd et procfs dans un processus macOS ordinaire : 23 contrôles sur 23, sans VM (`hl-reuse-core.md` résumé 3). Sa relation ptrace tracer/tracee en espace utilisateur (`proc_ptrace.c`) passe 79 contrôles sur 79 sur l'hôte (`hl-reuse-process.md` résumé 4).
-9. Le `fork()` natif de macOS 27 tient dans un processus multithread avec `MAP_JIT` (17 PASS), avec des verrous orphelins à gérer (`hl-reuse-process.md` résumé 7).
-10. Verdicts EAC : le seul environnement non physique accepté (code 301) est QEMU système x86 TCG, sans authentification, en 3,5 s ; toutes les piles ARM donnent 509/210 ou 502 « Cannot run under Virtual Machine ». L'absence d'authentification est une cause close. Un lancement du bootstrapper sans identifiants est donc un discriminateur valable (`eac-controls-digest.md` §0).
-11. Contrat observé du module : fork depuis un thread worker, `PTRACE_TRACEME`, `SETOPTIONS(0x11)`, `PTRACE_SYSCALL`, `GETREGSET NT_PRSTATUS` de 216 octets, `GETSIGINFO`, exec du loader Wine par l'enfant, `INT3` à l'entrée de l'image, `POKE` et `SETREGSET` pour injecter un `dlopen("/proc/self/fd/N")`, `SIGSEGV` attendu à l'adresse 9 (`eac-probes-digest.md` §0 points 2 et 5, §6).
-12. Wine 11 de voile-wine contient déjà la plomberie ARM64EC et une simulation de pages de 4 Kio sur hôte de 16 Kio ; l'interface `xtajit64` de Wine est identique, nom pour nom, à celle de `libarm64ecfex.dll` de FEX (`wine-macos-bridge.md` §4).
+1. The installed runtime is entirely x86_64 under Rosetta. No arm64 PE, no arm64 slice of D3DMetal (`wine-macos-bridge.md` §0 points 1 and 3).
+2. Under Rosetta, a raw `syscall` with a Linux number raises SIGSYS. Wine macOS redirects it to its NT dispatcher, and the Linux numbers overlap the NT identifiers (`wine-macos-bridge.md` §0 point 5). The EAC PE bootstrapper itself issues Linux `syscall`s (319, 1) from its image. The EAC module must therefore live in a process that offers a real Linux personality.
+3. A macOS arm64 process maps nothing below 4 GiB. Shrinking `__PAGEZERO` makes the kernel refuse the execution. Wine needs 0x7ffe0000 (`USER_SHARED_DATA`) and its preloader needs 0x10000-0x68000000 and 0x7f000000-0x7fff0000 (`fexcore-darwin-port.md`, `wine-macos-bridge.md` §3). A guest at an address identical to the host cannot host Wine.
+4. The arm64 user space goes up to 0x7ffffe000000; a `PROT_NONE` reservation of 2^46 bytes succeeds, 2^47 fails; the free space is mostly at the top (`fexcore-darwin-port.md`).
+5. 16 KiB host pages; `mmap`, `munmap` and `mprotect` round to 16 KiB and refuse an unaligned address; a file offset of 0x1000 gives EINVAL (`hl-reuse-core.md` appendix A). Only an x86_64 target under Rosetta gets 4 KiB pages (`posix_spawnattr_set_4k_page_size_np` answers EBADMACHO for arm64, `darwin-memory-facts-a.md`).
+6. `x18` is reset to zero by the kernel: the JIT cannot use it (`fexcore-darwin-port.md`).
+7. FEXCore 0df84d3 compiles as a static library on macOS arm64 with 13 modified files (`fexcore-darwin-port.md`, milestone 1). No witness had been run yet at the time of this note.
+8. HyperLinux has 40,617 lines of C. 25 objects out of 39 have no HVF symbol. A bench ran its real vfs, fd and procfs objects in an ordinary macOS process: 23 checks out of 23, without a VM (`hl-reuse-core.md` summary 3). Its user-space ptrace tracer/tracee relationship (`proc_ptrace.c`) passes 79 checks out of 79 on the host (`hl-reuse-process.md` summary 4).
+9. The native `fork()` of macOS 27 holds in a multithreaded process with `MAP_JIT` (17 PASS), with orphaned locks to handle (`hl-reuse-process.md` summary 7).
+10. EAC verdicts: the only non-physical environment accepted (code 301) is QEMU system x86 TCG, without authentication, in 3.5 s; all ARM stacks give 509/210 or 502 "Cannot run under Virtual Machine". The lack of authentication is a closed cause. A launch of the bootstrapper without credentials is therefore a valid discriminator (`eac-controls-digest.md` §0).
+11. Observed contract of the module: fork from a worker thread, `PTRACE_TRACEME`, `SETOPTIONS(0x11)`, `PTRACE_SYSCALL`, `GETREGSET NT_PRSTATUS` of 216 bytes, `GETSIGINFO`, exec of the Wine loader by the child, `INT3` at the image entry, `POKE` and `SETREGSET` to inject a `dlopen("/proc/self/fd/N")`, `SIGSEGV` expected at address 9 (`eac-probes-digest.md` §0 points 2 and 5, §6).
+12. The Wine 11 of voile-wine already contains the ARM64EC plumbing and a simulation of 4 KiB pages on a 16 KiB host; Wine's `xtajit64` interface is identical, name for name, to that of FEX's `libarm64ecfex.dll` (`wine-macos-bridge.md` §4).
 
-## 2. Options comparées
+## 2. Options compared
 
-| Option | Principe | Verdict |
+| Option | Principle | Verdict |
 | --- | --- | --- |
-| O1 | Wine macOS sous Rosetta, module ELF dans un processus FEX séparé | Rejetée. Le bootstrapper charge le module dans son propre processus par des `syscall` bruts qu'aucun pont externe ne voit, et le module doit tracer le vrai processus du jeu. |
-| O2 | Wine ARM64EC natif sur macOS, FEX comme émulateur ARM64EC, Linux de poche dans le processus pour EAC | Gardée comme optimisation ultérieure. Meilleur chemin graphique et de performance, mais demande de porter Wine arm64 sur macOS (`x18`, zone basse, 16 Kio), de loger glibc dans le processus, et d'aiguiller deux personnalités. |
-| O3 | Userland Linux x86-64 complet (Wine Linux, glibc, module EAC) sur FEXCore dans un processus macOS arm64, avec une couche noyau Linux-sur-Darwin | Retenue. Une seule personnalité, fidélité Linux par construction, preuve d'existence dans le chemin QEMU. |
-| O4 | HyperLinux (Hypervisor.framework par processus) | Exclue tant que l'utilisateur n'a pas accepté la virtualisation par processus. Lue seulement pour ses contrats. |
+| O1 | Wine macOS under Rosetta, ELF module in a separate FEX process | Rejected. The bootstrapper loads the module in its own process through raw `syscall`s that no external bridge sees, and the module must trace the real game process. |
+| O2 | Native ARM64EC Wine on macOS, FEX as ARM64EC emulator, pocket Linux in the process for EAC | Kept as a later optimization. Best graphics and performance path, but requires porting arm64 Wine to macOS (`x18`, low zone, 16 KiB), housing glibc in the process, and routing between two personalities. |
+| O3 | Complete x86-64 Linux userland (Linux Wine, glibc, EAC module) on FEXCore in a macOS arm64 process, with a Linux-on-Darwin kernel layer | Chosen. A single personality, Linux fidelity by construction, proof of existence in the QEMU path. |
+| O4 | HyperLinux (Hypervisor.framework per process) | Excluded as long as the user has not accepted per-process virtualization. Read only for its contracts. |
 
-## 3. Décision
+## 3. Decision
 
-O3, avec ces choix :
+O3, with these choices:
 
-1. Moteur : FEXCore porté sur Darwin. Les accès mémoire du code invité ajoutent un registre de base : adresse hôte = `GUEST_BASE` + adresse invitée. L'hôte réserve la fenêtre invitée une fois (PROT_NONE, MAP_NORESERVE, au plus 2^46 octets) et la valide par morceaux. Tous les déréférencements de pointeurs invités par FEXCore et par la couche noyau passent par une fonction unique.
-2. Pages : l'invité voit des pages de 4 Kio. Une table de VMA garde la vue exacte à 4 Kio ; la protection hôte d'une page de 16 Kio est le OU des protections de ses sous-pages ; les mappings de fichiers à offset non aligné sont copiés en mémoire anonyme pour le cas privé. FEXCore ignore le bit d'exécution invité, ce qui supprime le problème W^X des unions RWX.
-3. Couche noyau (nom de travail LKD) : une couche syscall x86-64 neuve, appelée par le moteur à chaque `syscall` invité. Modules repris de HyperLinux : vfs enraciné, objets fd, procfs, noms de tâches, traductions de drapeaux et d'errno, relation ptrace tracer/tracee en espace utilisateur. Éléments repris de FEX : structures x64, cadres de signal x86-64, vDSO, suivi des VMA. On ne compile pas la couche `LinuxEmulation` de FEX sur une bibliothèque « noyau ARM64 » (recommandation de `hl-reuse-core.md`, contre l'avis du mode A de `hl-reuse-process.md` ; le mode A reste la repli si l'écriture des conversions x86-64 s'avère plus chère que prévu).
-4. Processus : un processus invité est un processus hôte. `fork` invité = `fork` hôte avec le protocole de verrous de FEX. `exec` invité = réexécution du runtime. PID et TID viennent d'un compteur partagé de la famille, le TID du thread principal égale le PID.
-5. Signaux : files logicielles par tâche et boîte aux lettres inter-processus ; un seul signal hôte réservé interrompt le code JIT ; les fautes synchrones sont traduites en signaux invités avec l'adresse exacte.
-6. ptrace : émulation coopérative en espace utilisateur entre deux processus du runtime. L'état x86 réel se trouve dans `CPUState` de FEXCore, donc la vue de 216 octets est exacte par construction. Les écritures de code invalident le cache de traduction du tracee avant sa reprise.
-7. Graphique : client Neptune dans Wine Linux, transport vtest, rendu dans un processus macOS séparé (D3DMetal-native sous Rosetta ou DXMT-native arm64). La comparaison des deux se fait avec des témoins avant le jeu.
-8. Affichage, entrées, son : pilote Wine à écrire qui parle à l'hôte macOS par socket, ou serveur X minimal ; à trancher par les témoins de `graphics-display-audio.md`.
-9. Aucune réponse fabriquée : chaque réponse de `/proc`, de ptrace ou de syscall provient d'un état réel du runtime. Les fonctions non implémentées répondent ENOSYS de façon visible.
+1. Engine: FEXCore ported to Darwin. Memory accesses from guest code add a base register: host address = `GUEST_BASE` + guest address. The host reserves the guest window once (PROT_NONE, MAP_NORESERVE, at most 2^46 bytes) and commits it in pieces. All dereferences of guest pointers by FEXCore and by the kernel layer go through a single function.
+2. Pages: the guest sees 4 KiB pages. A VMA table keeps the exact view at 4 KiB; the host protection of a 16 KiB page is the OR of the protections of its subpages; file mappings at an unaligned offset are copied into anonymous memory for the private case. FEXCore ignores the guest execute bit, which removes the W^X problem of RWX unions.
+3. Kernel layer (working name LKD): a new x86-64 syscall layer, called by the engine on each guest `syscall`. Modules taken from HyperLinux: rooted vfs, fd objects, procfs, task names, flag and errno translations, user-space ptrace tracer/tracee relationship. Elements taken from FEX: x64 structures, x86-64 signal frames, vDSO, VMA tracking. FEX's `LinuxEmulation` layer is not compiled on top of an "ARM64 kernel" library (recommendation of `hl-reuse-core.md`, against the opinion of mode A of `hl-reuse-process.md`; mode A remains the fallback if writing the x86-64 conversions turns out more expensive than planned).
+4. Processes: a guest process is a host process. Guest `fork` = host `fork` with FEX's lock protocol. Guest `exec` = re-execution of the runtime. PID and TID come from a counter shared by the family, the TID of the main thread equals the PID.
+5. Signals: per-task software queues and an inter-process mailbox; a single reserved host signal interrupts the JIT code; synchronous faults are translated into guest signals with the exact address.
+6. ptrace: cooperative user-space emulation between two runtime processes. The real x86 state is in FEXCore's `CPUState`, so the 216-byte view is exact by construction. Code writes invalidate the tracee's translation cache before it resumes.
+7. Graphics: Neptune client in Linux Wine, vtest transport, rendering in a separate macOS process (D3DMetal-native under Rosetta or DXMT-native arm64). The two are compared with witnesses before the game.
+8. Display, input, sound: a Wine driver to write that talks to the macOS host over a socket, or a minimal X server; to be decided by the witnesses of `graphics-display-audio.md`.
+9. No fabricated answer: each answer from `/proc`, from ptrace or from a syscall comes from a real state of the runtime. Unimplemented functions answer ENOSYS visibly.
 
 ## 4. Interfaces
 
-Frontière étroite entre moteur et noyau, reprise de `hl-reuse-process.md` §3.2 : accès mémoire invitée (`user_read`, `user_write`, `user_strn`), entrée de syscall, livraison de signaux aux points sûrs, rapport de fautes, services du moteur (registres, FP, invalidation de code, spawn de thread, construction et restauration de cadre), points de fork et d'exec, arrêts ptrace. Le fichier d'en-tête de référence est `src/lkd/include/lkd/lkd.h`.
+Narrow boundary between engine and kernel, taken from `hl-reuse-process.md` §3.2: guest memory access (`user_read`, `user_write`, `user_strn`), syscall entry, signal delivery at safe points, fault reporting, engine services (registers, FP, code invalidation, thread spawn, frame construction and restoration), fork and exec points, ptrace stops. The reference header file is `src/lkd/include/lkd/lkd.h`.
 
-## 5. Échelle de qualification
+## 5. Qualification ladder
 
-Chaque palier a des programmes possédés et des oracles enregistrés (jamais QEMU relancé). Un palier n'est franchi que si la sortie correspond à l'oracle.
+Each rung has owned programs and recorded oracles (QEMU never rerun). A rung is passed only if the output matches the oracle.
 
-1. ELF x86-64 statique sans libc : chargement, syscalls directs, TLS par `arch_prctl`, code automodifiable, faute invitée.
-2. ELF statique avec libc (musl puis glibc) : malloc, threads, signaux, fichiers.
-3. Dynamique glibc depuis le sysroot Debian : `ld.so`, `/bin/sh`, outils de base.
-4. Processus : fork, exec, wait, pipes, sockets Unix, futex partagé, signaux entre processus.
-5. Wine `--version`, puis `wineboot --init`, puis `cmd /c echo`, puis un PE possédé : premier témoin de franchissement PE, ELF, macOS.
-6. ptrace x86 : les témoins existants (76 contrôles de l'oracle Linux x86) puis le contrat EAC.
-7. Bootstrapper EAC sans identifiants : code 301 contre 509/210.
-8. Graphique, entrées, son : témoins séparés avant le jeu.
-9. Jeu protégé : session authentifiée, partie complète, reconnexion, FPS et temps de frame.
+1. Static x86-64 ELF without libc: loading, direct syscalls, TLS through `arch_prctl`, self-modifying code, guest fault.
+2. Static ELF with libc (musl then glibc): malloc, threads, signals, files.
+3. Dynamic glibc from the Debian sysroot: `ld.so`, `/bin/sh`, basic tools.
+4. Processes: fork, exec, wait, pipes, Unix sockets, shared futex, signals between processes.
+5. Wine `--version`, then `wineboot --init`, then `cmd /c echo`, then an owned PE: first witness of crossing PE, ELF, macOS.
+6. x86 ptrace: the existing witnesses (76 checks of the Linux x86 oracle) then the EAC contract.
+7. EAC bootstrapper without credentials: code 301 versus 509/210.
+8. Graphics, input, sound: separate witnesses before the game.
+9. Protected game: authenticated session, full match, reconnection, FPS and frame time.
 
-## 6. Risques
+## 6. Risks
 
-1. Décalage de base dans le JIT : modification de nombreux sites mémoire de FEXCore (atomiques, vecteurs, `rep movs`). Lever : estimation par l'agent FEX, puis implémentation derrière une option.
-2. 4 Kio sur 16 Kio : garde-fous Windows et mappings fichiers à offsets de 4 Kio. Lever : témoins de pages sur Wine réel.
-3. Signaux asynchrones et boîte aux lettres inter-processus (Wine server envoie SIGUSR1 aux clients).
-4. Futex partagé entre processus, eventfd et epoll sur kqueue (kqueue n'est pas héritée par fork).
-5. ptrace coopératif et cohérence du cache de traduction après POKE.
-6. Verdict EAC : ARM n'a jamais produit 301 ; les critères de refus de VM sont inconnus. Lever : mesurer CPUID, `cpuinfo`, DMI et vecteur auxiliaire de l'environnement, sans masquage de l'identité de FEX.
-7. Performances : FEX sans TSO matériel. Mesurer tôt sur des microprogrammes puis sur Wine.
+1. Base offset in the JIT: modification of many FEXCore memory sites (atomics, vectors, `rep movs`). Mitigation: estimate by the FEX agent, then implementation behind an option.
+2. 4 KiB on 16 KiB: Windows guard pages and file mappings at 4 KiB offsets. Mitigation: page witnesses on real Wine.
+3. Asynchronous signals and inter-process mailbox (Wine server sends SIGUSR1 to clients).
+4. Futex shared between processes, eventfd and epoll on kqueue (kqueue is not inherited by fork).
+5. Cooperative ptrace and translation cache coherence after POKE.
+6. EAC verdict: ARM has never produced 301; the VM refusal criteria are unknown. Mitigation: measure CPUID, `cpuinfo`, DMI and the auxiliary vector of the environment, without masking FEX's identity.
+7. Performance: FEX without hardware TSO. Measure early on microprograms then on Wine.
 
-## 7. Questions pour l'utilisateur
+## 7. Questions for the user
 
-1. Si le mur des 4 Kio ou des 16 Kio bloquait Wine de façon irréparable, accepte-t-il Hypervisor.framework par processus comme repli ? Non demandé tant qu'aucun témoin n'établit ce blocage.
-2. Jeton Epic : le classifieur de permissions a refusé la lecture du trousseau. Il n'est requis qu'à la fin (session protégée). L'utilisateur peut écrire lui-même le fichier avec la commande `!` indiquée dans la conversation, ou lancer le jeu depuis Obelisk avec un moteur de laboratoire.
+1. If the 4 KiB or 16 KiB wall blocked Wine irreparably, would they accept per-process Hypervisor.framework as a fallback? Not asked as long as no witness establishes this blocking.
+2. Epic token: the permissions classifier refused to read the keychain. It is only required at the end (protected session). The user can write the file themselves with the `!` command given in the conversation, or launch the game from Obelisk with a lab engine.

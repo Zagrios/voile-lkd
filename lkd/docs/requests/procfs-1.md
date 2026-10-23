@@ -1,14 +1,14 @@
-# Demande procfs-1 au noyau commun (core)
+# Request procfs-1 to the common kernel (core)
 
-Date : 2026-10-02. Auteur : module procfs.
+Date: 2026-10-02. Author: procfs module.
 
-1. Chemin d'inclusion. `src/procfs/lkd_procfs.h` (API pour le moteur et les tests : fournisseur CPUID, backend de test, `lkd_procfs_dev_is_zero`) est inclus par chemin relatif (`"../src/procfs/lkd_procfs.h"`). Demande : ajouter `src/procfs` au chemin d'inclusion de `liblkd` et des tests, ou créer `src/include/lkd_procfs.h` qui fait `#include "../procfs/lkd_procfs.h"`. Même chose que `docs/requests/fs-1.md` point 2 pour `lkd_fs.h`.
-2. `lkd_task_uname` est définie par task (`src/task/sys.c:25`) mais déclarée nulle part (demande `task-1.md` point 2). procfs la redéclare dans `src/procfs/procfs_priv.h`. Demande : la déclarer dans `task.h`.
-3. `lkd_config_get` : même demande que `fs-1.md` point 1 (procfs la redéclare).
-4. `fake_make_task` ne crée ni table de descripteurs, ni fsctx, ni mm. Les tests procfs les posent (`tests/test_procfs_util.h`, `procfs_fixture`). Si core les ajoute, les tests restent valables.
-5. Ordre des crochets : procfs n'a aucun crochet (aucun verrou, aucun état par processus). Rien à changer.
+1. Include path. `src/procfs/lkd_procfs.h` (API for the engine and the tests: CPUID provider, test backend, `lkd_procfs_dev_is_zero`) is included by relative path (`"../src/procfs/lkd_procfs.h"`). Request: add `src/procfs` to the include path of `liblkd` and of the tests, or create `src/include/lkd_procfs.h` that does `#include "../procfs/lkd_procfs.h"`. Same thing as `docs/requests/fs-1.md` point 2 for `lkd_fs.h`.
+2. `lkd_task_uname` is defined by task (`src/task/sys.c:25`) but declared nowhere (request `task-1.md` point 2). procfs redeclares it in `src/procfs/procfs_priv.h`. Request: declare it in `task.h`.
+3. `lkd_config_get`: same request as `fs-1.md` point 1 (procfs redeclares it).
+4. `fake_make_task` creates neither a descriptor table, nor an fsctx, nor an mm. The procfs tests set them up (`tests/test_procfs_util.h`, `procfs_fixture`). If core adds them, the tests stay valid.
+5. Hook order: procfs has no hook (no lock, no per-process state). Nothing to change.
 
 
-## Traitée le 2026-10-02 (mainteneur d'intégration)
+## Handled on 2026-10-02 (integration maintainer)
 
-Point 1 : `src/include/lkd_procfs.h` renvoie à `src/procfs/lkd_procfs.h` ; tests et net incluent maintenant `"lkd_fs.h"` et `"lkd_procfs.h"`. Point 2 : `lkd_task_uname` déclarée dans `task.h`, redéclaration de `procfs_priv.h` retirée. Point 3 : fait (lead). Point 4 : non fait (même raison que fs-1 point 6). Point 5 : rien.
+Point 1: `src/include/lkd_procfs.h` points to `src/procfs/lkd_procfs.h`; tests and net now include `"lkd_fs.h"` and `"lkd_procfs.h"`. Point 2: `lkd_task_uname` declared in `task.h`, redeclaration in `procfs_priv.h` removed. Point 3: done (lead). Point 4: not done (same reason as fs-1 point 6). Point 5: nothing.

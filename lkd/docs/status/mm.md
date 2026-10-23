@@ -1,148 +1,148 @@
-# Statut du module mm (LKD)
+# Status of the mm module (LKD)
 
-Date : 2026-10-02. Jalon 4 (dernier de cette session) : le module couvre toute sa liste prioritaire. 8 programmes de test passent, soit 563 assertions.
+Date: 2026-10-02. Milestone 4 (the last of this session): the module covers its whole priority list. 8 test programs pass, for 563 assertions.
 
-## Ce qui existe
+## What exists
 
-`src/mm/` (3705 lignes) :
+`src/mm/` (3705 lines):
 
-- `vma.c` : table des VMA en arbre AVL trié par adresse de début. Recherche, insertion et retrait en O(log n), environ 100 octets par entrée, écart maximal par sous-arbre pour la recherche de trou (comme l'arbre augmenté de Linux). Remplace le tableau trié de HyperLinux (memmove linéaire, 4144 octets par entrée).
-- `window.c` : fenêtre hôte. `mm_window_reserve` (`window.c:36`) teste d'abord la base voulue avec `mach_vm_allocate(VM_FLAGS_FIXED)`, qui échoue au lieu d'écraser. Puis il essaie 8 Tio, 16 Tio, 32 Tio, 0x7d80000000, puis n'importe où aligné sur 1 Gio, et pose `lkd_guest_base`.
-- `lkd_mm_find_nowait` (`mm.c`) : `lkd_mm_find` sans attente, -EBUSY si la table des VMA est en cours de modification. Pour le rapport de faute fatale de fexdarwin, écrit depuis un gestionnaire de signal dont le fil peut tenir ce verrou. Cas `find_nowait` de `test_mm_map`.
-- `mm.c` : espaces d'adressage ; `mm_map_locked` (`mm.c:440`), `mm_unmap_locked` (`mm.c:344`), `mm_host_cleanup` (`mm.c:380`) ; recherche de trou descendante de Linux avec indice, `MAP_32BIT`, `MAP_ABOVE4G`, alignement THP de 2 Mio pour l'anonyme (`mm.c:612`) ; `lkd_mm_check_range` fort (`mm.c:681`) ; `/proc/<pid>/maps` exact (`mm.c:848`, `mm.c:878`) ; smaps, stats, clés futex ; crochets de fork (`mm.c:1092`), d'exec et de sortie de thread.
-- `sys.c` : mmap (ordre des erreurs de `do_mmap`, `sys.c:101`), munmap, mprotect, pkey_mprotect, pkey_alloc, pkey_free, map_shadow_stack, brk (`sys.c:318`), madvise, mincore (`sys.c:524`), msync, mlock, mlock2, munlock, mlockall, munlockall.
-- `remap.c` : mremap (MAYMOVE, FIXED, DONTUNMAP, agrandissement sur place, déplacement par `mach_vm_remap`, `remap.c:133`).
-- `shm.c` : shmget, shmat, shmdt, shmctl (IPC_STAT, IPC_SET, IPC_RMID, IPC_INFO, SHM_INFO, SHM_STAT, SHM_STAT_ANY, SHM_LOCK, SHM_UNLOCK). Les segments sont des objets `shm_open` ; la table est partagée par fork.
-- `remote.c` : service de mémoire entre processus (un fil par processus, socket AF_UNIX) ; `lkd_mm_remote_read/write/render_maps` avec la règle FOLL_FORCE et l'invalidation du code de la cible ; process_vm_readv/writev (`remote.c:320`).
-- `lkd_mm_ext.h` : entrées pas encore dans `mm.h` (voir `docs/requests/mm-2.md`). `NOTICE` : un bloc importé de HyperLinux (rendu d'une ligne de maps).
+- `vma.c`: VMA table as an AVL tree sorted by start address. Lookup, insertion and removal in O(log n), about 100 bytes per entry, maximum gap per subtree for the hole search (like Linux's augmented tree). Replaces HyperLinux's sorted array (linear memmove, 4144 bytes per entry).
+- `window.c`: host window. `mm_window_reserve` (`window.c:36`) first tests the wanted base with `mach_vm_allocate(VM_FLAGS_FIXED)`, which fails instead of overwriting. Then it tries 8 TiB, 16 TiB, 32 TiB, 0x7d80000000, then anywhere aligned on 1 GiB, and sets `lkd_guest_base`.
+- `lkd_mm_find_nowait` (`mm.c`): `lkd_mm_find` without waiting, -EBUSY if the VMA table is being modified. For fexdarwin's fatal fault report, written from a signal handler whose thread may hold that lock. `find_nowait` case of `test_mm_map`.
+- `mm.c`: address spaces; `mm_map_locked` (`mm.c:440`), `mm_unmap_locked` (`mm.c:344`), `mm_host_cleanup` (`mm.c:380`); Linux's top-down hole search with hint, `MAP_32BIT`, `MAP_ABOVE4G`, 2 MiB THP alignment for anonymous memory (`mm.c:612`); strong `lkd_mm_check_range` (`mm.c:681`); exact `/proc/<pid>/maps` (`mm.c:848`, `mm.c:878`); smaps, stats, futex keys; fork hooks (`mm.c:1092`), exec hooks and thread-exit hooks.
+- `sys.c`: mmap (error order of `do_mmap`, `sys.c:101`), munmap, mprotect, pkey_mprotect, pkey_alloc, pkey_free, map_shadow_stack, brk (`sys.c:318`), madvise, mincore (`sys.c:524`), msync, mlock, mlock2, munlock, mlockall, munlockall.
+- `remap.c`: mremap (MAYMOVE, FIXED, DONTUNMAP, growth in place, move through `mach_vm_remap`, `remap.c:133`).
+- `shm.c`: shmget, shmat, shmdt, shmctl (IPC_STAT, IPC_SET, IPC_RMID, IPC_INFO, SHM_INFO, SHM_STAT, SHM_STAT_ANY, SHM_LOCK, SHM_UNLOCK). The segments are `shm_open` objects; the table is shared by fork.
+- `remote.c`: memory service between processes (one thread per process, AF_UNIX socket); `lkd_mm_remote_read/write/render_maps` with the FOLL_FORCE rule and invalidation of the target's code; process_vm_readv/writev (`remote.c:320`).
+- `lkd_mm_ext.h`: entries not in `mm.h` yet (see `docs/requests/mm-2.md`). `NOTICE`: one block imported from HyperLinux (rendering of a maps line).
 
-Modèle mémoire (LU, `mm_priv.h`) :
+Memory model (READ, `mm_priv.h`):
 
-- I1 : une page hôte de 16 Kio sans VMA est une réservation neuve (PROT_NONE, zéro).
-- I2 : sa protection est l'union de ses sous-pages. Elle est lisible si une sous-page est accessible, inscriptible si une sous-page l'est, jamais exécutable.
-- I3 : une page hôte d'un mapping partagé (MAP_SHARED anonyme, SysV, fichier partagé) n'appartient qu'à ce mapping.
+- I1: a 16 KiB host page without a VMA is a fresh reservation (PROT_NONE, zero).
+- I2: its protection is the union of its subpages. It is readable if one subpage is accessible, writable if one subpage is, never executable.
+- I3: a host page of a shared mapping (anonymous MAP_SHARED, SysV, shared file) belongs only to that mapping.
 
-Fichiers privés : une page hôte entière est projetée directement (copie sur écriture de l'hôte) si son offset de fichier est aligné sur 16 Kio et si elle commence avant la fin du fichier. Les autres pages sont copiées par `pread`. La recherche de trou préfère une adresse congrue à l'offset modulo 16 Kio, pour permettre la projection directe.
+Private files: a whole host page is mapped directly (host copy-on-write) if its file offset is aligned on 16 KiB and if it starts before the end of the file. The other pages are copied through `pread`. The hole search prefers an address congruent to the offset modulo 16 KiB, to allow the direct mapping.
 
-## MAP_SHARED plus petit qu'une page hôte (demande du chef, premier lancement de Wine)
+## MAP_SHARED smaller than a host page (request from the project lead, first Wine launch)
 
-Cas déclencheur : le client Wine mappe le memfd de 4 Kio de wineserver (KUSER_SHARED_DATA) en `MAP_FIXED|MAP_SHARED|PROT_READ` sur sa réservation privée de 4 Kio à 0x7ffe0000 ; le serveur met la page à jour toutes les quelques ms, elle doit être réellement partagée. Avant : EINVAL. Maintenant : réussi.
+Triggering case: the Wine client maps wineserver's 4 KiB memfd (KUSER_SHARED_DATA) as `MAP_FIXED|MAP_SHARED|PROT_READ` over its private 4 KiB reservation at 0x7ffe0000; the server updates the page every few ms, it must be really shared. Before: EINVAL. Now: succeeds.
 
-Ce qui est géré (MESURE, `test_mm_shpart` 85 assertions, `test_mm_window` cas `wine_kuser_shared_data_production_window`) :
+What is handled (MEASURED, `test_mm_shpart` 85 assertions, `test_mm_window` case `wine_kuser_shared_data_production_window`):
 
-- Un VMA MAP_SHARED (fichier, memfd, anonyme, SysV) peut couvrir 4, 8, 12 Kio ou toute taille de 4 Kio. La ou les pages hôtes de 16 Kio qu'il touche sont mappées depuis l'objet partagé (`MAP_SHARED`, `MAP_FIXED`, décalage de fichier = décalage du VMA moins sa position dans la page hôte). Les pages invitées voisines de la page hôte (les « soeurs ») aliasent les octets de l'objet à cet endroit.
-- Condition d'adresse : l'adresse et le décalage de fichier doivent avoir la même position dans une page de 16 Kio (`(adresse - décalage) % 16 Kio == 0`). Un mapping non fixe choisit lui-même une telle adresse (4 Kio à l'offset 4 Kio tombe sur une adresse ≡ 0x1000 mod 16 Kio). Un mapping FIXE à une adresse alignée sur 16 Kio avec l'offset 4 Kio, ou avec un offset plus petit que la position dans la page, rend EINVAL avec un message visible. La mémoire anonyme partagée n'a pas d'offset : toute adresse de 4 Kio convient.
-- Règle de sûreté à la création : les soeurs doivent être non mappées, ou PROT_NONE privées, ou d'autres morceaux du MÊME objet à la même position relative. Sinon EINVAL avec message (« siblings must be unmapped or PROT_NONE »). Un autre objet dans la même page hôte : EINVAL.
-- Règle ensuite : un `mmap` privé accessible dans une soeur rend EINVAL ; un `mprotect` qui rendrait une soeur accessible rend ENOMEM, avec un message visible. Rien n'est jamais écrit dans les octets de l'objet depuis les soeurs (le remplissage et la remise à zéro des pages privées sautent les pages hôtes partagées).
-- La vue 4 Kio du VMA reste exacte : les protections sont par VMA, la page hôte prend l'union (une page partagée en lecture seule avec soeurs PROT_NONE est PROT_READ côté hôte). Les copies du noyau (`lkd_user_*`) et la classification du moteur par `lkd_mm_find` voient la vue exacte (EFAULT sur une soeur PROT_NONE).
-- munmap / mprotect d'un morceau : le VMA se découpe ; une page hôte dont le dernier VMA partagé a disparu mais qui garde des soeurs PROT_NONE redevient de la mémoire privée neuve (zéros) : l'objet ne reste pas visible derrière elles, et un `mprotect` ultérieur de ces soeurs réussit et lit des zéros. Les réservations autour restent privées PROT_NONE.
-- fork : le fils garde le mapping comme vrai mapping hôte partagé (test : le fils écrit par un second mapping, le père le voit ; les règles de soeurs restent valables dans le fils). mremap d'un morceau partagé : déplacement possible si la position dans la page hôte est conservée.
+- A MAP_SHARED VMA (file, memfd, anonymous, SysV) can cover 4, 8, 12 KiB or any 4 KiB size. The 16 KiB host page or pages it touches are mapped from the shared object (`MAP_SHARED`, `MAP_FIXED`, file offset = VMA offset minus its position in the host page). The guest pages next to it in the host page (the "siblings") alias the bytes of the object at that place.
+- Address condition: the address and the file offset must have the same position within a 16 KiB page (`(address - offset) % 16 KiB == 0`). A non-fixed mapping picks such an address itself (4 KiB at offset 4 KiB lands on an address ≡ 0x1000 mod 16 KiB). A FIXED mapping at an address aligned on 16 KiB with offset 4 KiB, or with an offset smaller than the position in the page, returns EINVAL with a visible message. Shared anonymous memory has no offset: any 4 KiB address works.
+- Safety rule at creation: the siblings must be unmapped, or private PROT_NONE, or other pieces of the SAME object at the same relative position. Otherwise EINVAL with a message ("siblings must be unmapped or PROT_NONE"). Another object in the same host page: EINVAL.
+- Rule afterwards: an accessible private `mmap` in a sibling returns EINVAL; an `mprotect` that would make a sibling accessible returns ENOMEM, with a visible message. Nothing is ever written into the object's bytes from the siblings (filling and zeroing of private pages skip the shared host pages).
+- The 4 KiB view of the VMA stays exact: protections are per VMA, the host page takes the union (a read-only shared page with PROT_NONE siblings is PROT_READ on the host side). The kernel copies (`lkd_user_*`) and the engine's classification through `lkd_mm_find` see the exact view (EFAULT on a PROT_NONE sibling).
+- munmap / mprotect of a piece: the VMA is split; a host page whose last shared VMA is gone but which keeps PROT_NONE siblings becomes fresh private memory again (zeros): the object does not stay visible behind them, and a later `mprotect` of those siblings succeeds and reads zeros. The reservations around stay private PROT_NONE.
+- fork: the child keeps the mapping as a real shared host mapping (test: the child writes through a second mapping, the parent sees it; the sibling rules stay valid in the child). mremap of a shared piece: a move is possible if the position in the host page is kept.
 
-Limite à connaître (ne peut pas être corrigée par mm) : la vue exacte n'est pas imposée par le matériel. Un accès du CODE INVITÉ à une soeur PROT_NONE ne fautera pas, car la page hôte est lisible (protection hôte = union) : il lit les octets de l'objet. Le SEGV_ACCERR n'est levé par le moteur que si l'hôte fautes. Les accès du noyau LKD sont, eux, refusés exactement. Aucun accès privé accessible ne peut aliaser l'objet, donc rien n'est écrit par erreur.
+Limit to know (cannot be fixed by mm): the exact view is not enforced by the hardware. An access by GUEST CODE to a PROT_NONE sibling will not fault, because the host page is readable (host protection = union): it reads the object's bytes. The engine only raises SEGV_ACCERR if the host faults. Accesses by the LKD kernel, on the other hand, are refused exactly. No accessible private access can alias the object, so nothing is written by mistake.
 
-## Pages de code surveillées par le JIT (`src/mm/watch.c`, `src/mm/lkd_mm_watch.h`)
+## Code pages watched by the JIT (`src/mm/watch.c`, `src/mm/lkd_mm_watch.h`)
 
-API (autonome, utilisable en C++ par le moteur) :
+API (standalone, usable from C++ by the engine):
 
-- `int lkd_mm_watch_code(uint64_t gva, uint64_t len)` : toute page hôte de 16 Kio touchant la plage perd PROT_WRITE, même si le VMA invité est inscriptible. Idempotent, sans verrou quand tout est déjà surveillé. Un bit par page hôte, dans un bitmap `MAP_NORESERVE` (une fenêtre de 2^46 octets coûte 512 Mio d'espace d'adressage, seuls les mots touchés sont alloués).
-- `int lkd_mm_code_write_fault(uint64_t gva)` : appelé par le gestionnaire SIGSEGV/SIGBUS du moteur pour un store fautif. Si la page est surveillée et si le VMA autorise l'écriture : `ops->invalidate_code(page, 16 Kio)` une seule fois, la surveillance est levée, la page redevient inscriptible, retour 1 (rejouer le store). Sinon 0 (vraie faute invitée). Un retour 1 sur une page déjà redevenue inscriptible par un autre thread est borné à 4 réponses consécutives par thread et par page, ensuite 0 : un store qui échoue pour une autre raison ne boucle pas.
-- `int lkd_mm_code_watched(uint64_t gva)` pour les tests.
+- `int lkd_mm_watch_code(uint64_t gva, uint64_t len)`: every 16 KiB host page touching the range loses PROT_WRITE, even if the guest VMA is writable. Idempotent, lock-free when everything is already watched. One bit per host page, in a `MAP_NORESERVE` bitmap (a window of 2^46 bytes costs 512 MiB of address space, only the touched words are allocated).
+- `int lkd_mm_code_write_fault(uint64_t gva)`: called by the engine's SIGSEGV/SIGBUS handler for a faulting store. If the page is watched and the VMA allows writing: `ops->invalidate_code(page, 16 KiB)` once, the watch is lifted, the page becomes writable again, return 1 (replay the store). Otherwise 0 (real guest fault). A return of 1 on a page already made writable again by another thread is bounded to 4 consecutive answers per thread and per page, then 0: a store that fails for another reason does not loop.
+- `int lkd_mm_code_watched(uint64_t gva)` for the tests.
 
-MESURE importante pour le moteur : un store sur une page en lecture seule NON RÉSIDENTE donne une faute de TRADUCTION (ESR 0x92000046, DFSC 0x06), pas une faute de permission (0x0f). Le gestionnaire du moteur ne doit pas filtrer sur DFSC : le critère est « abort de données (EC 0x24) avec WnR = 1 ». Un cas de test le couvre (`store_to_nonresident_watched_page`).
+Important MEASURED fact for the engine: a store to a NON-RESIDENT read-only page gives a TRANSLATION fault (ESR 0x92000046, DFSC 0x06), not a permission fault (0x0f). The engine's handler must not filter on DFSC: the criterion is "data abort (EC 0x24) with WnR = 1". A test case covers it (`store_to_nonresident_watched_page`).
 
-Verrou de surveillance : mutex récursif, pris avant le verrou de lecture des VMA, jamais tenu pendant du code invité, pendant `ops->invalidate_code` ni pendant une copie `lkd_user_*`. Il protège la cohérence entre les bits et les protections hôtes (`mm_host_refresh`, fenêtres d'écriture temporaires de mm, les deux fonctions de l'API). Le gestionnaire de signal prend donc un mutex : acceptable parce que le code interrompu est du code invité ou `lkd_uc_copy`, jamais du code de mm. `ops->invalidate_code` est appelé depuis ce gestionnaire et ne doit prendre aucun verrou que du code invité pourrait tenir.
+Watch lock: recursive mutex, taken before the VMA read lock, never held during guest code, during `ops->invalidate_code` nor during an `lkd_user_*` copy. It protects the consistency between the bits and the host protections (`mm_host_refresh`, mm's temporary write windows, the two API functions). The signal handler therefore takes a mutex: acceptable because the interrupted code is guest code or `lkd_uc_copy`, never mm code. `ops->invalidate_code` is called from that handler and must not take any lock that guest code could hold.
 
-Cohérence :
+Consistency:
 
-- `mprotect` recalcule les protections sans redonner l'écriture aux pages surveillées. `mremap` : la plage déplacée n'est pas surveillée à sa nouvelle adresse (le code traduit à l'ancienne est invalidé). `munmap` et reset d'exec lèvent la surveillance des pages hôtes libérées ; un `munmap` partiel garde celle d'une page encore utilisée par un autre VMA. Le fork : l'enfant efface tous les bits et rend leur protection aux pages (il n'hérite d'aucune traduction), le parent garde les siens.
-- Copies du noyau : `lkd_mm_check_range` (donc `lkd_user_write` et toutes les copies) lève la surveillance et invalide avant la copie. `lkd_mm_remote_write` et `process_vm_writev` font de même. MADV_POPULATE_WRITE ne réécrit pas une page surveillée. MADV_DONTNEED sur une page surveillée garde la protection.
-- MAP_SHARED et SysV : même règle dans ce processus. Limite : une écriture d'un AUTRE processus dans une page partagée traduite ici n'est pas vue (aucune faute dans ce processus).
+- `mprotect` recomputes the protections without giving write access back to watched pages. `mremap`: the moved range is not watched at its new address (the code translated at the old one is invalidated). `munmap` and the exec reset lift the watch on the freed host pages; a partial `munmap` keeps the watch on a page still used by another VMA. Fork: the child clears all the bits and gives the pages back their protection (it inherits no translation), the parent keeps its own.
+- Kernel copies: `lkd_mm_check_range` (so `lkd_user_write` and all the copies) lifts the watch and invalidates before the copy. `lkd_mm_remote_write` and `process_vm_writev` do the same. MADV_POPULATE_WRITE does not rewrite a watched page. MADV_DONTNEED on a watched page keeps the protection.
+- MAP_SHARED and SysV: same rule within this process. Limit: a write by ANOTHER process into a shared page translated here is not seen (no fault in this process).
 
-Récupération de faute des copies (core) : sans correctif, une copie qui fautes sur une page surveillée après le contrôle (un autre thread surveille de nouveau entre le contrôle et la copie) rend -EFAULT. MESURE dans le scratchpad : `lkd_user_write` rend -14 sans correctif, 0 avec une invalidation avec le correctif. Demande et diff exact : `docs/requests/mm-5.md`.
+Fault recovery of the copies (core): without a fix, a copy that faults on a watched page after the check (another thread watches it again between the check and the copy) returns -EFAULT. MEASURED in the scratchpad: `lkd_user_write` returns -14 without the fix, 0 with one invalidation with the fix. Request and exact diff: `docs/requests/mm-5.md`.
 
-Tests : `test_mm_watch` 104 assertions (store qui faute puis rejoué, invalidation unique avec la bonne plage, `lkd_user_write` et `process_vm_writev` et POKE forcé, page hôte partagée avec un VMA de données, mprotect qui garde la surveillance, munmap/mremap/exec qui la lèvent, MAP_SHARED, fork, page non résidente, bornage des réessais).
+Tests: `test_mm_watch` 104 assertions (store that faults then is replayed, single invalidation with the right range, `lkd_user_write` and `process_vm_writev` and forced POKE, host page shared with a data VMA, mprotect that keeps the watch, munmap/mremap/exec that lift it, MAP_SHARED, fork, non-resident page, bounded retries).
 
-## Verrou de surveillance dans l'enfant d'un fork (signalé par l'agent sig)
+## Watch lock in the child of a fork (reported by the sig agent)
 
-Un blocage de `lkd_mm_fork_child -> mm_host_refresh -> mm_watch_lock` venait d'une version intermédiaire de `watch.c` : l'enfant faisait `mm_watch_unlock()` sur le mutex récursif pris par `fork_prepare`, et macOS refuse ce déverrouillage depuis le thread de l'enfant (MESURE : `test_mm_fork` bloquait). Le verrou est maintenant reconstruit par `mm_watch_fork_child()`, et ce appel est la toute première opération de `lkd_mm_fork_child`. Le nouveau cas `fork_watch_lock_in_child` de `test_mm_fork` (35 assertions au total) fait fork trois fois avec une page surveillée, utilise le verrou dans l'enfant (mmap, surveillance, mprotect, madvise, munmap), puis fork depuis un thread secondaire ; chaque enfant a un délai de 10 s et le test un délai de 90 s. `test_task_bigwin` : 525 ms, passe. Si un binaire plus ancien de liblkd.a bloque encore, il faut le reconstruire.
+A hang in `lkd_mm_fork_child -> mm_host_refresh -> mm_watch_lock` came from an intermediate version of `watch.c`: the child did `mm_watch_unlock()` on the recursive mutex taken by `fork_prepare`, and macOS refuses that unlock from the child's thread (MEASURED: `test_mm_fork` hung). The lock is now rebuilt by `mm_watch_fork_child()`, and this call is the very first operation of `lkd_mm_fork_child`. The new case `fork_watch_lock_in_child` of `test_mm_fork` (35 assertions in total) forks three times with a watched page, uses the lock in the child (mmap, watch, mprotect, madvise, munmap), then forks from a secondary thread; each child has a 10 s timeout and the test a 90 s timeout. `test_task_bigwin`: 525 ms, passes. If an older liblkd.a binary still hangs, it must be rebuilt.
 
-## Correctif task-4 : parcours de la fenêtre en O(VMA) (2026-10-02, soir)
+## task-4 fix: walking the window in O(VMA) (2026-10-02, evening)
 
-- Cause (LU, demande `docs/requests/task-4.md`) : `mm_host_cleanup` avançait d'une page hôte de 16 Kio à la fois. Sur toute la fenêtre de production (2^46 octets), cela fait 2^32 recherches dans l'arbre, à chaque execve (`lkd_mm_reset_for_exec`) et à chaque fin de processus (`mm_destroy`).
-- Correctif : `mm_host_cleanup` saute à la page du prochain VMA et fait un seul `mmap` de remise à zéro par intervalle vide. Le même défaut existait ailleurs et a été corrigé :
-  - `mm_host_refresh` parcourt maintenant par VMA et par plage, avec un seul `mprotect` pour un vide ou pour l'intérieur d'un VMA ;
-  - la boucle de remplissage de `mm_map_locked` ne traite plus que les pages hôtes de bord et celles qui portent des données de fichier ;
-  - MADV_DONTNEED, WIPEONFORK et l'ancien intervalle de mremap DONTUNMAP passent par `mm_discard_range`, qui fait une seule remise à zéro pour l'intérieur ;
-  - la résidence de smaps et de stats est lue par région hôte (`mach_vm_region`) pour un VMA de plus de 256 Mio ;
-  - les bits de surveillance d'un intervalle vide sont effacés par pages entières de bitmap.
-  Les autres boucles restantes ne dépassent pas la taille demandée par l'appel (mincore, populate, copies).
-- `lkd_mm_window_size()` est défini.
-- MESURE : `test_task_bigwin` (module task) passe en 521 ms dans un build privé sans net, contre 20 114 ms d'après task-4. Le nouveau cas `whole_window_operations_are_fast` de `test_mm_window` fait sous 2 s : réservation de 1 Tio PROT_NONE, smaps, stats, DONTNEED de 1 Tio, munmap de toute la fenêtre, reset d'exec, destruction. Le programme entier tourne en 0,85 s.
+- Cause (READ, request `docs/requests/task-4.md`): `mm_host_cleanup` advanced one 16 KiB host page at a time. Over the whole production window (2^46 bytes), that makes 2^32 lookups in the tree, at every execve (`lkd_mm_reset_for_exec`) and at every process end (`mm_destroy`).
+- Fix: `mm_host_cleanup` jumps to the page of the next VMA and does a single zeroing `mmap` per empty interval. The same defect existed elsewhere and was fixed:
+  - `mm_host_refresh` now walks per VMA and per range, with a single `mprotect` for a gap or for the inside of a VMA;
+  - the fill loop of `mm_map_locked` now only handles the edge host pages and those that carry file data;
+  - MADV_DONTNEED, WIPEONFORK and the old interval of mremap DONTUNMAP go through `mm_discard_range`, which does a single zeroing for the inside;
+  - the residency for smaps and stats is read per host region (`mach_vm_region`) for a VMA of more than 256 MiB;
+  - the watch bits of an empty interval are cleared by whole bitmap pages.
+  The other remaining loops do not go beyond the size requested by the call (mincore, populate, copies).
+- `lkd_mm_window_size()` is defined.
+- MEASURED: `test_task_bigwin` (task module) passes in 521 ms in a private build without net, against 20,114 ms according to task-4. The new case `whole_window_operations_are_fast` of `test_mm_window` runs under 2 s: reservation of 1 TiB PROT_NONE, smaps, stats, DONTNEED of 1 TiB, munmap of the whole window, exec reset, destruction. The whole program runs in 0.85 s.
 
-## Ce qui passe (MESURE)
+## What passes (MEASURED)
 
-Mêmes résultats dans le build privé core + mm (script du scratchpad) et dans la construction commune (`./build.sh -k 0`, liblkd.a complet avec les autres modules).
+Same results in the private core + mm build (scratchpad script) and in the common build (`./build.sh -k 0`, complete liblkd.a with the other modules).
 
-| Programme | Assertions | Contenu |
+| Program | Assertions | Content |
 | --- | --- | --- |
-| `test_mm_vma` | 32 | arbre : recherches, écarts, 20 000 opérations aléatoires comparées à un tableau de référence |
-| `test_mm_map` | 144 | mmap/munmap/mprotect sur vraie mémoire, accès hôtes sondés par write/read sur un tube, vraie faute SIGBUS/SIGSEGV dans un enfant, MAP_FIXED, NOREPLACE, indice, MAP_32BIT, THP, MAP_SHARED anonyme partagé avec un enfant, invalidation JIT |
-| `test_mm_file` | 70 | fichier hôte réel, par `lkd_mm_map` (chemin du chargeur ELF) et par le syscall : projection directe, offsets de 4 Kio, motif de segments de ld.so, copie sur écriture, écriture MAP_SHARED visible dans le fichier (msync), règles EACCES/ENODEV/EOPNOTSUPP, « (deleted) » |
-| `test_mm_misc` | 159 | brk, mremap, madvise, mincore, msync, mlock*, pkeys, format exact de maps (colonne 73, espace final), clés futex |
-| `test_mm_fork` | 23 | vrai fork par `lkd_fork_host` : copie privée, partage MAP_SHARED, DONTFORK, WIPEONFORK, verrous mémoire non hérités ; remise à zéro à l'exec |
-| `test_mm_shm` | 71 | SysV : création, attache par un autre processus, nattch, IPC_RMID différé, droits, IPC_INFO, SHM_STAT |
-| `test_mm_remote` | 45 | process_vm_readv/writev (comptes partiels, erreurs), POKE forcé dans du code en lecture seule avec invalidation, service entre deux vrais processus hôtes |
-| `test_mm_watch` | 104 | pages de code surveillées (voir plus haut) |
-| `test_mm_window` | 37 | fenêtre de production de 2^46 à 8 Tio, opérations sur toute la fenêtre en moins de 2 s : adresses invitées 0x10000 et 0x7ffe0000, EPERM sous 0x10000, recherche sous 2^46 - 128 Mio, service démarré puis supprimé, repli sur 16 Tio quand 8 Tio est occupé |
+| `test_mm_vma` | 32 | tree: lookups, gaps, 20,000 random operations compared against a reference array |
+| `test_mm_map` | 144 | mmap/munmap/mprotect on real memory, host accesses probed by write/read on a pipe, real SIGBUS/SIGSEGV fault in a child, MAP_FIXED, NOREPLACE, hint, MAP_32BIT, THP, anonymous MAP_SHARED shared with a child, JIT invalidation |
+| `test_mm_file` | 70 | real host file, through `lkd_mm_map` (ELF loader path) and through the syscall: direct mapping, 4 KiB offsets, ld.so segment pattern, copy-on-write, MAP_SHARED write visible in the file (msync), EACCES/ENODEV/EOPNOTSUPP rules, "(deleted)" |
+| `test_mm_misc` | 159 | brk, mremap, madvise, mincore, msync, mlock*, pkeys, exact maps format (column 73, trailing space), futex keys |
+| `test_mm_fork` | 23 | real fork through `lkd_fork_host`: private copy, MAP_SHARED sharing, DONTFORK, WIPEONFORK, memory locks not inherited; reset at exec |
+| `test_mm_shm` | 71 | SysV: creation, attach by another process, nattch, deferred IPC_RMID, permissions, IPC_INFO, SHM_STAT |
+| `test_mm_remote` | 45 | process_vm_readv/writev (partial counts, errors), forced POKE into read-only code with invalidation, service between two real host processes |
+| `test_mm_watch` | 104 | watched code pages (see above) |
+| `test_mm_window` | 37 | production window of 2^46 at 8 TiB, operations on the whole window in less than 2 s: guest addresses 0x10000 and 0x7ffe0000, EPERM below 0x10000, search below 2^46 - 128 MiB, service started then removed, fallback to 16 TiB when 8 TiB is taken |
 
-Défauts trouvés par les tests et corrigés :
+Defects found by the tests and fixed:
 
-- `discard` remettait à zéro toute la page hôte pour un MADV_DONTNEED d'une seule sous-page.
-- L'enfant d'un fork restait bloqué, car macOS refuse de réinitialiser un rwlock tenu (EBUSY). L'enfant relâche maintenant les verrous.
+- `discard` zeroed the whole host page for a MADV_DONTNEED of a single subpage.
+- The child of a fork stayed stuck, because macOS refuses to reinitialize a held rwlock (EBUSY). The child now releases the locks.
 
-Suite complète (MESURE, `tools/run_tests.sh`) : les échecs restants sont `test_fs_pipe`, `test_sig_basic` et `test_task_time` (livraison de signaux, autres modules), ainsi que le lien de `test_core_dispatch` (symboles en double entre core et fs). Aucun ne touche mm.
+Complete suite (MEASURED, `tools/run_tests.sh`): the remaining failures are `test_fs_pipe`, `test_sig_basic` and `test_task_time` (signal delivery, other modules), as well as the link of `test_core_dispatch` (duplicate symbols between core and fs). None of them touches mm.
 
-## Syscalls enregistrés par mm
+## Syscalls registered by mm
 
 brk mmap munmap mprotect pkey_mprotect pkey_alloc pkey_free map_shadow_stack mremap madvise mincore msync mlock mlock2 munlock mlockall munlockall shmget shmat shmdt shmctl process_vm_readv process_vm_writev.
 
-Non enregistrés (ENOSYS visible et compté) : process_madvise, membarrier, mbind, set_mempolicy, get_mempolicy, migrate_pages, move_pages, set_mempolicy_home_node, mseal, remap_file_pages.
+Not registered (ENOSYS visible and counted): process_madvise, membarrier, mbind, set_mempolicy, get_mempolicy, migrate_pages, move_pages, set_mempolicy_home_node, mseal, remap_file_pages.
 
-## Limites connues (documentées)
+## Known limits (documented)
 
-1. Sous-pages de 4 Kio dans une page hôte de 16 Kio : une sous-page PROT_NONE ou en lecture seule, voisine d'une sous-page accessible, n'est pas protégée contre le code invité, car l'hôte applique l'union. Les copies du noyau (`lkd_user_*`) respectent la vue exacte. Conséquence (INFERE) : une page de garde de 4 Kio ne faute que si elle couvre une page hôte entière. Sont concernées la pile de thread de glibc (AT_PAGESZ 4096) et les gardes de Wine.
-2. MAP_SHARED (fichier, SysV) exige adresse et décalage de même position dans une page de 16 Kio, sinon EINVAL ; un mapping privé accessible ne partage jamais une page hôte avec un mapping partagé (voir la section précédente). Un mapping partagé anonyme ou SysV ne grandit pas par mremap au-delà de son objet (ENOMEM).
-3. Fichiers privés copiés : les pages copiées ne voient pas les écritures faites ensuite dans le fichier, alors que Linux les montre tant que la page n'a pas été écrite. Les pages entièrement au-delà de la fin du fichier lisent des zéros au lieu de lever SIGBUS.
-4. MAP_GROWSDOWN rend EINVAL (pas d'extension de pile). Pas d'ASLR : mmap_base est fixe (haut de la fenêtre moins 128 Mio). RLIMIT_AS ne s'applique pas à mmap, RLIMIT_DATA ne s'applique qu'à brk.
-5. MAP_POPULATE ne préfaute pas. MADV_WILLNEED, COLD, PAGEOUT et FREE ne font rien, ce que leur sémantique permet. MADV_REMOVE sur un fichier partagé rend EOPNOTSUPP, MADV_COLLAPSE rend EINVAL. KSM et THP ne sont que des drapeaux. Dans smaps, Pss vaut Rss et la résidence est connue par page hôte. SHM_LOCK n'est qu'un drapeau, shm_rss vaut 0.
-6. mlock câble les pages hôtes (`mlock`). Un refus de l'hôte rend EAGAIN ou ENOMEM, jamais un faux succès.
-7. La table SysV ne survit pas à une réexécution hôte (`docs/requests/mm-3.md`). nattch fuit si un processus meurt sans passer par les crochets de sortie.
-8. Avec une fenêtre de 2^46, le TASK_SIZE invité est plus petit que celui de Linux (`docs/requests/mm-2.md` point 3).
-9. Chemins d'erreur sans test : échec de `mmap` hôte pendant une projection directe, échec de `mach_vm_remap` dans mremap.
-10. Coût du service entre processus (une connexion par requête) non mesuré.
+1. 4 KiB subpages in a 16 KiB host page: a PROT_NONE or read-only subpage next to an accessible subpage is not protected against guest code, because the host applies the union. The kernel copies (`lkd_user_*`) respect the exact view. Consequence (INFERRED): a 4 KiB guard page only faults if it covers a whole host page. Affected: glibc's thread stack (AT_PAGESZ 4096) and Wine's guards.
+2. MAP_SHARED (file, SysV) requires the address and the offset to have the same position within a 16 KiB page, otherwise EINVAL; an accessible private mapping never shares a host page with a shared mapping (see the previous section). An anonymous or SysV shared mapping does not grow through mremap beyond its object (ENOMEM).
+3. Copied private files: the copied pages do not see writes made to the file afterwards, while Linux shows them as long as the page has not been written. Pages entirely beyond the end of the file read zeros instead of raising SIGBUS.
+4. MAP_GROWSDOWN returns EINVAL (no stack extension). No ASLR: mmap_base is fixed (top of the window minus 128 MiB). RLIMIT_AS does not apply to mmap, RLIMIT_DATA only applies to brk.
+5. MAP_POPULATE does not prefault. MADV_WILLNEED, COLD, PAGEOUT and FREE do nothing, which their semantics allow. MADV_REMOVE on a shared file returns EOPNOTSUPP, MADV_COLLAPSE returns EINVAL. KSM and THP are only flags. In smaps, Pss equals Rss and the residency is known per host page. SHM_LOCK is only a flag, shm_rss is 0.
+6. mlock wires the host pages (`mlock`). A refusal by the host returns EAGAIN or ENOMEM, never a fake success.
+7. The SysV table does not survive a host re-exec (`docs/requests/mm-3.md`). nattch leaks if a process dies without going through the exit hooks.
+8. With a window of 2^46, the guest TASK_SIZE is smaller than Linux's (`docs/requests/mm-2.md` point 3).
+9. Error paths without a test: host `mmap` failure during a direct mapping, `mach_vm_remap` failure in mremap.
+10. Cost of the service between processes (one connection per request) not measured.
 
-## Suivant
+## Next
 
-Mesurer le coût de mmap/munmap et du service distant. Appliquer RLIMIT_AS. Ajouter membarrier (Wine s'en sert, avec un repli) et une politique NUMA à un nœud. Traiter les pages surveillées par le JIT (question de `docs/requests/mm-4.md` point 4).
+Measure the cost of mmap/munmap and of the remote service. Apply RLIMIT_AS. Add membarrier (Wine uses it, with a fallback) and a one-node NUMA policy. Handle the pages watched by the JIT (question of `docs/requests/mm-4.md` point 4).
 
-## Phase des memfd et code aliasé (2026-10-02, 22 h 55, demande wine-7)
+## memfd phase and aliased code (2026-10-02, 22:55, request wine-7)
 
-`mm_backing.hbias` : un memfd peut avoir une phase hôte (offset hôte = offset du fichier + phase), fixée par son premier mmap, pour qu'un MAP_SHARED à une adresse non congrue à l'offset modulo 16 Kio soit possible. Les surveillances de code JIT couvrent toutes les vues d'un même objet partagé dans le processus (`mm_alias_pages`). Détail, mesures et limites : `docs/requests/wine-7.md`.
+`mm_backing.hbias`: a memfd can have a host phase (host offset = file offset + phase), set by its first mmap, so that a MAP_SHARED at an address not congruent to the offset modulo 16 KiB is possible. The JIT code watches cover all the views of the same shared object in the process (`mm_alias_pages`). Details, measurements and limits: `docs/requests/wine-7.md`.
 
-## Coût de VmRSS (2026-10-03, profil du menu du jeu)
+## Cost of VmRSS (2026-10-03, profile of the game menu)
 
-Le RSS de `lkd_mm_stats` :
-- Compte par région hôte quand la région est entièrement dans la VMA : une seule requête `mach_vm_region`, MESURE même total que mincore (270180 kB des deux façons sur le témoin).
-- Compte par mincore pour les pages de bord.
-- Est gardé en cache 100 ms (`MM_RSS_TTL_NS`) tant qu'aucune projection n'est ajoutée ni retirée.
+The RSS of `lkd_mm_stats`:
+- Is counted per host region when the region is entirely inside the VMA: a single `mach_vm_region` query, MEASURED same total as mincore (270180 kB both ways on the witness).
+- Is counted through mincore for the edge pages.
+- Is cached for 100 ms (`MM_RSS_TTL_NS`) as long as no mapping is added or removed.
 
-Précision : le RSS lu peut avoir 100 ms de retard sur des pages touchées ou libérées sans changement de projection. VmHWM n'est relevé qu'à ces lectures.
+Accuracy: the RSS read can lag 100 ms behind pages touched or freed without a mapping change. VmHWM is only sampled on these reads.
 
-MESURE (témoin `w20_statbench` : 1000 petites VMA et 256 Mio touchés, moteur réel) :
+MEASURED (witness `w20_statbench`: 1000 small VMAs and 256 MiB touched, real engine):
 
-| Opération | Avant | Après |
+| Operation | Before | After |
 | --- | --- | --- |
-| lecture de `/proc/self/status` | 4,45 ms | 24 à 26 us |
-| parcours complet, sans cache | 4,5 ms | 1,26 ms |
+| read of `/proc/self/status` | 4.45 ms | 24 to 26 us |
+| full walk, without cache | 4.5 ms | 1.26 ms |
 
-Test : `test_mm_misc` cas `rss_counting_and_cache`.
+Test: `test_mm_misc` case `rss_counting_and_cache`.

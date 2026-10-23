@@ -1,127 +1,127 @@
-# Faits macOS sur le JIT, les fautes et les signaux (groupes C et D)
+# macOS facts on JIT, faults and signals (groups C and D)
 
-Dernière mise à jour : 2026-10-02 (brouillon 3 : parties C et D mesurées sauf SMC et faute dans le handler). Les sections marquées `a completer` n'ont pas encore de mesure.
+Last update: 2026-10-02 (draft 3: parts C and D measured except SMC and fault in the handler). The sections marked `to be completed` have no measurement yet.
 
-Ce rapport sépare ce qui a été MESURE (programmes C écrits et exécutés sur cette machine, journaux dans `evidence/darwin-memory/`) de ce qui est LU (code source, en-têtes du SDK) et de ce qui est DEDUIT. Racine de travail : `build/experiments/rocket-wine-fex-darwin-20261002`, notée `$EXP`.
+This report separates what was MEASURED (C programs written and run on this machine, journals in `evidence/darwin-memory/`) from what is READ (source code, SDK headers) and from what is DEDUCED. Working root: `build/experiments/rocket-wine-fex-darwin-20261002`, written `$EXP`.
 
-## Machine de mesure
+## Measurement machine
 
-Mesuré : macOS 27.0.1 (build 26A434), noyau `xnu-13432.1.9~1/RELEASE_ARM64_T6050`, Apple M5 Max, 18 coeurs logiques, pages d'hôte de 16 Kio (`hw.pagesize` = 16384), 36 Gio de mémoire, SIP actif, Apple clang 21.0.0, SDK macOS 27.0. Aucune variable `boot-args` n'est lisible.
+Measured: macOS 27.0.1 (build 26A434), kernel `xnu-13432.1.9~1/RELEASE_ARM64_T6050`, Apple M5 Max, 18 logical cores, 16 KiB host pages (`hw.pagesize` = 16384), 36 GiB of memory, SIP enabled, Apple clang 21.0.0, SDK macOS 27.0. No `boot-args` variable is readable.
 
-## Etat d'avancement
+## Progress state
 
-| Élément | Etat |
+| Item | State |
 | --- | --- |
-| `witnesses/darwin-memory/src/common.h` laissé par la tentative précédente | inspecté, réutilisé (copie dans `cd_common.h`) |
-| Aucun fichier `c_*` ou `d_*` n'existait au démarrage de cette reprise | constaté |
-| Programmes C (JIT) : `c_jit_basic.c`, `c_jit_threads.c`, `c_jit_cost.c` | écrits, exécutés (variante `plain`), toutes les variantes à relancer |
-| Programmes D (fautes et signaux) | a completer |
-| Scripts `build-cd.sh` et `run-cd.sh` | écrits |
+| `witnesses/darwin-memory/src/common.h` left by the previous attempt | inspected, reused (copy in `cd_common.h`) |
+| No `c_*` or `d_*` file existed at the start of this resumption | observed |
+| C programs (JIT): `c_jit_basic.c`, `c_jit_threads.c`, `c_jit_cost.c` | written, run (`plain` variant), all variants to be rerun |
+| D programs (faults and signals) | to be completed |
+| Scripts `build-cd.sh` and `run-cd.sh` | written |
 
 ## C. JIT
 
-Mesures du brouillon 2 (variante `plain` : signature ad hoc sans runtime durci ni droit). Les journaux complets sont `evidence/darwin-memory/c_jit_basic.<variante>.log`, `c_jit_threads.<variante>.log` et `c_jit_cost.<variante>.log`. Détail à compléter dans la version finale.
+Measurements of draft 2 (`plain` variant: ad hoc signature without hardened runtime or entitlement). The full journals are `evidence/darwin-memory/c_jit_basic.<variant>.log`, `c_jit_threads.<variant>.log` and `c_jit_cost.<variant>.log`. Details to be completed in the final version.
 
-### C.1 MAP_JIT et bascule d'écriture par thread (mesuré)
+### C.1 MAP_JIT and per-thread write toggle (measured)
 
-- Un binaire signé ad hoc sans droit particulier et sans runtime durci obtient `MAP_JIT` (`c_jit_basic.plain`, test `C02.mapjit`). Avec le runtime durci (`-o runtime`) et sans le droit `com.apple.security.cs.allow-jit`, `mmap(MAP_JIT)` échoue avec `EINVAL` (variante `rt`). Avec le runtime durci et `allow-jit` (variante `rtjit`), il réussit.
-- `MAP_JIT|MAP_SHARED` et `MAP_JIT` sans `MAP_ANON` donnent `EINVAL`. `MAP_JIT|MAP_FIXED` donne `EINVAL`. Une région `MAP_JIT` de 4 Kio est arrondie à 16 Kio.
-- L'état par défaut de chaque thread (le principal et tout thread créé, que le parent soit en mode écriture ou non) est le mode exécution : une écriture dans la page `MAP_JIT` lève `SIGBUS` (`si_code` = `BUS_ADRALN`, ESR EC=0x24, DFSC=0x0f, faute de permission), une lecture et un appel réussissent (`c_jit_threads` T01).
-- `pthread_jit_write_protect_np(0)` : écriture et lecture possibles, l'exécution lève `SIGBUS` avec `si_addr` = `pc`. `pthread_jit_write_protect_np(1)` : lecture et exécution possibles, l'écriture lève `SIGBUS`. L'état est propre au thread appelant (T01.isolation, T02, T05).
-- Coût d'une bascule : 11,6 ns par appel (11,7 ns même si l'état ne change pas), 23 ns pour une paire. `pthread_jit_write_with_callback_np` coûte 22,7 ns. Une retouche complète (bascule, un store, bascule) coûte 23 ns, et 102 ns avec `sys_icache_invalidate` de 4 octets (`c_jit_cost` K01, K02, K04).
+- An ad hoc signed binary without any particular entitlement and without hardened runtime gets `MAP_JIT` (`c_jit_basic.plain`, test `C02.mapjit`). With the hardened runtime (`-o runtime`) and without the `com.apple.security.cs.allow-jit` entitlement, `mmap(MAP_JIT)` fails with `EINVAL` (`rt` variant). With the hardened runtime and `allow-jit` (`rtjit` variant), it succeeds.
+- `MAP_JIT|MAP_SHARED` and `MAP_JIT` without `MAP_ANON` give `EINVAL`. `MAP_JIT|MAP_FIXED` gives `EINVAL`. A 4 KiB `MAP_JIT` region is rounded to 16 KiB.
+- The default state of each thread (the main one and any created thread, whether the parent is in write mode or not) is execute mode: a write into the `MAP_JIT` page raises `SIGBUS` (`si_code` = `BUS_ADRALN`, ESR EC=0x24, DFSC=0x0f, permission fault), a read and a call succeed (`c_jit_threads` T01).
+- `pthread_jit_write_protect_np(0)`: write and read possible, execution raises `SIGBUS` with `si_addr` = `pc`. `pthread_jit_write_protect_np(1)`: read and execution possible, write raises `SIGBUS`. The state is specific to the calling thread (T01.isolation, T02, T05).
+- Cost of a toggle: 11.6 ns per call (11.7 ns even if the state does not change), 23 ns for a pair. `pthread_jit_write_with_callback_np` costs 22.7 ns. A complete patch (toggle, one store, toggle) costs 23 ns, and 102 ns with `sys_icache_invalidate` of 4 bytes (`c_jit_cost` K01, K02, K04).
 
-### C.2 Cohérence du cache d'instructions (mesuré)
+### C.2 Instruction cache coherence (measured)
 
-- Sans invalidation, un thread qui réécrit un mot d'instruction puis l'appelle exécute l'ancienne version 199 900 fois sur 200 000. `dsb ish; isb` seul et `dc cvau` seul ne suffisent pas (même taux). `ic ivau` suivi de `dsb ish; isb` suffit, sans `dc cvau`. `sys_icache_invalidate` et `__builtin___clear_cache` suffisent (0 exécution périmée) (`C03.same-thread`).
-- Entre threads : un écrivain qui fait bascule, écriture, bascule, `sys_icache_invalidate`, puis publie par un store release ne produit aucune exécution périmée chez trois lecteurs sans `isb` (T02, 60 000 réécritures par configuration, lignes de 128 octets partagées entre le code exécuté et le code réécrit). Sans invalidation : 69 149 exécutions périmées sur 69 250.
-- Patch d'un `b` en place pendant qu'un autre thread boucle : avec invalidation le lecteur sort de la boucle 125 ns (médiane) après le store, 250 ns au p99 (T03). Sans invalidation, la médiane est de 6,8 ms et 9 essais sur 300 n'ont pas quitté la boucle en 30 ms.
-- Un mot d'instruction alterné 11 millions de fois entre deux valeurs est lu entier par deux lecteurs concurrents (11,9 millions d'exécutions, 0 valeur intermédiaire, 0 faute) (T06).
-- Un pointeur littéral `ldr x16, lit; blr x16` retouché par un store 64 bits aligné en mode écriture est vu par le lecteur en 42 ns (médiane), sans maintenance de cache (T04).
-- Un thread qui bascule et écrit en continu ne ralentit pas quatre threads qui exécutent du code (0,72 ns par appel avec ou sans écrivain, même page de 16 Kio comprise) (T05).
-- `CTR_EL0` n'est pas lisible depuis l'espace utilisateur (`SIGILL`) ; `hw.cachelinesize` vaut 128, L1I 128 Kio, L1D 64 Kio. `sys_icache_invalidate` coûte 82 ns jusqu'à 128 octets, 652 ns pour 16 Kio, 35 µs pour 1 Mio (environ 25 à 30 Go/s) (K03). Elle fonctionne en mode écriture comme en mode exécution, et lève `SIGSEGV` sur une plage non mappée.
+- Without invalidation, a thread that rewrites an instruction word then calls it runs the old version 199,900 times out of 200,000. `dsb ish; isb` alone and `dc cvau` alone are not enough (same rate). `ic ivau` followed by `dsb ish; isb` is enough, without `dc cvau`. `sys_icache_invalidate` and `__builtin___clear_cache` are enough (0 stale executions) (`C03.same-thread`).
+- Between threads: a writer that does toggle, write, toggle, `sys_icache_invalidate`, then publishes through a release store produces no stale execution in three readers without `isb` (T02, 60,000 rewrites per configuration, 128-byte lines shared between the executed code and the rewritten code). Without invalidation: 69,149 stale executions out of 69,250.
+- Patching a `b` in place while another thread loops: with invalidation the reader leaves the loop 125 ns (median) after the store, 250 ns at p99 (T03). Without invalidation, the median is 6.8 ms and 9 trials out of 300 did not leave the loop within 30 ms.
+- An instruction word alternated 11 million times between two values is read whole by two concurrent readers (11.9 million executions, 0 intermediate values, 0 faults) (T06).
+- A literal pointer `ldr x16, lit; blr x16` patched by an aligned 64-bit store in write mode is seen by the reader in 42 ns (median), without cache maintenance (T04).
+- A thread that toggles and writes continuously does not slow down four threads that run code (0.72 ns per call with or without writer, same 16 KiB page included) (T05).
+- `CTR_EL0` is not readable from user space (`SIGILL`); `hw.cachelinesize` is 128, L1I 128 KiB, L1D 64 KiB. `sys_icache_invalidate` costs 82 ns up to 128 bytes, 652 ns for 16 KiB, 35 µs for 1 MiB (about 25 to 30 GB/s) (K03). It works in write mode as in execute mode, and raises `SIGSEGV` on an unmapped range.
 
-### C.3 Mappages RWX sans MAP_JIT (mesuré)
+### C.3 RWX mappings without MAP_JIT (measured)
 
-- `mmap(RWX)` anonyme sans `MAP_JIT` : `EACCES` dans toutes les variantes. `mprotect(RWX)` sur n'importe quel mappage anonyme : `EACCES`.
-- Variante `plain` (sans runtime durci) : `mmap(RW)`, écriture, `mprotect(RX)`, appel : réussit. Variante `rtjit` (runtime durci + `allow-jit`) : le même enchaînement est tué par `SIGKILL` à l'exécution. Variante `rtjitx` (`allow-jit` + `allow-unsigned-executable-memory`) : réussit.
-- Fichier non signé mappé `PROT_EXEC` : `EPERM`.
-- La paire `mprotect(RX)` + `mprotect(RW)` coûte 540 ns pour 16 Kio, 650 ns pour 128 Kio, 1,6 µs pour 1 Mio, 680 ns pour 16 Kio avec 8 threads occupés, et agit sur tout le processus (K05).
+- Anonymous `mmap(RWX)` without `MAP_JIT`: `EACCES` in all variants. `mprotect(RWX)` on any anonymous mapping: `EACCES`.
+- `plain` variant (without hardened runtime): `mmap(RW)`, write, `mprotect(RX)`, call: succeeds. `rtjit` variant (hardened runtime + `allow-jit`): the same sequence is killed by `SIGKILL` at execution. `rtjitx` variant (`allow-jit` + `allow-unsigned-executable-memory`): succeeds.
+- Unsigned file mapped `PROT_EXEC`: `EPERM`.
+- The pair `mprotect(RX)` + `mprotect(RW)` costs 540 ns for 16 KiB, 650 ns for 128 KiB, 1.6 µs for 1 MiB, 680 ns for 16 KiB with 8 busy threads, and acts on the whole process (K05).
 
-### C.4 Tailles et nombre de régions (mesuré)
+### C.4 Sizes and number of regions (measured)
 
-- Une réservation `MAP_JIT` RWX unique de 1 Gio, 4 Gio, 64 Gio, 1 Tio, 127 Tio réussit en 1 à 3 µs sans toucher de page ; 128 Tio donne `ENOMEM`. Les pages première et dernière sont utilisables.
-- 100 000 régions `MAP_JIT` de 16 Kio (0,5 µs chacune, aucune fusion des entrées VM), 20 000 de 1 Mio et 4 096 de 1 Gio ont été créées sans échec (limite fixée par le test, pas par le noyau).
-- Une région `MAP_JIT` créée avec la protection `---`, `r--`, `rw-` ou `r-x` peut être promue par `mprotect` vers n'importe quelle protection, dont RWX. Une fois RWX (créée ainsi ou promue), toute nouvelle `mprotect` donne `EACCES` : la promotion est à sens unique. Une région créée RWX refuse tout `mprotect`, y compris vers RWX. `mach_vm_protect(set_maximum)` donne `KERN_PROTECTION_FAILURE`.
-- Un indice d'adresse est respecté pour `MAP_JIT` comme pour `mmap` ordinaire quand l'adresse est libre (0x120000000, 0x7000000000, 0x10000000000 respectés ; les adresses occupées sont déplacées).
-- `MAP_FIXED|MAP_ANON` sans `MAP_JIT` par-dessus des pages `MAP_JIT` réussit, mais les pages perdent définitivement le statut JIT (`mprotect(RWX)` : `EACCES`, `MAP_FIXED|MAP_JIT` : `EINVAL`). `munmap` d'un trou puis `mmap(MAP_JIT)` à la même adresse (indice) réussit. `mach_vm_remap` d'une région `MAP_JIT` donne `KERN_PROTECTION_FAILURE` : pas de double mappage.
-- `madvise` sur pages `MAP_JIT` : `MADV_ZERO` donne `EPERM` (il réussit sur de la mémoire anonyme ordinaire), `MADV_DONTNEED`, `MADV_FREE`, `MADV_FREE_REUSABLE` retournent 0 sans remettre à zéro (le contenu 0xa5 reste lisible), `MADV_PAGEOUT` donne `ENOTSUP`.
-- Coût de la première touche d'une page `MAP_JIT` fraîche de 16 Kio (écriture, invalidation, premier appel) : 2,26 µs, contre 259 ns pour une page déjà résidente et 615 ns pour une page anonyme ordinaire (K06). `munmap` d'une réservation `MAP_JIT` non touchée : 1,8 µs pour 4 Mio, 4,0 µs pour 1 Gio.
+- A single RWX `MAP_JIT` reservation of 1 GiB, 4 GiB, 64 GiB, 1 TiB, 127 TiB succeeds in 1 to 3 µs without touching a page; 128 TiB gives `ENOMEM`. The first and last pages are usable.
+- 100,000 `MAP_JIT` regions of 16 KiB (0.5 µs each, no merging of VM entries), 20,000 of 1 MiB and 4,096 of 1 GiB were created without failure (limit set by the test, not by the kernel).
+- A `MAP_JIT` region created with protection `---`, `r--`, `rw-` or `r-x` can be promoted by `mprotect` to any protection, including RWX. Once RWX (created that way or promoted), any new `mprotect` gives `EACCES`: the promotion is one-way. A region created RWX refuses any `mprotect`, including to RWX. `mach_vm_protect(set_maximum)` gives `KERN_PROTECTION_FAILURE`.
+- An address hint is honored for `MAP_JIT` as for ordinary `mmap` when the address is free (0x120000000, 0x7000000000, 0x10000000000 honored; occupied addresses are moved).
+- `MAP_FIXED|MAP_ANON` without `MAP_JIT` over `MAP_JIT` pages succeeds, but the pages permanently lose the JIT status (`mprotect(RWX)`: `EACCES`, `MAP_FIXED|MAP_JIT`: `EINVAL`). `munmap` of a hole then `mmap(MAP_JIT)` at the same address (hint) succeeds. `mach_vm_remap` of a `MAP_JIT` region gives `KERN_PROTECTION_FAILURE`: no double mapping.
+- `madvise` on `MAP_JIT` pages: `MADV_ZERO` gives `EPERM` (it succeeds on ordinary anonymous memory), `MADV_DONTNEED`, `MADV_FREE`, `MADV_FREE_REUSABLE` return 0 without zeroing (the content 0xa5 stays readable), `MADV_PAGEOUT` gives `ENOTSUP`.
+- Cost of the first touch of a fresh 16 KiB `MAP_JIT` page (write, invalidation, first call): 2.26 µs, versus 259 ns for an already resident page and 615 ns for an ordinary anonymous page (K06). `munmap` of an untouched `MAP_JIT` reservation: 1.8 µs for 4 MiB, 4.0 µs for 1 GiB.
 
-### C.5 Transferts de contrôle (mesuré)
+### C.5 Control transfers (measured)
 
-- Le code JIT appelle une fonction C de l'hôte par `ldr x16, lit; blr x16` et revient ; `bl` entre deux régions JIT voisines (16 Kio d'écart) fonctionne ; `ldr x16, lit; br x16` vers une région à 443 Gio fonctionne ; 1 000 appels hôte vers JIT via pointeur de fonction fonctionnent.
-- Un `blr` vers une adresse JIT sans instruction `bti` d'arrivée s'exécute sans faute (FEAT_BTI est présent, mais non appliqué aux pages `MAP_JIT` d'un binaire arm64 simple).
-- Un appel indirect d'un stub JIT coûte 0,48 à 0,56 ns, contre 0,47 ns pour une fonction hôte (K08).
+- JIT code calls a host C function through `ldr x16, lit; blr x16` and returns; `bl` between two neighboring JIT regions (16 KiB apart) works; `ldr x16, lit; br x16` to a region 443 GiB away works; 1,000 host-to-JIT calls through a function pointer work.
+- A `blr` to a JIT address without a landing `bti` instruction runs without fault (FEAT_BTI is present, but not enforced on the `MAP_JIT` pages of a plain arm64 binary).
+- An indirect call of a JIT stub costs 0.48 to 0.56 ns, versus 0.47 ns for a host function (K08).
 
-## D. Fautes et signaux
+## D. Faults and signals
 
-Mesures du brouillon 3 (variante `plain`), journaux `evidence/darwin-memory/d_*.plain.log`. Les volets "coût d'un aller-retour de faute" (SMC) et "faute dans le handler" sont à compléter.
+Measurements of draft 3 (`plain` variant), journals `evidence/darwin-memory/d_*.plain.log`. The parts "cost of a fault round trip" (SMC) and "fault in the handler" are to be completed.
 
-### D.1 Classification des fautes (mesuré, `d_faults`)
+### D.1 Fault classification (measured, `d_faults`)
 
-- Page non mappée (lecture, écriture, saut) et adresses non canoniques : `SIGSEGV`, `si_code` = `SEGV_ACCERR` (2) et jamais `SEGV_MAPERR`, `si_addr` = FAR = adresse fautive, ESR EC=0x24 (donnée) ou 0x20 (instruction), DFSC=0x04 à 0x07 (translation).
-- Page mappée mais `PROT_NONE`, lecture seule en écriture, `PROT_READ|PROT_WRITE` en exécution, MAP_JIT en mode exécution (écriture) ou en mode écriture (appel), fichier au-delà de l'EOF, fichier partagé en lecture seule en écriture : `SIGBUS`, `si_code` = `BUS_ADRALN` (1) dans tous les cas, `si_addr` = FAR. L'ESR distingue : DFSC=0x0f (permission) pour une page protégée en écriture ou non exécutable, DFSC=0x07 (translation) pour `PROT_NONE` et le fichier tronqué.
-- Donc sur Darwin : non mappé = `SIGSEGV`, mappé avec protection insuffisante = `SIGBUS`. Le `si_code` ne permet pas de distinguer les cas ; l'ESR du contexte (`uc_mcontext->__es.__esr`) le permet. Le champ `__exception` du contexte vaut toujours 0.
-- Accès non alignés : `ldr`, `ldp`, `ldr q`, `ldar` et les exclusifs 32 et 64 bits à l'intérieur d'une fenêtre alignée de 16 octets ne lèvent aucune faute. Un `ldar`, `stlr`, `ldaxr`, `ldadd`, `swp`, `cas` qui franchit une frontière de 16 octets lève `SIGBUS`/`BUS_ADRALN`, ESR DFSC=0x21 (alignement), `si_addr` = adresse de début de l'accès. FEAT_LSE2 est présent (`hw.optional.arm.FEAT_LSE2` = 1).
-- Un `pc` non aligné (2 mod 4) : `SIGBUS`, ESR EC=0x22, `si_addr` = cible. Un `sp` non aligné utilisé comme base : `SIGBUS`, ESR EC=0x26, `si_addr` = 0.
-- Accès à cheval sur une frontière de page dont la seconde page est inaccessible : l'adresse de faute (`si_addr` et FAR) est la première adresse de la seconde page, pas le début de l'accès ; aucune écriture partielle n'a eu lieu (les 4 octets de la première page sont restés intacts dans les trois variantes).
-- `brk #0` : `SIGTRAP`, `si_code` = 0, `si_addr` = pc de l'instruction, ESR EC=0x3c. `udf`, `mrs ttbr0_el1`, `hvc`, `msr daifset` : `SIGILL`/`ILL_ILLTRP` (2), ESR EC=0x00 sauf `msr` (EC=0x18).
-- Les bits d'activation des exceptions flottantes de FPCR (IOE, DZE, OFE, UFE, IXE, IDE) se relisent tels qu'écrits et les exceptions sont réellement levées : `1.0/0.0` avec DZE donne `SIGILL`/`ILL_ILLTRP`, ESR EC=0x2c, `si_addr` = instruction fautive. La division entière par zéro ne lève rien (résultat 0).
-- Top-byte-ignore est actif pour les accès de données : un pointeur dont l'octet haut vaut 0xab accède à la même page.
-- Débordement de pile : thread principal sans pile alternative, mort par `SIGSEGV` ; thread `pthread` sans pile alternative, mort par `SIGILL` (le noyau ne peut pas construire le cadre). Avec `sigaltstack` et `SA_ONSTACK` le handler s'exécute : `SIGSEGV` (`SEGV_ACCERR`) sur le thread principal, `SIGBUS` (`BUS_ADRALN`) sur un thread `pthread` (page de garde mappée `PROT_NONE`).
+- Unmapped page (read, write, jump) and non-canonical addresses: `SIGSEGV`, `si_code` = `SEGV_ACCERR` (2) and never `SEGV_MAPERR`, `si_addr` = FAR = faulting address, ESR EC=0x24 (data) or 0x20 (instruction), DFSC=0x04 to 0x07 (translation).
+- Page mapped but `PROT_NONE`, read-only on write, `PROT_READ|PROT_WRITE` on execution, MAP_JIT in execute mode (write) or in write mode (call), file beyond EOF, read-only shared file on write: `SIGBUS`, `si_code` = `BUS_ADRALN` (1) in all cases, `si_addr` = FAR. The ESR distinguishes: DFSC=0x0f (permission) for a write-protected or non-executable page, DFSC=0x07 (translation) for `PROT_NONE` and the truncated file.
+- So on Darwin: unmapped = `SIGSEGV`, mapped with insufficient protection = `SIGBUS`. The `si_code` does not allow distinguishing the cases; the context's ESR (`uc_mcontext->__es.__esr`) does. The context's `__exception` field is always 0.
+- Unaligned accesses: `ldr`, `ldp`, `ldr q`, `ldar` and the 32- and 64-bit exclusives inside an aligned 16-byte window raise no fault. An `ldar`, `stlr`, `ldaxr`, `ldadd`, `swp`, `cas` that crosses a 16-byte boundary raises `SIGBUS`/`BUS_ADRALN`, ESR DFSC=0x21 (alignment), `si_addr` = start address of the access. FEAT_LSE2 is present (`hw.optional.arm.FEAT_LSE2` = 1).
+- An unaligned `pc` (2 mod 4): `SIGBUS`, ESR EC=0x22, `si_addr` = target. An unaligned `sp` used as base: `SIGBUS`, ESR EC=0x26, `si_addr` = 0.
+- Access straddling a page boundary whose second page is inaccessible: the fault address (`si_addr` and FAR) is the first address of the second page, not the start of the access; no partial write took place (the 4 bytes of the first page stayed intact in the three variants).
+- `brk #0`: `SIGTRAP`, `si_code` = 0, `si_addr` = pc of the instruction, ESR EC=0x3c. `udf`, `mrs ttbr0_el1`, `hvc`, `msr daifset`: `SIGILL`/`ILL_ILLTRP` (2), ESR EC=0x00 except `msr` (EC=0x18).
+- The FPCR floating-point exception enable bits (IOE, DZE, OFE, UFE, IXE, IDE) read back as written and the exceptions are really raised: `1.0/0.0` with DZE gives `SIGILL`/`ILL_ILLTRP`, ESR EC=0x2c, `si_addr` = faulting instruction. Integer division by zero raises nothing (result 0).
+- Top-byte-ignore is active for data accesses: a pointer whose top byte is 0xab accesses the same page.
+- Stack overflow: main thread without alternate stack, dies by `SIGSEGV`; `pthread` thread without alternate stack, dies by `SIGILL` (the kernel cannot build the frame). With `sigaltstack` and `SA_ONSTACK` the handler runs: `SIGSEGV` (`SEGV_ACCERR`) on the main thread, `SIGBUS` (`BUS_ADRALN`) on a `pthread` thread (guard page mapped `PROT_NONE`).
 
-### D.2 Contexte arm64 (mesuré, `d_context`)
+### D.2 arm64 context (measured, `d_context`)
 
-- `sizeof(siginfo_t)` = 104, `ucontext_t` = 56 octets (champs `uc_onstack` 0, `uc_sigmask` 4, `uc_stack` 8, `uc_link` 32, `uc_mcsize` 40, `uc_mcontext` 48), le `mcontext` de 816 octets suit immédiatement (`uc_mcontext` pointe à `uc + 56`). `sigset_t` fait 4 octets et `NSIG` vaut 32.
-- Dans `struct __darwin_mcontext64` : `__es` (16 octets : `__far` 0, `__esr` 8, `__exception` 12), `__ss` à 16 (x0 à 16, x28 à 240, fp 248, lr 256, sp 264, pc 272, cpsr 280, 272 octets), `__ns` à 288 (v0 288, v31 784, fpsr 800, fpcr 804, 528 octets).
-- Lecture : le handler voit exactement x0 à x28, fp, lr, sp, v0 à v31, NZCV, fpsr et fpcr posés avant un `brk`, sur la pile du thread comme sur une pile alternative. Écriture : x0 à x28, fp, lr, v0 à v31, NZCV, fpsr, fpcr, sp et pc modifiés par le handler sont ceux que le code repris observe après `sigreturn` (sp changé vers une autre pile, pc vers une autre fonction).
-- Exception : **x18 est remis à 0 par le noyau**. La valeur écrite dans le contexte n'est pas restaurée (relu à 0 après `sigreturn`) ; x18 est aussi remis à 0 à chaque retour d'appel système (2 000 000 `svc #0x80` sur 2 000 000, et `getpid()` de libSystem) et pendant une boucle sans signal (1 500 à 5 000 changements par seconde, interruptions et ordonnancement). x18 est donc inutilisable par du code JIT.
-- Cadre de signal : environ 1 120 octets au-dessus de la pile (siginfo à top-1120, ucontext à top-1016) ; la pile alternative minimale acceptée est `MINSIGSTKSZ` = 32 768 (`ENOMEM` en dessous), `SIGSTKSZ` = 131 072. Un thread créé n'hérite pas de la pile alternative de son créateur (`SS_DISABLE`).
+- `sizeof(siginfo_t)` = 104, `ucontext_t` = 56 bytes (fields `uc_onstack` 0, `uc_sigmask` 4, `uc_stack` 8, `uc_link` 32, `uc_mcsize` 40, `uc_mcontext` 48), the 816-byte `mcontext` follows immediately (`uc_mcontext` points at `uc + 56`). `sigset_t` is 4 bytes and `NSIG` is 32.
+- In `struct __darwin_mcontext64`: `__es` (16 bytes: `__far` 0, `__esr` 8, `__exception` 12), `__ss` at 16 (x0 at 16, x28 at 240, fp 248, lr 256, sp 264, pc 272, cpsr 280, 272 bytes), `__ns` at 288 (v0 288, v31 784, fpsr 800, fpcr 804, 528 bytes).
+- Read: the handler sees exactly x0 to x28, fp, lr, sp, v0 to v31, NZCV, fpsr and fpcr set before a `brk`, on the thread's stack as on an alternate stack. Write: x0 to x28, fp, lr, v0 to v31, NZCV, fpsr, fpcr, sp and pc modified by the handler are those that the resumed code observes after `sigreturn` (sp changed to another stack, pc to another function).
+- Exception: **x18 is reset to 0 by the kernel**. The value written in the context is not restored (read back as 0 after `sigreturn`); x18 is also reset to 0 at every system call return (2,000,000 `svc #0x80` out of 2,000,000, and libSystem's `getpid()`) and during a loop without signal (1,500 to 5,000 changes per second, interrupts and scheduling). x18 is therefore unusable by JIT code.
+- Signal frame: about 1,120 bytes above the stack (siginfo at top-1120, ucontext at top-1016); the minimal accepted alternate stack is `MINSIGSTKSZ` = 32,768 (`ENOMEM` below), `SIGSTKSZ` = 131,072. A created thread does not inherit the alternate stack of its creator (`SS_DISABLE`).
 
-### D.3 Interruption de threads (mesuré, `d_thread_signals`)
+### D.3 Thread interruption (measured, `d_thread_signals`)
 
-Les durées sont en microsecondes ; elles sont mesurées avec `cntvct_el0` normalisé par le `CNTFRQ_EL0` du processus (voir D.6).
+Durations are in microseconds; they are measured with `cntvct_el0` normalized by the process's `CNTFRQ_EL0` (see D.6).
 
-- `pthread_kill` vers un thread qui boucle dans une région `MAP_JIT` : entrée du handler 3,1 µs (médiane), 3,6 µs (p90), 9,6 µs (p99) ; le handler voit un pc dans la boucle (4000 sur 4000) ; l'appel `pthread_kill` lui-même dure 0,71 µs. Le handler redirige le pc vers un stub dans la même région, dans une autre région `MAP_JIT`, ou dans le texte de l'hôte : 12 000 retours corrects sur 12 000 ; thread revenu en C après `sigreturn` : 3,4 µs (médiane), 10 µs (p99).
-- Thread bloqué : `read` sur un tube, `os_sync_wait_on_address`, `usleep`, `nanosleep` reviennent tous avec `EINTR` (500 sur 500, sans `SA_RESTART`). Entrée du handler : 6,8 µs, 16,6 µs, 11,3 µs, 15,2 µs (médianes).
-- Arrêt et reprise par signal (le handler attend sur `os_sync_wait_on_address`) : `pthread_kill` vers handler parqué 3,4 µs (médiane), 28,8 µs (p99) ; réveil vers thread de nouveau en cours d'exécution 5,9 µs ; cycle complet 9,5 µs (médiane), 62 µs (p99). Le thread est réellement arrêté dans 3000 cycles sur 3000.
-- Arrêt par Mach (`thread_suspend`, `thread_get_state`, `thread_resume`) sans droit particulier : `thread_suspend` revient en 6,9 µs, `thread_get_state` 1,2 µs, `thread_resume` vers reprise 5,3 µs, cycle 13,6 µs (médiane) ; le pc lu est dans la boucle JIT dans 3000 cas sur 3000. Redirection par `thread_set_state` du pc vers un stub JIT : 2000 réussites sur 2000, 12,4 µs de la suspension au retour en C.
-- Masques : un signal dirigé vers le processus (`kill(getpid(), ...)`) est toujours remis au thread principal s'il ne le bloque pas (200 sur 200), sinon au premier thread débloqué. Dix envois du même signal pendant qu'il est bloqué donnent un seul appel de handler. Un thread hérite du masque de son créateur. Dans un handler, le signal remis et les signaux de `sa_mask` sont bloqués ; au retour, le masque est celui de `uc_sigmask` en fin de handler : une modification de `uc_sigmask` est appliquée, les appels `pthread_sigmask` faits dans le handler sont écrasés.
-- Il n'y a pas de signaux temps réel (`SIGRTMIN` absent), pas de `sigqueue`, `sigtimedwait`, `sigwaitinfo`, `signalfd`, `timer_create`, `tgkill`.
+- `pthread_kill` to a thread that loops in a `MAP_JIT` region: handler entry 3.1 µs (median), 3.6 µs (p90), 9.6 µs (p99); the handler sees a pc in the loop (4000 out of 4000); the `pthread_kill` call itself lasts 0.71 µs. The handler redirects the pc to a stub in the same region, in another `MAP_JIT` region, or in the host's text: 12,000 correct returns out of 12,000; thread back in C after `sigreturn`: 3.4 µs (median), 10 µs (p99).
+- Blocked thread: `read` on a pipe, `os_sync_wait_on_address`, `usleep`, `nanosleep` all return with `EINTR` (500 out of 500, without `SA_RESTART`). Handler entry: 6.8 µs, 16.6 µs, 11.3 µs, 15.2 µs (medians).
+- Stop and resume by signal (the handler waits on `os_sync_wait_on_address`): `pthread_kill` to parked handler 3.4 µs (median), 28.8 µs (p99); wakeup to thread running again 5.9 µs; full cycle 9.5 µs (median), 62 µs (p99). The thread is really stopped in 3000 cycles out of 3000.
+- Stop through Mach (`thread_suspend`, `thread_get_state`, `thread_resume`) without any particular entitlement: `thread_suspend` returns in 6.9 µs, `thread_get_state` 1.2 µs, `thread_resume` to resumption 5.3 µs, cycle 13.6 µs (median); the pc read is in the JIT loop in 3000 cases out of 3000. Redirection of the pc to a JIT stub through `thread_set_state`: 2000 successes out of 2000, 12.4 µs from the suspension to the return to C.
+- Masks: a signal directed to the process (`kill(getpid(), ...)`) is always delivered to the main thread if it does not block it (200 out of 200), otherwise to the first unblocked thread. Ten sends of the same signal while it is blocked give a single handler call. A thread inherits the mask of its creator. In a handler, the delivered signal and the signals of `sa_mask` are blocked; on return, the mask is that of `uc_sigmask` at the end of the handler: a change of `uc_sigmask` is applied, `pthread_sigmask` calls made in the handler are overwritten.
+- There are no real-time signals (`SIGRTMIN` absent), no `sigqueue`, `sigtimedwait`, `sigwaitinfo`, `signalfd`, `timer_create`, `tgkill`.
 
-### D.4 Mode d'écriture JIT et signaux (mesuré, `d_jit_signal_state`)
+### D.4 JIT write mode and signals (measured, `d_jit_signal_state`)
 
-- À l'entrée d'un handler le thread est toujours en mode exécution, quel que soit son mode au moment de l'interruption (signal asynchrone, `pthread_kill` sur soi-même ou `brk`) : un store dans une page JIT lève `SIGBUS`, un appel de stub JIT réussit.
-- Après `sigreturn` : si le thread était en mode écriture à l'arrivée du signal, il est en mode écriture, quoi que le handler ait fait. S'il était en mode exécution, il garde le mode que le handler lui a laissé (donc en mode écriture si le handler a appelé `pthread_jit_write_protect_np(0)` et ne l'a pas annulé).
-- Conséquence mesurée : un handler qui redirige le pc vers du code JIT échoue (`SIGBUS` à la reprise) si le thread était en mode écriture, ou si le handler a laissé le mode écriture ; il réussit si le thread était en mode exécution et que le handler n'a rien changé.
-- Une faute synchrone levée par du code qui s'exécute dans une page JIT : le handler démarre en mode exécution ; un mode écriture laissé par le handler persiste après `sigreturn`.
+- On entry to a handler the thread is always in execute mode, whatever its mode at the time of the interruption (asynchronous signal, `pthread_kill` on itself or `brk`): a store into a JIT page raises `SIGBUS`, a JIT stub call succeeds.
+- After `sigreturn`: if the thread was in write mode when the signal arrived, it is in write mode, whatever the handler did. If it was in execute mode, it keeps the mode that the handler left it in (so in write mode if the handler called `pthread_jit_write_protect_np(0)` and did not undo it).
+- Measured consequence: a handler that redirects the pc to JIT code fails (`SIGBUS` at resumption) if the thread was in write mode, or if the handler left write mode; it succeeds if the thread was in execute mode and the handler changed nothing.
+- A synchronous fault raised by code running in a JIT page: the handler starts in execute mode; a write mode left by the handler persists after `sigreturn`.
 
-### D.5 À compléter
+### D.5 To be completed
 
-- Aller-retour faute et reprise (détection de code auto-modifiant par protection des pages), faute dans le handler.
+- Fault and resume round trip (self-modifying code detection through page protection), fault in the handler.
 
-### D.6 Compteur de temps (mesuré)
+### D.6 Time counter (measured)
 
-- `CNTFRQ_EL0` vaut 1 000 000 000 dans un processus lancé par `exec` ou `posix_spawn` (le compteur avance de 1,00 tick par ns), et 24 000 000 dans un processus créé par `fork` sans `exec` (0,02 tick par ns). `mach_absolute_time` avance à 24 MHz (rapport 125/3) dans les deux cas. Aucune valeur brute de `cntvct_el0` ne doit être comparée entre ces deux types de processus.
+- `CNTFRQ_EL0` is 1,000,000,000 in a process launched by `exec` or `posix_spawn` (the counter advances 1.00 tick per ns), and 24,000,000 in a process created by `fork` without `exec` (0.02 tick per ns). `mach_absolute_time` advances at 24 MHz (ratio 125/3) in both cases. No raw `cntvct_el0` value must be compared between these two types of process.
 
 ## Implications for FEXCore on Darwin
 
-a completer
+to be completed
 
-## Ce qui n'est pas testable ici
+## What is not testable here
 
-a completer
+to be completed
 
-## Fichiers
+## Files
 
-a completer
+to be completed

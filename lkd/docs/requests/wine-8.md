@@ -1,50 +1,50 @@
-# wine-8 : aucune interface réseau visible (AF_NETLINK absent, SIOCGIFCONF -> ENOTTY) ; c'était l'arrêt du jeu après 96 images
+# wine-8: no visible network interface (AF_NETLINK absent, SIOCGIFCONF -> ENOTTY); this was the game stopping after 96 frames
 
-Demandeur : agent wine-linux.
+Requester: wine-linux agent.
 
-MESURE :
-- Le fil principal de RocketLeague.exe (0130) s'arrête toujours après `gethostname() -> "obelisk"`, `gethostbyname("obelisk")`, puis l'ioctl nsiproxy 0x121000 (IOCTL_NSIPROXY_WINE_ENUMERATE_ALL, ifinfo) qui ne revient jamais (WINEDEBUG +winsock, evidence/eac-runs/20261002T232124 ; Launch.log s'arrête au même moment, plus aucun Present).
-- Témoin src/wine-linux/tests/hostent.c (gethostbyname du nom de la machine puis GetAdaptersAddresses), logs/wine-linux-hostent-001.log : même blocage, `nsi_ioctl ioctl 121000` puis `ifinfo_enumerate_all` sans retour.
-- Cause côté Wine (corrigée) : nsiproxy appelle if_nameindex() ; glibc la construit par netlink ; LKD répond `AF_NETLINK is not implemented (-EAFNOSUPPORT)`, if_nameindex rend NULL, Wine déréférençait NULL en tenant if_list_lock, le fil mourait et tous les appels suivants restaient bloqués sur le verrou. Correctif dans dlls/nsiproxy.sys/ndis.c (NULL vérifié, repli SIOCGIFCONF + SIOCGIFINDEX). MESURE après correctif : gethostbyname rend en 22 ms (NULL : aucune adresse).
-- Il reste qu'aucune interface n'existe : le repli SIOCGIFCONF rend `Inappropriate ioctl for device` (ENOTTY) sous LKD (logs/wine-linux-hostent-003.log). Sous Windows il y a toujours au moins la boucle locale et l'interface active ; gethostbyname(nom de la machine) réussit toujours, et GetAdaptersAddresses avec zéro interface fait planter iphlpapi de Wine (cas jamais vu sous Linux).
-Demande, au choix :
-1. NETLINK_ROUTE minimal (socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) ; RTM_GETLINK et RTM_GETADDR en dump ; RTM_GETROUTE serait utile à nsiproxy pour les routes) : rend getifaddrs/if_nameindex de glibc et nsiproxy (iphlpapi) fonctionnels. C'est ce que font tous les programmes Linux.
-2. À défaut, les ioctl SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFFLAGS, SIOCGIFADDR, SIOCGIFNETMASK, SIOCGIFHWADDR, SIOCGIFMTU sur une socket AF_INET, à partir des interfaces de l'hôte (getifaddrs de macOS : lo0 -> « lo », en0 -> « eth0 » par exemple).
+MEASURED:
+- The main thread of RocketLeague.exe (0130) always stops after `gethostname() -> "obelisk"`, `gethostbyname("obelisk")`, then the nsiproxy ioctl 0x121000 (IOCTL_NSIPROXY_WINE_ENUMERATE_ALL, ifinfo) that never returns (WINEDEBUG +winsock, evidence/eac-runs/20261002T232124; Launch.log stops at the same moment, no more Present).
+- Witness src/wine-linux/tests/hostent.c (gethostbyname of the machine name then GetAdaptersAddresses), logs/wine-linux-hostent-001.log: same hang, `nsi_ioctl ioctl 121000` then `ifinfo_enumerate_all` without return.
+- Cause on the Wine side (fixed): nsiproxy calls if_nameindex(); glibc builds it through netlink; LKD answers `AF_NETLINK is not implemented (-EAFNOSUPPORT)`, if_nameindex returns NULL, Wine dereferenced NULL while holding if_list_lock, the thread died and all following calls stayed blocked on the lock. Fix in dlls/nsiproxy.sys/ndis.c (NULL checked, fallback SIOCGIFCONF + SIOCGIFINDEX). MEASURED after the fix: gethostbyname returns in 22 ms (NULL: no address).
+- What remains is that no interface exists: the SIOCGIFCONF fallback returns `Inappropriate ioctl for device` (ENOTTY) under LKD (logs/wine-linux-hostent-003.log). Under Windows there is always at least the loopback and the active interface; gethostbyname(machine name) always succeeds, and GetAdaptersAddresses with zero interfaces crashes Wine's iphlpapi (case never seen under Linux).
+Request, either:
+1. Minimal NETLINK_ROUTE (socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE); RTM_GETLINK and RTM_GETADDR as dumps; RTM_GETROUTE would be useful to nsiproxy for the routes): makes glibc's getifaddrs/if_nameindex and nsiproxy (iphlpapi) work. This is what all Linux programs do.
+2. Failing that, the SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFFLAGS, SIOCGIFADDR, SIOCGIFNETMASK, SIOCGIFHWADDR, SIOCGIFMTU ioctls on an AF_INET socket, from the host's interfaces (macOS getifaddrs: lo0 -> "lo", en0 -> "eth0" for example).
 
-## Traitée le 2026-10-03 (mainteneur d'intégration)
+## Handled on 2026-10-03 (integration maintainer)
 
-Nouveau fichier `src/net/ifaces.c`. Tout est en lecture seule et lu dans l'état réel de l'hôte (getifaddrs, sysctl des routes) à chaque requête.
+New file `src/net/ifaces.c`. Everything is read-only and read from the host's real state (getifaddrs, route sysctl) at each request.
 
-Interfaces vues par l'invité :
-- `lo` (lo0 de l'hôte, index 1, MTU 65536 comme Linux) ;
-- puis chaque interface hôte UP et RUNNING qui porte une adresse IPv4 ou une adresse IPv6 non locale au lien, dans l'ordre de l'hôte.
-- Noms Linux : Ethernet (en*) donne `ethN`, point à point (utun de VPN) donne `tunN`, le reste donne `netN`.
-- Sur ce Mac : `lo` et `eth0` (en0, 192.168.1.167, deux IPv6 globales). Les utun sans adresse globale, awdl, llw, bridge, anpi et en* inactives ne sont pas montrées.
+Interfaces seen by the guest:
+- `lo` (the host's lo0, index 1, MTU 65536 like Linux);
+- then each host interface that is UP and RUNNING and carries an IPv4 address or a non-link-local IPv6 address, in the host's order.
+- Linux names: Ethernet (en*) gives `ethN`, point-to-point (VPN utun) gives `tunN`, the rest gives `netN`.
+- On this Mac: `lo` and `eth0` (en0, 192.168.1.167, two global IPv6). The utun without a global address, awdl, llw, bridge, anpi and inactive en* are not shown.
 
-ioctl sur toute socket : SIOCGIFCONF (IPv4, ifreq entières seulement, sonde de taille avec tampon NULL), SIOCGIFNAME, SIOCGIFINDEX, SIOCGIFFLAGS, SIOCGIFADDR, SIOCGIFNETMASK, SIOCGIFBRDADDR, SIOCGIFMTU, SIOCGIFHWADDR, SIOCGIFTXQLEN. Les SIOCSIF* rendent EPERM (pas de CAP_NET_ADMIN). Un nom inconnu rend ENODEV.
+ioctl on any socket: SIOCGIFCONF (IPv4, whole ifreq only, size probe with a NULL buffer), SIOCGIFNAME, SIOCGIFINDEX, SIOCGIFFLAGS, SIOCGIFADDR, SIOCGIFNETMASK, SIOCGIFBRDADDR, SIOCGIFMTU, SIOCGIFHWADDR, SIOCGIFTXQLEN. The SIOCSIF* return EPERM (no CAP_NET_ADMIN). An unknown name returns ENODEV.
 
-NETLINK_ROUTE (`socket(AF_NETLINK, SOCK_RAW ou SOCK_DGRAM, 0)`) :
-- dumps RTM_GETLINK, RTM_GETADDR et RTM_GETROUTE, plus RTM_GETLINK d'une seule interface (par index ou IFLA_IFNAME) ;
-- NLMSG_DONE et NLMSG_ERROR, avec le seq et le port id de la requête ;
-- bind et autobind (port id = tgid), getsockname, adresse source {AF_NETLINK, 0} ;
-- options SOL_NETLINK acceptées sans effet ;
-- RTM_NEW*, RTM_DEL* et RTM_SET* rendent EPERM, les autres types EOPNOTSUPP.
-- Transport : une paire AF_UNIX datagramme de l'hôte, la réponse étant écrite par LKD, un message netlink par datagramme. recv, poll, epoll, MSG_PEEK, MSG_TRUNC et O_NONBLOCK marchent sans code particulier.
-- Routes : un préfixe connecté par adresse (proto kernel, scope link) et les routes par défaut de l'hôte (passerelle, sur une interface que l'invité voit).
+NETLINK_ROUTE (`socket(AF_NETLINK, SOCK_RAW or SOCK_DGRAM, 0)`):
+- RTM_GETLINK, RTM_GETADDR and RTM_GETROUTE dumps, plus RTM_GETLINK of a single interface (by index or IFLA_IFNAME);
+- NLMSG_DONE and NLMSG_ERROR, with the seq and port id of the request;
+- bind and autobind (port id = tgid), getsockname, source address {AF_NETLINK, 0};
+- SOL_NETLINK options accepted with no effect;
+- RTM_NEW*, RTM_DEL* and RTM_SET* return EPERM, the other types EOPNOTSUPP.
+- Transport: a host AF_UNIX datagram pair, the answer being written by LKD, one netlink message per datagram. recv, poll, epoll, MSG_PEEK, MSG_TRUNC and O_NONBLOCK work without special code.
+- Routes: one connected prefix per address (proto kernel, scope link) and the host's default routes (gateway, on an interface that the guest sees).
 
-Les autres protocoles netlink rendent EPROTONOSUPPORT.
+The other netlink protocols return EPROTONOSUPPORT.
 
-MESURE :
-- `tests/test_net_ifaces.c` (nouveau, 46 assertions) : ioctl sur lo (index 1, flags, 127.0.0.1/8, MTU 65536, ARPHRD_LOOPBACK), SIOCGIFNAME, ENODEV, EPERM, SIOCGIFCONF comparé à getifaddrs de l'hôte ; dumps netlink (lo en tête avec IFLA_IFNAME, adresses, routes), seq et port id vérifiés, NLMSG_ERROR -EPERM, EAGAIN.
-- `test_net_unix` mis à jour (NETLINK_ROUTE accepté, autres protocoles EPROTONOSUPPORT).
-- Témoin glibc 2.41 `witnesses/glibc/ifaces.c`, lié dynamiquement par zig (x86_64-linux-gnu), lancé dans la racine Debian sous `build-integration/host/fexdarwin-run` :
-  - avant : getifaddrs et if_nameindex rendent EAFNOSUPPORT, SIOCGIFCONF rend ENOTTY, 0 interface ;
-  - après : getifaddrs donne lo et eth0 (AF_PACKET, 127.0.0.1, ::1, fe80::1, 192.168.1.167, IPv6 de eth0) ; if_nameindex donne 1 lo et 2 eth0 ; SIOCGIFCONF puis SIOCGIFINDEX sont cohérents ; PASS.
-- `ip` (iproute2) n'est pas dans la racine Debian : non testé.
+MEASURED:
+- `tests/test_net_ifaces.c` (new, 46 assertions): ioctl on lo (index 1, flags, 127.0.0.1/8, MTU 65536, ARPHRD_LOOPBACK), SIOCGIFNAME, ENODEV, EPERM, SIOCGIFCONF compared with the host's getifaddrs; netlink dumps (lo first with IFLA_IFNAME, addresses, routes), seq and port id checked, NLMSG_ERROR -EPERM, EAGAIN.
+- `test_net_unix` updated (NETLINK_ROUTE accepted, other protocols EPROTONOSUPPORT).
+- glibc 2.41 witness `witnesses/glibc/ifaces.c`, dynamically linked by zig (x86_64-linux-gnu), launched in the Debian root under `build-integration/host/fexdarwin-run`:
+  - before: getifaddrs and if_nameindex return EAFNOSUPPORT, SIOCGIFCONF returns ENOTTY, 0 interfaces;
+  - after: getifaddrs gives lo and eth0 (AF_PACKET, 127.0.0.1, ::1, fe80::1, 192.168.1.167, IPv6 of eth0); if_nameindex gives 1 lo and 2 eth0; SIOCGIFCONF then SIOCGIFINDEX are consistent; PASS.
+- `ip` (iproute2) is not in the Debian root: not tested.
 
-Limites :
-1. L'adresse MAC est celle que macOS donne au processus : 02:00:00:00:00:00, valeur de confidentialité. MESURE : getifaddrs et sysctl NET_RT_IFLIST2 de l'hôte rendent la même valeur pour en0, alors que `ifconfig` montre la vraie.
-2. Pas de notifications multicast (changement d'adresse ou de lien).
-3. Pas de RTM_GETROUTE d'une seule destination.
-4. Pas de statistiques d'interface (IFLA_STATS).
-5. Une socket netlink envoyée par SCM_RIGHTS arrive comme socket AF_UNIX.
+Limits:
+1. The MAC address is the one that macOS gives the process: 02:00:00:00:00:00, a privacy value. MEASURED: the host's getifaddrs and sysctl NET_RT_IFLIST2 return the same value for en0, while `ifconfig` shows the real one.
+2. No multicast notifications (address or link change).
+3. No RTM_GETROUTE for a single destination.
+4. No interface statistics (IFLA_STATS).
+5. A netlink socket sent through SCM_RIGHTS arrives as an AF_UNIX socket.

@@ -1,15 +1,15 @@
-# Demande procfs-2 au module mm
+# Request procfs-2 to the mm module
 
-Date : 2026-10-02. Auteur : module procfs.
+Date: 2026-10-02. Author: procfs module.
 
-1. `/dev/zero` (`drivers/char/mem.c` `mmap_zero`) : un mmap du fichier est de la mémoire anonyme (privé : pages à zéro copiées à l'écriture ; partagé : objet partagé anonyme). procfs fournit `int lkd_procfs_dev_is_zero(lkd_fdobj *o)` (`src/procfs/lkd_procfs.h`). Aujourd'hui `lkd_fs_mmap_check` répond `-ENODEV` pour cet objet (pas de fd hôte), donc `mmap(/dev/zero)` échoue. Demande : dans le chemin mmap de fichier, si `lkd_procfs_dev_is_zero(file)` alors traiter comme `MAP_ANONYMOUS` avec l'objet en nom `/dev/zero (deleted)` dans maps (Linux : `/dev/zero (deleted)`). Aucun test procfs ne l'exige (c'est un test mm).
-2. Compteurs de crête. `/proc/<pid>/status` affiche `VmPeak` et `VmHWM`. `lkd_mm_stats` ne les donne pas : procfs affiche la valeur courante (borne inférieure de la crête, dit dans le statut). Demande : ajouter `hiwater_vm` et `hiwater_rss` à `struct lkd_mm_stats` (mise à jour à chaque map et à chaque `munmap` qui réduit `total_vm`).
-3. `lkd_mm_remote_*` en mode fenêtre identité (tests) : le service n'est pas démarré par `lkd_mm_create` (`mm.c:128`). `tests/test_procfs_other.c` appelle `mm_remote_start()` lui-même. Rien à changer si c'est voulu.
-4. `THP_enabled` de status est fixé à 1 (INFERE : les THP ne sont qu'un drapeau dans mm). Si mm retient `PR_SET_THP_DISABLE`, dire où le lire.
+1. `/dev/zero` (`drivers/char/mem.c` `mmap_zero`): an mmap of the file is anonymous memory (private: zero pages copied on write; shared: anonymous shared object). procfs provides `int lkd_procfs_dev_is_zero(lkd_fdobj *o)` (`src/procfs/lkd_procfs.h`). Today `lkd_fs_mmap_check` answers `-ENODEV` for this object (no host fd), so `mmap(/dev/zero)` fails. Request: in the file mmap path, if `lkd_procfs_dev_is_zero(file)` then treat it as `MAP_ANONYMOUS` with the object named `/dev/zero (deleted)` in maps (Linux: `/dev/zero (deleted)`). No procfs test requires it (it is an mm test).
+2. Peak counters. `/proc/<pid>/status` shows `VmPeak` and `VmHWM`. `lkd_mm_stats` does not give them: procfs shows the current value (lower bound of the peak, stated in the status). Request: add `hiwater_vm` and `hiwater_rss` to `struct lkd_mm_stats` (updated at each map and at each `munmap` that reduces `total_vm`).
+3. `lkd_mm_remote_*` in identity window mode (tests): the service is not started by `lkd_mm_create` (`mm.c:128`). `tests/test_procfs_other.c` calls `mm_remote_start()` itself. Nothing to change if this is intended.
+4. `THP_enabled` in status is fixed at 1 (INFERRED: THP is only a flag in mm). If mm keeps `PR_SET_THP_DISABLE`, say where to read it.
 
 
-## Traitée le 2026-10-02 (mainteneur d'intégration)
+## Handled on 2026-10-02 (integration maintainer)
 
-Point 1 : `do_mmap` (`src/mm/sys.c`) traite un objet `/dev/zero` (`lkd_procfs_dev_is_zero`, faible dans core) comme de la mémoire anonyme : privé « /dev/zero » dans maps, partagé objet partagé anonyme « /dev/zero (deleted) » ; EACCES pour un partagé inscriptible sur un fd en lecture seule. Test : `test_procfs_global` cas `dev_nodes`. Avant : ENODEV.
-Point 2 : `hiwater_vm` et `hiwater_rss` dans `struct lkd_mm_stats`. `hiwater_vm` est exact (avant chaque démappage, comme `update_hiwater_vm`). `hiwater_rss` est relevé à chaque lecture et avant les démappages de 2 Mio ou plus : c'est une borne inférieure. Remise à zéro à l'exec. procfs les affiche dans VmPeak et VmHWM. Test : `test_mm_misc` cas `high_water_marks`.
-Point 3 : voulu (service distant démarré seulement pour une fenêtre de production). Point 4 : mm ne retient pas `PR_SET_THP_DISABLE` ; `THP_enabled` reste 1.
+Point 1: `do_mmap` (`src/mm/sys.c`) treats a `/dev/zero` object (`lkd_procfs_dev_is_zero`, weak in core) as anonymous memory: private "/dev/zero" in maps, shared anonymous shared object "/dev/zero (deleted)"; EACCES for a writable shared mapping on a read-only fd. Test: `test_procfs_global` case `dev_nodes`. Before: ENODEV.
+Point 2: `hiwater_vm` and `hiwater_rss` in `struct lkd_mm_stats`. `hiwater_vm` is exact (before each unmapping, like `update_hiwater_vm`). `hiwater_rss` is sampled at each read and before unmappings of 2 MiB or more: it is a lower bound. Reset at exec. procfs shows them in VmPeak and VmHWM. Test: `test_mm_misc` case `high_water_marks`.
+Point 3: intended (remote service started only for a production window). Point 4: mm does not keep `PR_SET_THP_DISABLE`; `THP_enabled` stays 1.

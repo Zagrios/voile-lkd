@@ -1,26 +1,26 @@
-# Statut du module task (LKD)
+# Status of the task module (LKD)
 
-Date : 2026-10-02. Jalon 3 atteint : tous les syscalls du périmètre écrits et testés, dans la construction privée (core + task, puis core + task + fs + mm) et dans la construction commune avec tous les modules.
+Date: 2026-10-02. Milestone 3 reached: all syscalls of the scope written and tested, in the private build (core + task, then core + task + fs + mm) and in the common build with all modules.
 
-## Ce qui existe (src/task, 4755 lignes avec les tests)
+## What exists (src/task, 4755 lines with the tests)
 
-| Fichier | Contenu |
+| File | Content |
 | --- | --- |
-| `task_priv.h` | interfaces internes, plafonds de sûreté (300 threads par processus, 64 enfants vivants, 512 processus vivants par famille) |
-| `family.c` | registre de famille partagé : fichier temporaire supprimé aussitôt, `MAP_SHARED`, 1024 processus et 8192 threads ; mutex local puis verrou d'octet `fcntl` (`family.c:146`) ; compteur de pid atomique partagé, jamais réutilisé (`family.c:138`) ; export et rattachement par `LKD_FAMILY_FD` ; recherches publiques |
-| `tasks.c` | objets tâche et processus, table locale, publication, `lkd_task_create_main` (`tasks.c:551`, reprise d'un enregistrement après ré-exécution hôte), sortie de thread, `exit_group`, `lkd_task_release` (`tasks.c:702`), `de_thread` (`tasks.c:747`), crochets de fork |
-| `ids.c` | pid, tid, ppid, pgid, sid, setpgid, setsid, famille uid/gid, groupes, capget/capset, personality |
-| `sys.c` | uname, rlimits, getrusage, times, sysinfo, sched_*, priorités, getcpu, getrandom, set_tid_address, listes robustes, exit, exit_group, arch_prctl, prctl, iopl, ioperm, unshare, setns |
-| `time.c` | horloges, CPU clocks dynamiques, nanosleep, clock_nanosleep, gettimeofday, time, adjtimex en lecture, itimers, alarm |
-| `clone.c` | clone, clone3, fork, vfork, crochet `lkd_task_fork_child` (`clone.c:54`) |
-| `wait.c` | mort d'un processus (`wait.c:166`), reparentage, notification du parent, wait4, waitid, enfants hôtes |
-| `exec.c` | execve, execveat, `lkd_exec_prepare`, crochet `lkd_task_exec_commit`, `lkd_exec_finish` |
+| `task_priv.h` | internal interfaces, safety caps (300 threads per process, 64 live children, 512 live processes per family) |
+| `family.c` | shared family registry: temporary file deleted right away, `MAP_SHARED`, 1024 processes and 8192 threads; local mutex then `fcntl` byte lock (`family.c:146`); shared atomic pid counter, never reused (`family.c:138`); export and attach through `LKD_FAMILY_FD`; public lookups |
+| `tasks.c` | task and process objects, local table, publication, `lkd_task_create_main` (`tasks.c:551`, takeover of a record after a host re-exec), thread exit, `exit_group`, `lkd_task_release` (`tasks.c:702`), `de_thread` (`tasks.c:747`), fork hooks |
+| `ids.c` | pid, tid, ppid, pgid, sid, setpgid, setsid, uid/gid family, groups, capget/capset, personality |
+| `sys.c` | uname, rlimits, getrusage, times, sysinfo, sched_*, priorities, getcpu, getrandom, set_tid_address, robust lists, exit, exit_group, arch_prctl, prctl, iopl, ioperm, unshare, setns |
+| `time.c` | clocks, dynamic CPU clocks, nanosleep, clock_nanosleep, gettimeofday, time, read-only adjtimex, itimers, alarm |
+| `clone.c` | clone, clone3, fork, vfork, `lkd_task_fork_child` hook (`clone.c:54`) |
+| `wait.c` | death of a process (`wait.c:166`), reparenting, parent notification, wait4, waitid, host children |
+| `exec.c` | execve, execveat, `lkd_exec_prepare`, `lkd_task_exec_commit` hook, `lkd_exec_finish` |
 
-## Tests (MESURE)
+## Tests (MEASURED)
 
-Construction commune `./build.sh -k 0` puis `tools/run_tests.sh build/tests` (`test_task_proc` recompté le 2026-10-10, après les orphelins) :
+Common build `./build.sh -k 0` then `tools/run_tests.sh build/tests` (`test_task_proc` recounted on 2026-10-10, after the orphans):
 
-| Programme | Assertions | Cas |
+| Program | Assertions | Cases |
 | --- | --- | --- |
 | `test_task_ids` | 228 | 16 |
 | `test_task_time` | 118 | 10 |
@@ -29,67 +29,67 @@ Construction commune `./build.sh -k 0` puis `tools/run_tests.sh build/tests` (`t
 | `test_task_bigwin` | 4 | 1 |
 | total task | 699 | 57 |
 
-- Les quatre passent dans la construction commune (tous modules liés, dont le vrai module sig) et dans la construction privée core + task (les cas d'exec qui demandent le vfs y sont signalés `SKIP`) ; trois à cinq exécutions consécutives sans échec, aucun processus restant, répertoire temporaire supprimé.
-- `test_core_contract` (89) passe contre le module task.
-- `test_core_dispatch` passait (155) dans la construction privée core + task ; dans la construction commune il ne se lie plus, à cause de ses propres gestionnaires non statiques en conflit avec fs (demande `task-1.md` point 5).
-- Le seul autre échec de la suite commune est `test_fs_pipe` (bits en attente de SIGPIPE et EINTR avec le vrai module sig) : sans rapport avec task.
-- Les tests de fork forkent vraiment (au plus trois processus en même temps), chaque enfant a `alarm(20)`. Les tests de threads utilisent le moteur factice.
+- The four pass in the common build (all modules linked, including the real sig module) and in the private core + task build (the exec cases that need the vfs are reported `SKIP` there); three to five consecutive runs without failure, no process left, temporary directory removed.
+- `test_core_contract` (89) passes against the task module.
+- `test_core_dispatch` passed (155) in the private core + task build; in the common build it no longer links, because of its own non-static handlers that conflict with fs (request `task-1.md` point 5).
+- The only other failure of the common suite is `test_fs_pipe` (pending bits of SIGPIPE and EINTR with the real sig module): unrelated to task.
+- The fork tests really fork (at most three processes at the same time), each child has `alarm(20)`. The thread tests use the fake engine.
 
-## Blocage signalé sous le vrai moteur (2026-10-02, après le jalon 3)
+## Hang reported under the real engine (2026-10-02, after milestone 3)
 
-`/bin/sh -c '/bin/true; echo status=$?'` restait bloqué dans `wait4` (ou après le `write` final avec `LKD_TRACE=1`). MESURE (`sample`) : aucun réveil perdu dans task ; l'enfant de vfork, passé dans son propre processus hôte à l'exec, tournait dans `lkd_mm_reset_for_exec -> mm_host_cleanup`, qui parcourt toute la fenêtre de 2^46 octets page hôte par page hôte ; le shell faisait ensuite de même dans son `exit_group` (`lkd_mm_put`). Avec la boucle corrigée dans une copie de l'arbre, la commande finit en 1 s avec `status=0` et l'ordre de syscalls attendu. Demande `docs/requests/task-4.md` au module mm. Test ajouté : `tests/test_task_bigwin.c` (fenêtre de production, borne 5 s) : ÉCHEC sur l'arbre actuel (20 114 ms), PASSE avec la correction (524 ms). Il passera quand mm aura corrigé sa boucle.
+`/bin/sh -c '/bin/true; echo status=$?'` stayed stuck in `wait4` (or after the final `write` with `LKD_TRACE=1`). MEASURED (`sample`): no lost wakeup in task; the vfork child, moved into its own host process at exec, was spinning in `lkd_mm_reset_for_exec -> mm_host_cleanup`, which walks the whole 2^46-byte window host page by host page; the shell then did the same in its `exit_group` (`lkd_mm_put`). With the loop fixed in a copy of the tree, the command finishes in 1 s with `status=0` and the expected syscall order. Request `docs/requests/task-4.md` to the mm module. Test added: `tests/test_task_bigwin.c` (production window, 5 s bound): FAILS on the current tree (20,114 ms), PASSES with the fix (524 ms). It will pass when mm has fixed its loop.
 
-## Comportements (LU dans Linux v6.12, MESURE par les tests)
+## Behaviors (READ in Linux v6.12, MEASURED by the tests)
 
-1. Identité. Le thread principal a `tid == pid`. Le premier processus a le pid `first_pid` (2 par défaut), jamais 1 sauf configuration, et `ppid` 1 par défaut (`lkd_main_spec.ppid` le change). Aucun processus 1 n'est inventé : `/proc/1` n'existe que si le runtime crée un processus de pid 1. Le premier processus est chef de session et de groupe (pgid = sid = pid). Le premier processus enregistré sans parent dans la famille en est l'init (`fam_child_reaper`, en-tête du registre, version 2) : il tient le rôle du `child_reaper` d'un espace de pid Linux, sans prendre le pid 1 (raisons : `docs/journal/01-integration-status.md`, section des orphelins du 2026-10-10).
-2. Registre partagé. Chaque processus de la famille lit le nom, ppid, pgid, sid, état, exe, cmdline (4096 octets au plus), nombre de threads, statut de sortie, limites d'un autre. `wait4` publie l'état `S` du thread qui attend (cas `waiting_parent_shows_sleeping`).
-3. clone. Trois formes (`clone.c`, en-tête) : thread (`spawn_thread`), processus partageant la mémoire (vfork, posix_spawn : thread hôte du processus hôte du parent jusqu'à l'exec, le parent attend vraiment, l'écriture de l'enfant en mémoire est vue par le parent, donc le rapport d'erreur de `posix_spawn` de la glibc fonctionne), fork hôte. Les drapeaux suivent `copy_process()` et `clone3_args_valid()` : SETTLS, PARENT_SETTID, CHILD_SETTID (dans la mémoire de l'enfant après fork), CHILD_CLEARTID, PARENT, VFORK, THREAD, SIGHAND, VM, FILES, FS. `CLONE_FILES` ou `CLONE_FS` sans `CLONE_VM` répond EINVAL (impossible entre deux processus hôtes, journalisé). Namespaces : EPERM. `CLONE_PIDFD` : EINVAL (pas de pidfd). `set_tid` de clone3 : EPERM.
-4. exec. Résolution par le vfs, droit x selon fsuid/fsgid/groupes, `#!` (argument unique, nom tronqué ENOEXEC, 5 niveaux puis ELOOP comme `exec_binprm`), ELF64 x86-64 `ET_EXEC`/`ET_DYN` sinon ENOEXEC (pas d'émulation i386), argv vide remplacé par `""`, E2BIG pour une chaîne de plus de 128 Kio ou le total au-delà de min(RLIMIT_STACK/4, 6 Mio, 2 Mio), `AT_SYMLINK_NOFOLLOW` sur un lien ELOOP, `execveat` avec `/dev/fd/N[/chemin]`. Point de non-retour : `de_thread` (le thread non chef prend le tid du chef), déplacement d'un enfant de vfork vers un fork hôte, `lkd_exec_commit`, nom = base du nom de fichier, exe = fichier chargé, cmdline, environ, dumpable 0 si le fichier n'est pas lisible, liste robuste et `clear_child_tid` traités comme `exec_mm_release`, setpgid du parent ensuite EACCES. Échec de `exec_image` après ce point : SIGSEGV.
-5. Sortie. `exit` code `(c & 0xff) << 8`, `exit_group` tue les autres threads (FATAL + kick), le premier statut de groupe gagne. Par thread : liste robuste (sig), `clear_child_tid` mis à 0 et futex réveillé si la mémoire a d'autres utilisateurs, crochets `task_exit`, signal de mort du parent pour les enfants créés par ce thread. Par processus : zombie publié, enfants reparentés (`forget_original_parent`, `find_new_reaper`) vers le sous-moissonneur vivant le plus proche parmi les ancêtres, sinon vers l'init de la famille, sinon 1 quand l'init lui-même meurt. Chaque enfant reparenté reçoit son signal de mort du parent (SI_USER, pid du parent mort) et prend SIGCHLD comme signal de sortie (`reparent_leader`) ; un zombie reparenté est annoncé au nouveau parent par SIGCHLD, ou libéré si aucun processus vivant ne le prend. Un processus hôte mort sans passer par sa sortie laisse ses enfants orphelins de la même façon (`poll_host_children`, cas `orphans_of_a_killed_host_process`). Puis signal de sortie au parent (SIGCHLD par `lkd_sig_child_event`, autre signal avec siginfo `CLD_*`), libération immédiate si sig le demande.
-6. wait4/waitid. WNOHANG, WUNTRACED/WSTOPPED, WCONTINUED, WNOWAIT, WEXITED, `__WALL`, `__WCLONE`, `__WNOTHREAD`, sélection par pid, groupe (0 = le sien) ou tous, ECHILD, EINVAL pour les options inconnues, `INT_MIN` ESRCH, `P_PIDFD` EBADF, siginfo de waitid mis à zéro s'il n'y a rien, rusage des enfants cumulé. Un enfant hôte mort sans passer par sa sortie (SIGKILL hôte, plantage du moteur) est rapporté avec le statut réel de l'hôte (cas `host_killed_child_is_reported`). L'attente est interruptible (ERESTARTSYS) et relit le registre toutes les 10 ms au plus.
-7. Temps. REALTIME, REALTIME_COARSE, TAI, REALTIME_ALARM : `CLOCK_REALTIME` de Darwin. MONOTONIC, MONOTONIC_RAW, MONOTONIC_COARSE : `CLOCK_UPTIME_RAW` (s'arrête en veille comme Linux MONOTONIC). BOOTTIME : `CLOCK_MONOTONIC_RAW` de Darwin (compte la veille). CPU clocks `~pid << 3 | which` : processus (soi ou tout processus de la famille par `proc_pidinfo`), thread (soi seulement). Sommeil : partie longue interruptible par le tube de réveil, dernière milliseconde par `nanosleep` hôte (précision mesurée sous la milliseconde) ; relatif : reste écrit et redémarrage par `restart_syscall` à la même échéance ; absolu : ERESTARTNOHAND. itimers REAL, VIRTUAL, PROF par un thread hôte auxiliaire par processus (SIGALRM/SIGVTALRM/SIGPROF avec `SI_KERNEL`), non hérités par fork.
-8. Limites et ressources. Défauts Linux (pile 8 Mio, core 0, NOFILE 1024, MEMLOCK 8 Mio, MSGQUEUE 819200, NICE et RTPRIO 0), limite dure NOFILE = `kern.maxfilesperproc` de l'hôte, NPROC = limite hôte. getrusage SELF, THREAD (temps du thread Mach), CHILDREN. sysinfo : mémoire réelle, charge, swap, uptime arrondi au-dessus comme `do_sysinfo`.
-9. prctl : SET/GET_NAME, DUMPABLE (0 ou 1), PDEATHSIG, CHILD_SUBREAPER, NO_NEW_PRIVS, TID_ADDRESS, KEEPCAPS, TIMERSLACK, CAPBSET_READ/DROP, CAP_AMBIENT, SECUREBITS, THP_DISABLE, MCE_KILL, TSC, SPECULATION_CTRL (non affecté), SET_VMA (par mm), GET_AUXV (par la disposition rapportée par le moteur) ; SECCOMP, SYSCALL_USER_DISPATCH, MDWE, PTRACER : EINVAL (journalisés pour les deux du milieu) ; options inconnues EINVAL.
-10. arch_prctl : SET/GET_FS et GS par `get_regs`/`set_regs` du moteur, EPERM au-delà de `TASK_SIZE_MAX`, `ARCH_CET_STATUS` EINVAL, CPUID faulting ENODEV, LAM et pile fantôme comme un CPU sans ces fonctions.
+1. Identity. The main thread has `tid == pid`. The first process has the pid `first_pid` (2 by default), never 1 unless configured, and `ppid` 1 by default (`lkd_main_spec.ppid` changes it). No process 1 is invented: `/proc/1` only exists if the runtime creates a process with pid 1. The first process is session and group leader (pgid = sid = pid). The first process registered without a parent in the family is its init (`fam_child_reaper`, registry header, version 2): it plays the role of the `child_reaper` of a Linux pid namespace, without taking pid 1 (reasons: `docs/journal/01-integration-status.md`, orphans section of 2026-10-10).
+2. Shared registry. Each process of the family reads the name, ppid, pgid, sid, state, exe, cmdline (4096 bytes at most), number of threads, exit status, limits of another one. `wait4` publishes the `S` state of the waiting thread (case `waiting_parent_shows_sleeping`).
+3. clone. Three forms (`clone.c`, header): thread (`spawn_thread`), process sharing the memory (vfork, posix_spawn: host thread of the parent's host process until the exec, the parent really waits, the child's write to memory is seen by the parent, so glibc's `posix_spawn` error report works), host fork. The flags follow `copy_process()` and `clone3_args_valid()`: SETTLS, PARENT_SETTID, CHILD_SETTID (in the child's memory after fork), CHILD_CLEARTID, PARENT, VFORK, THREAD, SIGHAND, VM, FILES, FS. `CLONE_FILES` or `CLONE_FS` without `CLONE_VM` answers EINVAL (impossible between two host processes, logged). Namespaces: EPERM. `CLONE_PIDFD`: EINVAL (no pidfd). clone3's `set_tid`: EPERM.
+4. exec. Resolution through the vfs, x permission according to fsuid/fsgid/groups, `#!` (single argument, truncated name ENOEXEC, 5 levels then ELOOP like `exec_binprm`), ELF64 x86-64 `ET_EXEC`/`ET_DYN` otherwise ENOEXEC (no i386 emulation), empty argv replaced by `""`, E2BIG for a string of more than 128 KiB or a total beyond min(RLIMIT_STACK/4, 6 MiB, 2 MiB), `AT_SYMLINK_NOFOLLOW` on a link ELOOP, `execveat` with `/dev/fd/N[/path]`. Point of no return: `de_thread` (the non-leader thread takes the leader's tid), move of a vfork child to a host fork, `lkd_exec_commit`, name = base of the file name, exe = loaded file, cmdline, environ, dumpable 0 if the file is not readable, robust list and `clear_child_tid` handled like `exec_mm_release`, the parent's setpgid then EACCES. Failure of `exec_image` after this point: SIGSEGV.
+5. Exit. `exit` code `(c & 0xff) << 8`, `exit_group` kills the other threads (FATAL + kick), the first group status wins. Per thread: robust list (sig), `clear_child_tid` set to 0 and futex woken if the memory has other users, `task_exit` hooks, parent death signal for the children created by this thread. Per process: zombie published, children reparented (`forget_original_parent`, `find_new_reaper`) to the closest live subreaper among the ancestors, otherwise to the family's init, otherwise 1 when the init itself dies. Each reparented child receives its parent death signal (SI_USER, pid of the dead parent) and takes SIGCHLD as its exit signal (`reparent_leader`); a reparented zombie is announced to the new parent through SIGCHLD, or released if no live process takes it. A host process that died without going through its exit leaves its children orphaned the same way (`poll_host_children`, case `orphans_of_a_killed_host_process`). Then exit signal to the parent (SIGCHLD through `lkd_sig_child_event`, another signal with `CLD_*` siginfo), immediate release if sig asks for it.
+6. wait4/waitid. WNOHANG, WUNTRACED/WSTOPPED, WCONTINUED, WNOWAIT, WEXITED, `__WALL`, `__WCLONE`, `__WNOTHREAD`, selection by pid, group (0 = its own) or all, ECHILD, EINVAL for unknown options, `INT_MIN` ESRCH, `P_PIDFD` EBADF, waitid's siginfo zeroed if there is nothing, cumulative rusage of the children. A host child that died without going through its exit (host SIGKILL, engine crash) is reported with the host's real status (case `host_killed_child_is_reported`). The wait is interruptible (ERESTARTSYS) and rereads the registry every 10 ms at most.
+7. Time. REALTIME, REALTIME_COARSE, TAI, REALTIME_ALARM: Darwin's `CLOCK_REALTIME`. MONOTONIC, MONOTONIC_RAW, MONOTONIC_COARSE: `CLOCK_UPTIME_RAW` (stops during sleep like Linux MONOTONIC). BOOTTIME: Darwin's `CLOCK_MONOTONIC_RAW` (counts sleep). CPU clocks `~pid << 3 | which`: process (self or any process of the family through `proc_pidinfo`), thread (self only). Sleep: long part interruptible through the wakeup pipe, last millisecond through host `nanosleep` (measured precision under the millisecond); relative: remainder written and restart through `restart_syscall` at the same deadline; absolute: ERESTARTNOHAND. itimers REAL, VIRTUAL, PROF through an auxiliary host thread per process (SIGALRM/SIGVTALRM/SIGPROF with `SI_KERNEL`), not inherited by fork.
+8. Limits and resources. Linux defaults (stack 8 MiB, core 0, NOFILE 1024, MEMLOCK 8 MiB, MSGQUEUE 819200, NICE and RTPRIO 0), NOFILE hard limit = the host's `kern.maxfilesperproc`, NPROC = host limit. getrusage SELF, THREAD (time of the Mach thread), CHILDREN. sysinfo: real memory, load, swap, uptime rounded up like `do_sysinfo`.
+9. prctl: SET/GET_NAME, DUMPABLE (0 or 1), PDEATHSIG, CHILD_SUBREAPER, NO_NEW_PRIVS, TID_ADDRESS, KEEPCAPS, TIMERSLACK, CAPBSET_READ/DROP, CAP_AMBIENT, SECUREBITS, THP_DISABLE, MCE_KILL, TSC, SPECULATION_CTRL (not affected), SET_VMA (through mm), GET_AUXV (through the layout reported by the engine); SECCOMP, SYSCALL_USER_DISPATCH, MDWE, PTRACER: EINVAL (logged for the two in the middle); unknown options EINVAL.
+10. arch_prctl: SET/GET_FS and GS through the engine's `get_regs`/`set_regs`, EPERM beyond `TASK_SIZE_MAX`, `ARCH_CET_STATUS` EINVAL, CPUID faulting ENODEV, LAM and shadow stack like a CPU without these features.
 
-## Syscalls laissés sans enregistrement (ENOSYS compté, choix délibéré)
+## Syscalls left unregistered (ENOSYS counted, deliberate choice)
 
-`rseq` (la glibc s'en passe), `seccomp` (noyau modélisé sans `CONFIG_SECCOMP`), `pidfd_open`, `modify_ldt` (pas de LDT dans le moteur), `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` (minuteries POSIX pas encore écrites), `ioprio_get`, `ioprio_set`.
+`rseq` (glibc does without it), `seccomp` (kernel modeled without `CONFIG_SECCOMP`), `pidfd_open`, `modify_ldt` (no LDT in the engine), `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` (POSIX timers not written yet), `ioprio_get`, `ioprio_set`.
 
-## Réponses ENOSYS ou EPERM visibles à l'intérieur de syscalls enregistrés
+## Visible ENOSYS or EPERM answers inside registered syscalls
 
-- `prlimit64` qui modifie un autre processus, `sched_setscheduler`, `sched_setattr`, `setpriority` sur un thread d'un autre processus hôte : ENOSYS journalisé. `setpriority` par groupe ou utilisateur : ENOSYS.
-- `sched_setaffinity` sur un thread d'un autre processus hôte passe par le service inter-processus (`famsvc.h`, opcode `TASK_OP_SET_AFFINITY`, 97) : le processus qui possède le thread pose le masque et le publie. wineserver applique ainsi le `SetThreadAffinityMask` d'un jeu. Avant, ENOSYS faisait échouer cet appel, et Wwise abandonne un fil dont il ne peut poser le masque (ELDEN RING, 2026-10-10). MESURE : `affinity_of_a_thread_in_another_host_process` dans `test_task_proc`.
-- `clock_nanosleep` sur une horloge de temps CPU : EOPNOTSUPP journalisé. CPU clock d'un autre thread : EINVAL journalisé.
-- `arch_prctl(ARCH_*_XCOMP_*)` : EINVAL journalisé (l'ensemble XSAVE est au moteur).
+- `prlimit64` that modifies another process, `sched_setscheduler`, `sched_setattr`, `setpriority` on a thread of another host process: logged ENOSYS. `setpriority` by group or user: ENOSYS.
+- `sched_setaffinity` on a thread of another host process goes through the inter-process service (`famsvc.h`, opcode `TASK_OP_SET_AFFINITY`, 97): the process that owns the thread sets the mask and publishes it. This is how wineserver applies a game's `SetThreadAffinityMask`. Before, ENOSYS made this call fail, and Wwise abandons a thread whose mask it cannot set (ELDEN RING, 2026-10-10). MEASURED: `affinity_of_a_thread_in_another_host_process` in `test_task_proc`.
+- `clock_nanosleep` on a CPU time clock: logged EOPNOTSUPP. CPU clock of another thread: logged EINVAL.
+- `arch_prctl(ARCH_*_XCOMP_*)`: logged EINVAL (the XSAVE set belongs to the engine).
 
-## Lacunes connues (INFERE sauf mention)
+## Known gaps (INFERRED unless stated)
 
-1. L'affinité et le nice sont enregistrés et rapportés, pas appliqués à l'hôte (Darwin n'a pas d'API de placement de thread ni de nice par thread).
-2. `pdeathsig` est stocké par processus dans le registre (Linux : par thread de l'enfant). Envoi par `lkd_sig_send_pid`.
-3. Un processus partageant la mémoire de son parent (vfork avant exec) meurt avec le processus hôte du parent si celui-ci sort : il est alors rapporté tué par SIGKILL.
-4. Un processus hôte de la famille qui meurt brutalement et dont le parent invité n'est pas son parent hôte (cas `CLONE_PARENT`) reste `R` dans le registre : aucun statut réel n'est disponible.
-5. `cmdline` des autres processus tronqué à 4096 octets, `exe` à 512.
-6. Les CPU clocks d'un processus partageant l'hôte d'un autre comptent tout le processus hôte.
-7. L'état publié d'un autre processus hôte n'est `S` que pendant wait4 ; pour les autres attentes il faut la demande `task-1.md` point 4.
-8. La sortie du thread principal seul (autres threads vivants) termine aujourd'hui le processus côté moteur (`task-3.md` point 2).
-9. `exec_image` du moteur répond ENOSYS : tout exec atteint le point de non-retour puis tue le processus par SIGSEGV (`task-3.md` point 1).
-10. `lkd_tid_lookup` publie l'état courant d'un thread local avant de répondre ; `syscall_nr` d'un thread d'un autre processus hôte est celui de la dernière publication.
-11. L'init de la famille n'a pas les règles du pid 1 de Linux : `kill(-1)` ne l'épargne pas, il n'a pas la protection `SIGNAL_UNKILLABLE`, et sa mort ne tue pas le reste de la famille (`zap_pid_ns_processes`). C'est le superviseur du moteur (`FEXDARWIN_SUPERVISOR_PID`) qui termine alors les processus hôtes. D'ici là, les orphelins restants ont le parent 1, qui n'existe pas.
-12. Le premier processus garde `ppid` 1 alors que `/proc/1` n'existe pas. Linux donnerait 0 pour un parent hors de l'espace de pid (cas d'un processus entré par `setns`). Non changé faute de besoin mesuré.
+1. Affinity and nice are recorded and reported, not applied to the host (Darwin has no thread placement API nor per-thread nice).
+2. `pdeathsig` is stored per process in the registry (Linux: per thread of the child). Sent through `lkd_sig_send_pid`.
+3. A process sharing its parent's memory (vfork before exec) dies with the parent's host process if the latter exits: it is then reported killed by SIGKILL.
+4. A host process of the family that dies abruptly and whose guest parent is not its host parent (`CLONE_PARENT` case) stays `R` in the registry: no real status is available.
+5. `cmdline` of the other processes truncated to 4096 bytes, `exe` to 512.
+6. The CPU clocks of a process sharing the host of another one count the whole host process.
+7. The published state of another host process is `S` only during wait4; for the other waits, request `task-1.md` point 4 is needed.
+8. The exit of the main thread alone (other threads alive) currently ends the process on the engine side (`task-3.md` point 2).
+9. The engine's `exec_image` answers ENOSYS: every exec reaches the point of no return then kills the process with SIGSEGV (`task-3.md` point 1).
+10. `lkd_tid_lookup` publishes the current state of a local thread before answering; `syscall_nr` of a thread of another host process is the one of the last publication.
+11. The family's init does not have the rules of Linux's pid 1: `kill(-1)` does not spare it, it does not have the `SIGNAL_UNKILLABLE` protection, and its death does not kill the rest of the family (`zap_pid_ns_processes`). It is the engine's supervisor (`FEXDARWIN_SUPERVISOR_PID`) that then ends the host processes. Until then, the remaining orphans have parent 1, which does not exist.
+12. The first process keeps `ppid` 1 while `/proc/1` does not exist. Linux would give 0 for a parent outside the pid namespace (case of a process that entered through `setns`). Not changed for lack of a measured need.
 
-## Demandes ouvertes
+## Open requests
 
-`docs/requests/task-1.md` (core), `task-2.md` (sig, ptrace, procfs, fs), `task-3.md` (moteur), `task-4.md` (mm, remise à zéro de l'espace d'adressage).
+`docs/requests/task-1.md` (core), `task-2.md` (sig, ptrace, procfs, fs), `task-3.md` (engine), `task-4.md` (mm, reset of the address space).
 
-## Suite possible
+## Possible next steps
 
-Minuteries POSIX (`timer_*`), opcodes famsvc pour les opérations sur un autre processus hôte, nettoyage d'un zombie dont le processus hôte a disparu sans statut.
+POSIX timers (`timer_*`), famsvc opcodes for operations on another host process, cleanup of a zombie whose host process vanished without a status.
 
-## getrusage (2026-10-03, profil du menu du jeu)
+## getrusage (2026-10-03, profile of the game menu)
 
-`getrusage(RUSAGE_THREAD)` ne fait plus de `getrusage(RUSAGE_SELF)` de l'hôte, qui parcourt tous les threads du processus hôte, seulement pour remplir ru_maxrss.
-- ru_maxrss vient de `MACH_TASK_BASIC_INFO.resident_size_max`, relevé au plus toutes les 10 ms.
-- Les temps viennent de `thread_info` du thread appelant.
+`getrusage(RUSAGE_THREAD)` no longer does a host `getrusage(RUSAGE_SELF)`, which walks all the threads of the host process, only to fill ru_maxrss.
+- ru_maxrss comes from `MACH_TASK_BASIC_INFO.resident_size_max`, sampled at most every 10 ms.
+- The times come from `thread_info` of the calling thread.
 
-MESURE (`w20_statbench`, un seul thread) : de 0,93 us à 0,47 us par appel. Le gain croît avec le nombre de threads du processus hôte. RUSAGE_SELF reste la somme exacte de l'hôte (0,5 us ici).
+MEASURED (`w20_statbench`, a single thread): from 0.93 us to 0.47 us per call. The gain grows with the number of threads of the host process. RUSAGE_SELF stays the exact sum from the host (0.5 us here).

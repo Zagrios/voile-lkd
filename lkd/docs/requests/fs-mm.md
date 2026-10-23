@@ -1,18 +1,18 @@
-# fs -> mm : mappings de fichiers et scellés memfd
+# fs -> mm: file mappings and memfd seals
 
-## Ce que fs fournit
+## What fs provides
 
-- `o->ops->mmap_fd(o)` : fd hôte mappable (fichiers ordinaires, memfd), absent pour les tubes, répertoires, O_PATH et fichiers virtuels.
-- `lkd_fs_mmap_check(o, prot, flags)` (dans `src/fs/lkd_fs.h`) : contrôles de `do_mmap` propres au fichier, à appeler avant de mapper : `-EBADF` (O_PATH), `-ENODEV` (rien à mapper), `-EACCES` (pas ouvert en lecture ; MAP_SHARED|PROT_WRITE sans O_RDWR ou avec O_APPEND), `-EPERM` (MAP_SHARED|PROT_WRITE d'un memfd scellé F_SEAL_WRITE ou F_SEAL_FUTURE_WRITE). Testé dans `tests/test_fs_memfd.c`.
-- `lkd_fs_memfd_seals(o)` : scellés d'un memfd, -1 sinon.
+- `o->ops->mmap_fd(o)`: mappable host fd (ordinary files, memfd), absent for pipes, directories, O_PATH and virtual files.
+- `lkd_fs_mmap_check(o, prot, flags)` (in `src/fs/lkd_fs.h`): `do_mmap` checks specific to the file, to call before mapping: `-EBADF` (O_PATH), `-ENODEV` (nothing to map), `-EACCES` (not open for reading; MAP_SHARED|PROT_WRITE without O_RDWR or with O_APPEND), `-EPERM` (MAP_SHARED|PROT_WRITE of a memfd sealed with F_SEAL_WRITE or F_SEAL_FUTURE_WRITE). Tested in `tests/test_fs_memfd.c`.
+- `lkd_fs_memfd_seals(o)`: seals of a memfd, -1 otherwise.
 
-## Ce que fs attend de mm
+## What fs expects from mm
 
-1. `lkd_mm_has_writable_shared_mapping(mm, file)` : rendre 1 s'il existe dans `mm` un mapping MAP_SHARED de ce fichier qui peut devenir inscriptible, c'est-à-dire, comme `i_mmap_writable` de Linux, tout mapping partagé fait depuis une description O_RDWR (VM_SHARED avec VM_MAYWRITE), même s'il est en lecture seule à cet instant. Comparer l'objet ou, mieux, l'inode (`o->dev`, `o->ino`), parce qu'une réouverture par /proc crée un autre objet pour le même memfd. fs appelle la fonction par le pointeur `lkd_fs_wsm_query` (les tests le remplacent).
-2. Après F_SEAL_WRITE ou F_SEAL_FUTURE_WRITE : refuser `mprotect(PROT_WRITE)` d'un mapping partagé de ce memfd (`-EACCES`, VM_MAYWRITE retiré par `seal_check_write`).
-3. Limite à documenter côté mm : la requête ne voit que l'espace d'adressage de l'appelant. Un mapping inscriptible partagé fait par un autre processus de la famille (après fork) n'est pas vu ; Linux le verrait. C'est la seule écriture qu'un scellé F_SEAL_WRITE ne peut pas bloquer ici.
+1. `lkd_mm_has_writable_shared_mapping(mm, file)`: return 1 if there is in `mm` a MAP_SHARED mapping of this file that can become writable, that is, like Linux's `i_mmap_writable`, any shared mapping made from an O_RDWR description (VM_SHARED with VM_MAYWRITE), even if it is read-only at that moment. Compare the object or, better, the inode (`o->dev`, `o->ino`), because a reopen through /proc creates another object for the same memfd. fs calls the function through the pointer `lkd_fs_wsm_query` (the tests replace it).
+2. After F_SEAL_WRITE or F_SEAL_FUTURE_WRITE: refuse `mprotect(PROT_WRITE)` of a shared mapping of this memfd (`-EACCES`, VM_MAYWRITE removed by `seal_check_write`).
+3. Limit to document on the mm side: the query sees only the caller's address space. A shared writable mapping made by another process of the family (after fork) is not seen; Linux would see it. It is the only write that an F_SEAL_WRITE seal cannot block here.
 
 
-## Traitée le 2026-10-02 (mainteneur d'intégration)
+## Handled on 2026-10-02 (integration maintainer)
 
-Point 1 : déjà implanté par mm (`lkd_mm_has_writable_shared_mapping`, tests `test_mm_file`). Point 2 : `mprotect(PROT_WRITE)` d'un mapping partagé d'un memfd scellé (F_SEAL_WRITE ou F_SEAL_FUTURE_WRITE) rend EACCES (`src/mm/mm.c`, `lkd_fs_memfd_seals` faible dans core). Test : `test_fs_memfd` cas `sealed_memfd_mprotect`. Point 3 : limite conservée.
+Point 1: already implemented by mm (`lkd_mm_has_writable_shared_mapping`, tests `test_mm_file`). Point 2: `mprotect(PROT_WRITE)` of a shared mapping of a sealed memfd (F_SEAL_WRITE or F_SEAL_FUTURE_WRITE) returns EACCES (`src/mm/mm.c`, weak `lkd_fs_memfd_seals` in core). Test: `test_fs_memfd` case `sealed_memfd_mprotect`. Point 3: limit kept.

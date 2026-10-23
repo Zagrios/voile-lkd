@@ -1,391 +1,391 @@
-# Réutilisation du coeur HyperLinux par un moteur FEXCore en processus
+# Reuse of the HyperLinux core by an in-process FEXCore engine
 
-Date : 2026-10-02. Statut : version complète de la première moitié de l'étude. Elle couvre la mémoire invitée, les VMA, le vfs, procfs, les objets fd, l'identité de processus et la conversion d'ABI. Les threads, fork/exec, signaux, futex, ptrace et le réseau sont dans `reports/hl-reuse-process.md`.
+Date: 2026-10-02. Status: complete version of the first half of the study. It covers guest memory, VMAs, the vfs, procfs, fd objects, process identity and ABI conversion. Threads, fork/exec, signals, futex, ptrace and networking are in `reports/hl-reuse-process.md`.
 
-Conventions. LU : lu dans le code, avec fichier:ligne. MESURÉ : obtenu en exécutant un programme ou un test sur cette machine, avec la commande ou le journal cités. INFÉRÉ : déduction non vérifiée par exécution. Abréviations de chemins :
+Conventions. READ: read in the code, with file:line. MEASURED: obtained by running a program or a test on this machine, with the command or the log cited. INFERRED: deduction not checked by execution. Path abbreviations:
 
-- HL : `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-hyperlinux-20260928/hyper-linux/src`, copie de travail, HEAD 8048a96.
-- FEX : `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-hyperlinux-20260928/probes/fex-implementation-feasibility-20260929/source/FEX-0df84d3844bcdb87bb7d3f5b8fb0959cd009c038/Source/Tools/LinuxEmulation/LinuxSyscalls`, arbre intact.
-- EXP : `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-wine-fex-darwin-20261002`.
-- XP : `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-hyperlinux-20260928`, dossier d'expérience précédent, lecture seule.
+- HL: `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-hyperlinux-20260928/hyper-linux/src`, working copy, HEAD 8048a96.
+- FEX: `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-hyperlinux-20260928/probes/fex-implementation-feasibility-20260929/source/FEX-0df84d3844bcdb87bb7d3f5b8fb0959cd009c038/Source/Tools/LinuxEmulation/LinuxSyscalls`, intact tree.
+- EXP: `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-wine-fex-darwin-20261002`.
+- XP: `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-hyperlinux-20260928`, previous experiment folder, read-only.
 
-Machine : Apple M5 Max, macOS 27.0.1, pages hôte de 16 Kio (`getpagesize()` = 16384, MESURÉ, annexe A).
+Machine: Apple M5 Max, macOS 27.0.1, 16 KiB host pages (`getpagesize()` = 16384, MEASURED, appendix A).
 
-## Résumé
+## Summary
 
-1. LU. HL est un noyau Linux ARM64 écrit autour d'une mémoire invitée HVF. Un seul tampon hôte `host_base` de 64 Gio ou 1 Tio, adresse virtuelle invitée = adresse physique invitée = décalage dans ce tampon, tables de pages de niveau 1 construites par l'hôte, pages invitées de 4 Kio sur un hôte à 16 Kio (`guest.h:6-15`, `guest.c:65-66`).
-2. MESURÉ (`wc -l`, `nm -u`). 84 fichiers, 40 617 lignes. 25 des 39 objets compilés n'ont aucun symbole HVF non résolu ; l'API HVF utilisée tient en 20 fonctions ; les handlers de fichiers, d'I/O, de temps et de procfs n'ont besoin que de cinq fonctions d'accès à la mémoire invitée. Reprise quasi telle quelle : 3 835 lignes (9 %). À adapter, ABI et accès mémoire : 9 082 (22 %). À réécrire : 6 197 (15 %). À abandonner : 7 563 (19 %). Couche processus, traitée dans l'autre rapport : 13 940 (34 %).
-3. MESURÉ (annexe C). Les vrais objets de HL, liés avec un shim de quinze lignes qui remplace les cinq accesseurs de mémoire invitée par l'identité, exécutent dans un processus macOS ordinaire : `openat` par le vfs rooted, `read`, `write`, `fstat`, `getdents64`, liens symboliques résolus dans la racine invitée, `/proc/self/maps` rendu depuis la table VMA avec des découpes à 4 Kio, réouverture `/proc/self/fd/N` d'un fichier supprimé avec un curseur indépendant. 23 contrôles sur 23. Aucune VM HVF n'est créée.
-4. Les trois choses que le MMU invité donne gratuitement n'existent pas en processus : protection par page de 4 Kio, adresses invitées basses, faute sur page retirée. MESURÉ (annexe A) : sur cette machine `mmap`, `munmap` et `mprotect` arrondissent à 16 Kio, refusent une adresse non alignée sur 16 Kio (EINVAL) et refusent un offset de fichier de 0x1000 (EINVAL). L'équipe FEXCore mesure en plus qu'un `mmap` fixe à 0x400000 échoue (errno 12) et que `__PAGEZERO` ne se réduit pas.
-5. La table `guest_vma_t` et le rendu de `/proc/self/maps` sont du C pur et se reprennent comme vue invitée à 4 Kio. La structure doit être refaite : 4 144 octets par entrée, `memmove` linéaire, 16 384 entrées au plus. Les blocs de support de 2 Mio, les alias de VA, les segments de débordement et le tampon noyau sont à jeter.
-6. ABI. HL parle l'ABI ARM64 générique. Le passage à x86-64 change les numéros, `stat`, les drapeaux `O_*`, `epoll_event`, `clone`, les signaux et une trentaine d'appels hérités. `dirent64`, `statfs`, `rlimit`, `flock`, `sockaddr`, `msghdr`, `timespec` ont la même disposition. FEX envoie 241 appels x86-64 tels quels au noyau hôte, HL n'en implémente que 128 de ces 241 (MESURÉ par comparaison de noms).
-7. Recommandation : une couche syscall x86-64 neuve écrite pour FEXCore, avec import sélectif de HL (vfs, fd, procfs, noms de tâches, traductions de drapeaux et d'errno) et de FEX (structures `x64`, suivi des VMA et du code automodifiable, accès mémoire protégé). Ne pas compiler `LinuxEmulation` de FEX sur une bibliothèque « noyau ARM64 ».
-8. Lacunes face à Wine et EAC : seals de memfd absents, `/proc/<pid>/maps` des autres processus, `/proc/self/task` et `/proc/self/fd` en répertoire, `/proc/self/mem`, `/proc/self/environ`, `mremap`, `process_vm_readv`, `userfaultfd` absents. `madvise`, `mincore`, `msync`, `mlock` sont des stubs. Voir section 5.
-9. Estimation INFÉRÉE : 8 000 à 11 000 lignes écrites ou modifiées, pour environ 10 500 lignes reprises presque sans changement.
-10. Cinq risques : la granularité 4 Kio sur 16 Kio, les adresses basses, la sémantique réelle de `munmap`/`mprotect`/`mremap` en processus, la fidélité de `/proc` et de memfd pour EAC, le partage de mémoire entre processus sans noyau Linux.
+1. READ. HL is an ARM64 Linux kernel written around HVF guest memory. A single host buffer `host_base` of 64 GiB or 1 TiB, guest virtual address = guest physical address = offset in this buffer, level 1 page tables built by the host, 4 KiB guest pages on a 16 KiB host (`guest.h:6-15`, `guest.c:65-66`).
+2. MEASURED (`wc -l`, `nm -u`). 84 files, 40,617 lines. 25 of the 39 compiled objects have no unresolved HVF symbol; the HVF API used fits in 20 functions; the file, I/O, time and procfs handlers only need five guest memory access functions. Reused almost as is: 3,835 lines (9%). To adapt, ABI and memory access: 9,082 (22%). To rewrite: 6,197 (15%). To drop: 7,563 (19%). Process layer, covered in the other report: 13,940 (34%).
+3. MEASURED (appendix C). HL's real objects, linked with a fifteen-line shim that replaces the five guest memory accessors with the identity, run in an ordinary macOS process: `openat` through the rooted vfs, `read`, `write`, `fstat`, `getdents64`, symbolic links resolved inside the guest root, `/proc/self/maps` rendered from the VMA table with 4 KiB splits, reopening `/proc/self/fd/N` of a deleted file with an independent cursor. 23 checks out of 23. No HVF VM is created.
+4. The three things that the guest MMU gives for free do not exist in a process: per-page protection at 4 KiB, low guest addresses, fault on a removed page. MEASURED (appendix A): on this machine `mmap`, `munmap` and `mprotect` round to 16 KiB, refuse an address not aligned on 16 KiB (EINVAL) and refuse a file offset of 0x1000 (EINVAL). The FEXCore team additionally measures that a fixed `mmap` at 0x400000 fails (errno 12) and that `__PAGEZERO` cannot be shrunk.
+5. The `guest_vma_t` table and the rendering of `/proc/self/maps` are pure C and can be reused as a 4 KiB guest view. The structure must be redone: 4,144 bytes per entry, linear `memmove`, 16,384 entries at most. The 2 MiB backing blocks, the VA aliases, the overflow segments and the kernel buffer are to be thrown away.
+6. ABI. HL speaks the generic ARM64 ABI. Moving to x86-64 changes the numbers, `stat`, the `O_*` flags, `epoll_event`, `clone`, the signals and about thirty legacy calls. `dirent64`, `statfs`, `rlimit`, `flock`, `sockaddr`, `msghdr`, `timespec` have the same layout. FEX sends 241 x86-64 calls as is to the host kernel, HL implements only 128 of these 241 (MEASURED by comparing names).
+7. Recommendation: a new x86-64 syscall layer written for FEXCore, with selective import from HL (vfs, fd, procfs, task names, flag and errno translations) and from FEX (`x64` structures, VMA and self-modifying code tracking, protected memory access). Do not compile FEX's `LinuxEmulation` on top of an "ARM64 kernel" library.
+8. Gaps relative to Wine and EAC: memfd seals missing, `/proc/<pid>/maps` of other processes, `/proc/self/task` and `/proc/self/fd` as directories, `/proc/self/mem`, `/proc/self/environ`, `mremap`, `process_vm_readv`, `userfaultfd` missing. `madvise`, `mincore`, `msync`, `mlock` are stubs. See section 5.
+9. INFERRED estimate: 8,000 to 11,000 lines written or modified, for about 10,500 lines reused almost without change.
+10. Five risks: the 4 KiB granularity on 16 KiB, the low addresses, the real semantics of `munmap`/`mprotect`/`mremap` in a process, the fidelity of `/proc` and memfd for EAC, memory sharing between processes without a Linux kernel.
 
-## 0. Arbre lu, correctifs privés, banc
+## 0. Tree read, private fixes, test bench
 
-### 0.1 État de l'arbre
+### 0.1 State of the tree
 
-LU (`git status --short`, `git diff --stat`, lectures seules) : 33 fichiers suivis modifiés (4 475 insertions, 1 560 suppressions) et 11 fichiers source non suivis, soit 44 chemins utiles. Non suivis : `fault_dump.c/h`, `proc_names.c/h`, `proc_ptrace.c/h`, `signal_notify.h`, `syscall_filemap.c/h`, `syscall_reopen.c/h`. HEAD : 8048a96 « docs: link the public examples sibling ».
+READ (`git status --short`, `git diff --stat`, read-only): 33 tracked files modified (4,475 insertions, 1,560 deletions) and 11 untracked source files, that is 44 useful paths. Untracked: `fault_dump.c/h`, `proc_names.c/h`, `proc_ptrace.c/h`, `signal_notify.h`, `syscall_filemap.c/h`, `syscall_reopen.c/h`. HEAD: 8048a96 "docs: link the public examples sibling".
 
-`README.md` et `CLAUDE.md` ne sont pas modifiés et retardent sur le code. Le README annonce « ~26,000 lines » et « MAP_SHARED treated as MAP_PRIVATE » ; `src/` compte 40 617 lignes et traite le MAP_SHARED de fichier par un vrai mapping hôte (`syscall.c:837-856`). Le code fait foi.
+`README.md` and `CLAUDE.md` are not modified and lag behind the code. The README announces "~26,000 lines" and "MAP_SHARED treated as MAP_PRIVATE"; `src/` counts 40,617 lines and handles file MAP_SHARED with a real host mapping (`syscall.c:837-856`). The code is authoritative.
 
-### 0.2 Ce que les correctifs privés ont changé, et pourquoi
+### 0.2 What the private fixes changed, and why
 
-Les lignes touchées sont insertions plus suppressions de `git diff --stat`. Les raisons viennent des commentaires du code, des noms de tests ajoutés et de `XP/README.md` ; je ne les ai pas rejouées.
+The lines touched are insertions plus deletions from `git diff --stat`. The reasons come from the code comments, the names of the added tests and `XP/README.md`; I did not replay them.
 
-| Sous-système | Fichiers (lignes touchées) | Raison |
+| Subsystem | Files (lines touched) | Reason |
 | --- | --- | --- |
-| Table des mappings invités exacts à 4 Kio, séparée des blocs de support | `guest.c` (562), `guest.h` (73), `syscall.c` (608), `proc_emulation.c` (716), test `test-page-table-pool.c` (240) | Le résolveur d'EAC cherche une ligne `/libc-` ou `libc.so` dans `/proc/self/maps`. L'ancien suivi montrait des blocs anonymes de 2 Mio (`XP/README.md`, section « Lecture de la carte mémoire par EAC »). |
-| Mappings partagés de fichiers sur IPA alignée sur 16 Kio | `syscall_filemap.c/h` (nouveau, 466), `syscall_shm.c` (17), `guest.c` | `syscall_filemap.c:1-3` : les entrées L3 choisissent des pages de 4 Kio pour laisser intactes les pages privées voisines sur un hôte à 16 Kio. |
-| Réouverture de `/proc/self/fd/N` avec une description de fichier indépendante | `syscall_reopen.c/h` (nouveau, 361), `proc_emulation.c`, `syscall_fs.c` (45), `syscall_io.c` (415) | La réouverture par `dup` partageait la position laissée en fin de fichier ; la lecture de l'en-tête ELF de 832 octets du memfd renvoyait zéro (`XP/README.md`, même section). |
-| Registre des tâches partagé dans la famille de fork | `proc_names.c/h` (nouveau, 539), `syscall_proc.c` (991), `proc_emulation.c` | `/proc/<tid>/comm`, `status`, `cmdline`, `exe` d'un autre processus ; allocateur de PID commun (`syscall_proc.c:76-113`). |
-| Résolution de chemins dans l'espace de noms invité | `vfs.c` (334), `syscall_fs.c` (45), test `test-vfs-unit.c` (136) | Un préfixe Wine contient des liens absolus qui doivent repartir de la racine invitée. Tests : « absolute interior link crosses guest root », « dotdot is evaluated after following an interior link », « forty-one interior links return ELOOP ». |
-| Bas de l'espace invité rendu à l'invité | `hl.c` (60), `shim.S` (22), `stack.c` (8), `vdso.c` (7), `guest.c`, test `test-guard-page.c` (160) | Shim EL1 et pool de tables de pages déplacés en haut du tampon (`guest.c:83-89`, `guest.c:171-176`). Commentaire du diff : les MAP_FIXED invités peuvent utiliser le bas de l'espace « as Wine does for its DOS area ». |
-| Pont ptrace x86, signaux, threads, fork | `proc_ptrace.c/h` (nouveau, 922), `fork_ipc.c` (457), `syscall_signal.c` (444), `thread.c` (392), `fault_dump.c/h`, `signal_notify.h` | Hors périmètre ici (`XP/STATUS.md`, `hl-reuse-process.md`). |
-| Petits correctifs d'ABI | `stack.c` (UID/GID réels dans l'auxv), `syscall_fs.c` (types de verrous `fcntl` convertis vers les valeurs macOS) | Lu dans `git diff`. |
+| Table of exact guest mappings at 4 KiB, separate from the backing blocks | `guest.c` (562), `guest.h` (73), `syscall.c` (608), `proc_emulation.c` (716), test `test-page-table-pool.c` (240) | EAC's resolver looks for a `/libc-` or `libc.so` line in `/proc/self/maps`. The old tracking showed anonymous 2 MiB blocks (`XP/README.md`, section "EAC reading the memory map"). |
+| Shared file mappings on a 16 KiB aligned IPA | `syscall_filemap.c/h` (new, 466), `syscall_shm.c` (17), `guest.c` | `syscall_filemap.c:1-3`: the L3 entries choose 4 KiB pages to leave the neighboring private pages intact on a 16 KiB host. |
+| Reopening `/proc/self/fd/N` with an independent file description | `syscall_reopen.c/h` (new, 361), `proc_emulation.c`, `syscall_fs.c` (45), `syscall_io.c` (415) | Reopening by `dup` shared the position left at end of file; reading the 832-byte ELF header of the memfd returned zero (`XP/README.md`, same section). |
+| Task registry shared within the fork family | `proc_names.c/h` (new, 539), `syscall_proc.c` (991), `proc_emulation.c` | `/proc/<tid>/comm`, `status`, `cmdline`, `exe` of another process; common PID allocator (`syscall_proc.c:76-113`). |
+| Path resolution in the guest namespace | `vfs.c` (334), `syscall_fs.c` (45), test `test-vfs-unit.c` (136) | A Wine prefix contains absolute links that must restart from the guest root. Tests: "absolute interior link crosses guest root", "dotdot is evaluated after following an interior link", "forty-one interior links return ELOOP". |
+| Bottom of the guest space given back to the guest | `hl.c` (60), `shim.S` (22), `stack.c` (8), `vdso.c` (7), `guest.c`, test `test-guard-page.c` (160) | EL1 shim and page table pool moved to the top of the buffer (`guest.c:83-89`, `guest.c:171-176`). Diff comment: guest MAP_FIXED can use the bottom of the space "as Wine does for its DOS area". |
+| x86 ptrace bridge, signals, threads, fork | `proc_ptrace.c/h` (new, 922), `fork_ipc.c` (457), `syscall_signal.c` (444), `thread.c` (392), `fault_dump.c/h`, `signal_notify.h` | Out of scope here (`XP/STATUS.md`, `hl-reuse-process.md`). |
+| Small ABI fixes | `stack.c` (real UID/GID in the auxv), `syscall_fs.c` (`fcntl` lock types converted to the macOS values) | Read in `git diff`. |
 
-### 0.3 Banc réutilisé
+### 0.3 Test bench reused
 
-MESURÉ. La tentative précédente a copié HL dans `EXP/scratch-hl/hyper-linux-copy` (manifeste sha256 identique avant et après, `EXP/evidence/hl-source-manifest-before.sha256` et `-after.sha256`). Le script `EXP/tools/build-hl-scratch.sh` compile les 39 sources C avec les drapeaux du Makefile amont : `EXP/logs/hl-compile.log` est vide (aucun avertissement, aucune erreur), 39 objets, `_build/hl` lié (488 944 octets, non signé, non lancé). Je n'ai créé aucune VM HVF et je n'ai lancé aucun invité.
+MEASURED. The previous attempt copied HL into `EXP/scratch-hl/hyper-linux-copy` (sha256 manifest identical before and after, `EXP/evidence/hl-source-manifest-before.sha256` and `-after.sha256`). The script `EXP/tools/build-hl-scratch.sh` compiles the 39 C sources with the upstream Makefile's flags: `EXP/logs/hl-compile.log` is empty (no warning, no error), 39 objects, `_build/hl` linked (488,944 bytes, unsigned, not launched). I created no HVF VM and I launched no guest.
 
-Les huit tests purs hôte de `EXP/tools/build-run-host-tests.sh` ont été relancés pendant cette session depuis les binaires du scratch, sortie envoyée dans le répertoire temporaire de la session : `test-fd-object-lite`, `test-vfs-unit`, `test-app-open`, `test-oss-abi`, `test-fd-digest`, `test-aot-format`, `test-thread-vcpu-lifetime`, `test-page-table-pool`, tous code 0 et ligne finale `PASS`. Les journaux d'origine sont dans `EXP/logs/host-test-*.log`, leur contenu concorde. Le test `host-build-test-thread-vcpu-lifetime-asis.log` échoue à l'édition de liens (`_proc_trace_tracer_exit` non défini) quand on le construit comme le Makefile amont : la copie de travail n'est pas cohérente avec son propre test hôte, contournée dans le scratch par `scratch-hl/stub-trace.c`.
+The eight pure host tests of `EXP/tools/build-run-host-tests.sh` were rerun during this session from the scratch binaries, output sent to the session's temporary directory: `test-fd-object-lite`, `test-vfs-unit`, `test-app-open`, `test-oss-abi`, `test-fd-digest`, `test-aot-format`, `test-thread-vcpu-lifetime`, `test-page-table-pool`, all code 0 and final line `PASS`. The original logs are in `EXP/logs/host-test-*.log`, their contents agree. The test `host-build-test-thread-vcpu-lifetime-asis.log` fails at link time (`_proc_trace_tracer_exit` undefined) when built like the upstream Makefile does: the working copy is not consistent with its own host test, worked around in the scratch by `scratch-hl/stub-trace.c`.
 
-## 1. Architecture du coeur telle qu'implémentée
+## 1. Architecture of the core as implemented
 
-### 1.1 Mémoire invitée
+### 1.1 Guest memory
 
-LU. Un `mmap(MAP_ANON)` unique de 64 Gio (IPA 36 bits) ou 1 Tio (IPA 40 bits) sert de mémoire physique invitée, mappé d'un bloc en RWX dans le stage 2 (`guest.c:293-439`, `hv_vm_map` en 392-393). `GUEST_IPA_BASE` vaut 0 (`guest.h:95`) : adresse invitée = adresse physique invitée = décalage dans le tampon. Pour le fork COW, le tampon est remplacé par un fichier `mkstemp` mappé `MAP_SHARED|MAP_FIXED` (`guest.c:361-380`) et l'enfant le mappe `MAP_PRIVATE` (`guest.c:441-501`).
+READ. A single `mmap(MAP_ANON)` of 64 GiB (36-bit IPA) or 1 TiB (40-bit IPA) serves as guest physical memory, mapped in one block as RWX in stage 2 (`guest.c:293-439`, `hv_vm_map` at 392-393). `GUEST_IPA_BASE` is 0 (`guest.h:95`): guest address = guest physical address = offset in the buffer. For COW fork, the buffer is replaced by a `mkstemp` file mapped `MAP_SHARED|MAP_FIXED` (`guest.c:361-380`) and the child maps it `MAP_PRIVATE` (`guest.c:441-501`).
 
-Le MMU invité est celui du vCPU : tables de pages de niveau 1 écrites par l'hôte dans un pool de 16 Mio à la fin du tampon (`guest.h:36`, `guest.c:171-176`), descripteurs de bloc de 2 Mio par défaut (`guest_build_page_tables`, `guest.c:1588-1689`), éclatés en 512 descripteurs L3 de 4 Kio quand les droits diffèrent (`split_l2_block`, `guest.c:2007`, `guest_update_perms`, `guest.c:2314`, `guest_map_pages`, `guest.c:2071`). HVF impose W^X, d'où deux arènes : RX à 0x10000000 et RW à 0x200000000 (`guest.h:41-61`, `syscall.c:997-1048`). Le shim EL1 et les pages de pile EL1 sont 32 Mio sous la fin du tampon (`guest.c:83-89`).
+The guest MMU is the vCPU's: level 1 page tables written by the host in a 16 MiB pool at the end of the buffer (`guest.h:36`, `guest.c:171-176`), 2 MiB block descriptors by default (`guest_build_page_tables`, `guest.c:1588-1689`), split into 512 L3 descriptors of 4 KiB when the permissions differ (`split_l2_block`, `guest.c:2007`, `guest_update_perms`, `guest.c:2314`, `guest_map_pages`, `guest.c:2071`). HVF enforces W^X, hence two arenas: RX at 0x10000000 and RW at 0x200000000 (`guest.h:41-61`, `syscall.c:997-1048`). The EL1 shim and the EL1 stack pages are 32 MiB below the end of the buffer (`guest.c:83-89`).
 
-4 Kio invités sur 16 Kio hôte. `PAGE_SIZE` est redéfini à 4096 dans `guest.c:65-66` et l'auxv annonce `AT_PAGESZ` = 4096 (`stack.c:257`). Les droits que l'invité voit sont ceux des PTE de 4 Kio ; le noyau hôte ne voit qu'un seul gros mapping RWX. La taille de page hôte n'intervient que pour les mémoires externes branchées par `hv_vm_map` : l'IPA et la taille doivent être multiples de 16 Kio (`syscall_filemap.c:220-224`).
+4 KiB guest on 16 KiB host. `PAGE_SIZE` is redefined to 4096 in `guest.c:65-66` and the auxv announces `AT_PAGESZ` = 4096 (`stack.c:257`). The permissions the guest sees are those of the 4 KiB PTEs; the host kernel sees only a single large RWX mapping. The host page size only comes into play for external memory plugged in by `hv_vm_map`: the IPA and the size must be multiples of 16 KiB (`syscall_filemap.c:220-224`).
 
-Traduction d'un pointeur invité (`gva_resolve`, `guest.c:821-878`), dans l'ordre : résolveurs externes (SysV SHM et mappings de fichiers, 8 au plus, `guest.c:795-819`) ; chemin rapide `host_base + gva` ; fenêtre du tampon noyau de Rosetta (`KBUF_VA_BASE`, `guest.h:76-88`) ; rejet de l'espace non canonique ; marche des tables de pages (`guest_walk_pt`, `guest.c:748-787`) ; segments de débordement (`guest_overflow_resolve`, `guest.c:590-597`). `guest_read`, `guest_write` et `guest_read_str` découpent la copie en segments de page (`guest.c:888-948`). MESURÉ (`grep -o`, appels de fonction seulement) : 269 appels à `guest_ptr`, `guest_ptr_avail`, `guest_read`, `guest_write`, `guest_read_str` ou `guest_gpa_ptr` dans 20 fichiers hors `guest.c` ; 57 dans `syscall_fs.c`, 40 dans `syscall_net.c`, 26 dans `syscall_io.c`, 25 dans `audio_oss.c`, 18 dans `syscall_proc.c`, 17 dans `syscall.c`. Les handlers n'accèdent à la mémoire invitée que par ces fonctions, ce qui rend possible un remplacement par des copies protégées sans toucher aux sites d'appel. Les références directes à `host_base` ou `gva_resolve` (lignes de grep) sont dans le code de chargement et de mémoire : `hl.c` 9, `syscall.c` 8 (mmap, brk, munmap), `syscall_exec.c` 6, `vdso.c` 5, et 3 chacun dans `fork_ipc.c`, `rosetta.c`, `syscall_filemap.c`, `syscall_shm.c`. Aucun handler de fichiers, de réseau ou d'I/O n'en contient.
+Translation of a guest pointer (`gva_resolve`, `guest.c:821-878`), in order: external resolvers (SysV SHM and file mappings, 8 at most, `guest.c:795-819`); fast path `host_base + gva`; Rosetta's kernel buffer window (`KBUF_VA_BASE`, `guest.h:76-88`); rejection of non-canonical space; page table walk (`guest_walk_pt`, `guest.c:748-787`); overflow segments (`guest_overflow_resolve`, `guest.c:590-597`). `guest_read`, `guest_write` and `guest_read_str` split the copy into page segments (`guest.c:888-948`). MEASURED (`grep -o`, function calls only): 269 calls to `guest_ptr`, `guest_ptr_avail`, `guest_read`, `guest_write`, `guest_read_str` or `guest_gpa_ptr` in 20 files outside `guest.c`; 57 in `syscall_fs.c`, 40 in `syscall_net.c`, 26 in `syscall_io.c`, 25 in `audio_oss.c`, 18 in `syscall_proc.c`, 17 in `syscall.c`. The handlers access guest memory only through these functions, which makes a replacement by protected copies possible without touching the call sites. The direct references to `host_base` or `gva_resolve` (grep lines) are in the loading and memory code: `hl.c` 9, `syscall.c` 8 (mmap, brk, munmap), `syscall_exec.c` 6, `vdso.c` 5, and 3 each in `fork_ipc.c`, `rosetta.c`, `syscall_filemap.c`, `syscall_shm.c`. No file, network or I/O handler contains any.
 
-Zéro et libération. Un `mmap` anonyme fait un `memset` du tampon (`syscall.c:1103-1105`, `syscall.c:972-973`) parce que `munmap` ne rend rien à l'hôte : il met à zéro les régions non PROT_NONE, retire la région et laisse les PTE du bas de l'espace valides (`syscall.c:1385-1515`, commentaire de l'auteur `syscall.c:1458-1470`). Un accès après `munmap` lit donc des zéros au lieu de lever SIGSEGV dans le bas de l'espace. `mprotect(PROT_NONE)` invalide les PTE (`guest_invalidate_ptes`, `syscall.c:1593-1596`).
+Zeroing and release. An anonymous `mmap` does a `memset` of the buffer (`syscall.c:1103-1105`, `syscall.c:972-973`) because `munmap` gives nothing back to the host: it zeroes the non-PROT_NONE regions, removes the region and leaves the PTEs of the bottom of the space valid (`syscall.c:1385-1515`, author's comment `syscall.c:1458-1470`). An access after `munmap` therefore reads zeros instead of raising SIGSEGV in the bottom of the space. `mprotect(PROT_NONE)` invalidates the PTEs (`guest_invalidate_ptes`, `syscall.c:1593-1596`).
 
-Fichiers. Un `mmap` de fichier `MAP_PRIVATE` est un `pread` dans le tampon (`syscall.c:1112-1117`, `syscall.c:974-982`). Seul le `MAP_SHARED` de fichier fait un vrai `mmap` hôte, branché par `hv_vm_map` dans une fenêtre d'IPA entre `mmap_limit + 2 Gio` et `interp_base`, puis sélectionné page par page par des PTE (`syscall_filemap.c:210-298`). Un `MAP_SHARED|MAP_ANONYMOUS` est traité comme privé (`syscall.c:837`, `syscall.c:1120-1121`).
+Files. A `MAP_PRIVATE` file `mmap` is a `pread` into the buffer (`syscall.c:1112-1117`, `syscall.c:974-982`). Only file `MAP_SHARED` does a real host `mmap`, plugged in by `hv_vm_map` in an IPA window between `mmap_limit + 2 Gio` and `interp_base`, then selected page by page by PTEs (`syscall_filemap.c:210-298`). A `MAP_SHARED|MAP_ANONYMOUS` is treated as private (`syscall.c:837`, `syscall.c:1120-1121`).
 
-### 1.2 VMA et suivi côté hôte
+### 1.2 VMAs and host-side tracking
 
-Trois structures indépendantes dans `guest_t` (`guest.h:259-264`) :
+Three independent structures in `guest_t` (`guest.h:259-264`):
 
-1. `regions[]` (`guest_region_t`, 4096 entrées triées, 112 octets). Allocateur de blocs de support en espace physique : `find_free_gap` (`syscall.c:519-570`), fusion des voisines anonymes (`regions_mergeable`, `guest.c:1247`). Alimente aussi `VmSize` de `/proc/self/status` et le zéro-fill de `guest_reset`. Propre au modèle physique.
-2. `va_ranges[]` (4096 entrées). Réservations exactes de VA hautes, créées pour les mappings de Rosetta à 128 Tio (`guest_track_high_mapping`, `guest.c:130-146`).
-3. `vmas` (`guest_vma_t`, tableau dynamique, 16 384 entrées au plus). Mappings exacts visibles par l'invité : début, fin, offset, inode, dev, droits, drapeaux, chemin de 4096 octets (`guest.h:203-211`, 4 144 octets par entrée). Opérations `guest_vma_replace`, `guest_vma_remove`, `guest_vma_protect` avec découpe, et `vma_merge` des voisines compatibles (`guest.c:1107-1205`). Chaque `mmap` réussi appelle `record_mmap_vma` (`syscall.c:1163-1179`), `munmap` appelle `guest_vma_remove` (`syscall.c:1511`), `mprotect` appelle `guest_vma_protect` (`syscall.c:1635`).
+1. `regions[]` (`guest_region_t`, 4096 sorted entries, 112 bytes). Allocator of backing blocks in physical space: `find_free_gap` (`syscall.c:519-570`), merging of anonymous neighbors (`regions_mergeable`, `guest.c:1247`). Also feeds `VmSize` of `/proc/self/status` and the zero-fill of `guest_reset`. Specific to the physical model.
+2. `va_ranges[]` (4096 entries). Exact reservations of high VAs, created for Rosetta's mappings at 128 TiB (`guest_track_high_mapping`, `guest.c:130-146`).
+3. `vmas` (`guest_vma_t`, dynamic array, 16,384 entries at most). Exact mappings visible to the guest: start, end, offset, inode, dev, permissions, flags, 4096-byte path (`guest.h:203-211`, 4,144 bytes per entry). Operations `guest_vma_replace`, `guest_vma_remove`, `guest_vma_protect` with splitting, and `vma_merge` of compatible neighbors (`guest.c:1107-1205`). Each successful `mmap` calls `record_mmap_vma` (`syscall.c:1163-1179`), `munmap` calls `guest_vma_remove` (`syscall.c:1511`), `mprotect` calls `guest_vma_protect` (`syscall.c:1635`).
 
-Autres tables : `va_aliases[16]`, `overflow[4]` de 1 Gio, `preannounced[16]`, `pt_free_list[256]`, 256 supports et 2 048 vues de fichiers dans `syscall_filemap.h:7-8`. Ces plafonds fixes viennent du modèle physique.
+Other tables: `va_aliases[16]`, `overflow[4]` of 1 GiB, `preannounced[16]`, `pt_free_list[256]`, 256 backings and 2,048 file views in `syscall_filemap.h:7-8`. These fixed caps come from the physical model.
 
-### 1.3 vfs et racine de l'invité
+### 1.3 vfs and guest root
 
-LU, `vfs.c` (751 lignes) et `vfs.h` :
+READ, `vfs.c` (751 lines) and `vfs.h`:
 
-- Table de montages de 64 entrées `guest_prefix` vers `host_path`, drapeaux RO, NOEXEC, NOSUID, VIRTUAL (`vfs.h:17-39`). Le préfixe le plus long gagne (`find_mount`, `vfs.c:264-282`). Deux modes : `legacy` (aucune réécriture) et `rooted` (`vfs.h:21-24`).
-- CWD virtuel, jamais de `chdir` hôte en mode rooted (`vfs.c:646-670`). Carte inverse hôte vers invité (`hl_vfs_host_to_guest`, `vfs.c:610-644`). Racine et ancêtres de montages synthétiques (`vfs.c:293-302`, `vfs.c:362-415`).
-- Le résolveur avance composant par composant. Un lien symbolique intérieur est résolu dans l'espace de noms invité (un lien absolu repart de `/` invité), avec 40 liens au plus et ELOOP (`vfs.c:511-608`). Les noms trop longs donnent ENAMETOOLONG au lieu d'être tronqués (`vfs.c:284-291`). Le confinement canonicalise le parent avec `realpath` (`vfs.c:315-353`) et `sys_openat` ouvre ensuite sous la racine du montage avec `O_RESOLVE_BENEATH` (`syscall_fs.c:485-594`, drapeau défini dans le SDK macOS, `sys/fcntl.h:128`).
-- La sysroot est un champ séparé (`vfs.h:47`) avec un repli par nom de base pour les chemins Nix (`resolve_sysroot_path`, `syscall_fs.c:107-134`). Le lanceur de l'expérience monte la racine Debian en lecture seule sur `/`, puis `prefix`, `tmp`, `home`, un répertoire hôte `proc` sur `/proc` et `/run/user/UID` (`XP/run-linux.py`).
-- `/dev` et `/proc` : `sys_openat` essaie d'abord le registre de périphériques, la réouverture procfd et `proc_intercept_open` sur la chaîne du chemin, avant toute résolution (`syscall_fs.c:451-473`). `hl_vfs_apply_app_profile` déclare en plus `/dev` et `/proc` comme montages VIRTUAL (`vfs.c:732-733`).
-- Aucun appel HVF, aucun pointeur invité. Seule dépendance : `syscall.h` pour les constantes `LINUX_*` et `fd_table` (`vfs.c:438-446`), et `syscall.h` inclut `Hypervisor.h` (`syscall.h:9`), dépendance d'en-tête.
-- Non vérifié : APFS est insensible à la casse par défaut et le résolveur ne replie pas la casse. Wine sait faire sa propre recherche insensible à la casse, mais la sysroot est sur le volume de l'utilisateur ; à mesurer.
+- 64-entry mount table `guest_prefix` to `host_path`, flags RO, NOEXEC, NOSUID, VIRTUAL (`vfs.h:17-39`). The longest prefix wins (`find_mount`, `vfs.c:264-282`). Two modes: `legacy` (no rewriting) and `rooted` (`vfs.h:21-24`).
+- Virtual CWD, never a host `chdir` in rooted mode (`vfs.c:646-670`). Reverse map host to guest (`hl_vfs_host_to_guest`, `vfs.c:610-644`). Synthetic root and mount ancestors (`vfs.c:293-302`, `vfs.c:362-415`).
+- The resolver advances component by component. An interior symbolic link is resolved in the guest namespace (an absolute link restarts from guest `/`), with 40 links at most and ELOOP (`vfs.c:511-608`). Names that are too long give ENAMETOOLONG instead of being truncated (`vfs.c:284-291`). Confinement canonicalizes the parent with `realpath` (`vfs.c:315-353`) and `sys_openat` then opens under the mount root with `O_RESOLVE_BENEATH` (`syscall_fs.c:485-594`, flag defined in the macOS SDK, `sys/fcntl.h:128`).
+- The sysroot is a separate field (`vfs.h:47`) with a basename fallback for Nix paths (`resolve_sysroot_path`, `syscall_fs.c:107-134`). The experiment's launcher mounts the Debian root read-only on `/`, then `prefix`, `tmp`, `home`, a host `proc` directory on `/proc` and `/run/user/UID` (`XP/run-linux.py`).
+- `/dev` and `/proc`: `sys_openat` first tries the device registry, the procfd reopen and `proc_intercept_open` on the path string, before any resolution (`syscall_fs.c:451-473`). `hl_vfs_apply_app_profile` additionally declares `/dev` and `/proc` as VIRTUAL mounts (`vfs.c:732-733`).
+- No HVF call, no guest pointer. Only dependency: `syscall.h` for the `LINUX_*` constants and `fd_table` (`vfs.c:438-446`), and `syscall.h` includes `Hypervisor.h` (`syscall.h:9`), a header dependency.
+- Not checked: APFS is case-insensitive by default and the resolver does not fold case. Wine can do its own case-insensitive lookup, but the sysroot is on the user's volume; to measure.
 
-### 1.4 Objets fd
+### 1.4 fd objects
 
-LU. Trois niveaux :
+READ. Three levels:
 
-- `fd_table[1024]` (`syscall.h:601`, `syscall.c:82`), entrée `{type, host_fd, linux_flags, dir, of, desc}` (`syscall.h:623-630`). Allocation du plus petit numéro libre par bitmap (`syscall.c:88-96`, `syscall.c:149-171`). Les fichiers procfd sont alloués à partir de 128 (`syscall_fs.c:466`), ce qui s'écarte de la règle Linux du plus petit descripteur libre.
-- `hl_descriptor_t` par numéro de descripteur : compteur, `host_fd`, drapeaux CLOEXEC, marque `removed` (`fd_object.h:111-119`).
-- `hl_open_file_t` par description ouverte : compteur, genre, table d'opérations, `status_flags` atomique, état, `mount_id`, `guest_path_hint` (`fd_object.h:98-107`). Table `hl_fd_ops_t` : `read, write, readv, writev, ioctl, lseek, fstat, fcntl_getfl/setfl, poll_host_fd, destroy, fork_export, fork_import` (`fd_object.h:72-96`). `hl_fd_get` épingle la description pour la durée d'un appel (`fd_object.h:121-128`). `dup`, `dup3` et `F_DUPFD` partagent la description (`fd_object.c:339-440`).
+- `fd_table[1024]` (`syscall.h:601`, `syscall.c:82`), entry `{type, host_fd, linux_flags, dir, of, desc}` (`syscall.h:623-630`). Allocation of the lowest free number by bitmap (`syscall.c:88-96`, `syscall.c:149-171`). Procfd files are allocated from 128 (`syscall_fs.c:466`), which departs from the Linux lowest-free-descriptor rule.
+- `hl_descriptor_t` per descriptor number: counter, `host_fd`, CLOEXEC flags, `removed` mark (`fd_object.h:111-119`).
+- `hl_open_file_t` per open description: counter, kind, operations table, atomic `status_flags`, state, `mount_id`, `guest_path_hint` (`fd_object.h:98-107`). `hl_fd_ops_t` table: `read, write, readv, writev, ioctl, lseek, fstat, fcntl_getfl/setfl, poll_host_fd, destroy, fork_export, fork_import` (`fd_object.h:72-96`). `hl_fd_get` pins the description for the duration of a call (`fd_object.h:121-128`). `dup`, `dup3` and `F_DUPFD` share the description (`fd_object.c:339-440`).
 
-Genres : stdio, fichier, répertoire, pipe, socket, epoll, timerfd, eventfd, signalfd, inotify, répertoire virtuel, OSS dsp et mixer, périphérique (`syscall.h:603-614`). Pipes et sockets sont des descripteurs hôte. Émulations : eventfd par pipe et compteur, timerfd par `kqueue` EVFILT_TIMER, signalfd par lectures synthétiques (`syscall_fd.c:1-8`), epoll par `kqueue` (`syscall_poll.c:1-8`), inotify par `kqueue` EVFILT_VNODE (`syscall_inotify.c:1-20`). Leur état est indexé par le numéro invité, d'où `fd_special_subsystem_close` pour chaque chemin qui libère un numéro (`syscall_fs.c:649-657`).
+Kinds: stdio, file, directory, pipe, socket, epoll, timerfd, eventfd, signalfd, inotify, virtual directory, OSS dsp and mixer, device (`syscall.h:603-614`). Pipes and sockets are host descriptors. Emulations: eventfd by pipe and counter, timerfd by `kqueue` EVFILT_TIMER, signalfd by synthetic reads (`syscall_fd.c:1-8`), epoll by `kqueue` (`syscall_poll.c:1-8`), inotify by `kqueue` EVFILT_VNODE (`syscall_inotify.c:1-20`). Their state is indexed by the guest number, hence `fd_special_subsystem_close` for every path that frees a number (`syscall_fs.c:649-657`).
 
-memfd : `mkstemp`, `unlink`, `fd_alloc(FD_REGULAR)`, seul `MFD_CLOEXEC` est lu, le nom est ignoré (`syscall.c:2385-2398`). Pas de scellement : `grep -i seal` ne trouve rien dans `src/`. Réouverture procfd : `syscall_reopen.c` crée une description indépendante dont le curseur vit dans un fichier d'état partagé et verrouillé (`reopen_shared_t`, `syscall_reopen.c:20-30`), exportable au fork par `hl_reopen_export_state_fd` (`syscall_reopen.h:16-20`).
+memfd: `mkstemp`, `unlink`, `fd_alloc(FD_REGULAR)`, only `MFD_CLOEXEC` is read, the name is ignored (`syscall.c:2385-2398`). No sealing: `grep -i seal` finds nothing in `src/`. Procfd reopen: `syscall_reopen.c` creates an independent description whose cursor lives in a shared, locked state file (`reopen_shared_t`, `syscall_reopen.c:20-30`), exportable at fork through `hl_reopen_export_state_fd` (`syscall_reopen.h:16-20`).
 
-Verrous : `fd_lock` de rang 3 après `mmap_lock` et `pt_lock` (`syscall_internal.h:10-38`).
+Locks: `fd_lock` of rank 3 after `mmap_lock` and `pt_lock` (`syscall_internal.h:10-38`).
 
-### 1.5 Identité de processus
+### 1.5 Process identity
 
-LU.
+READ.
 
-- Le processus racine a le PID 1 et le PPID 0 (`proc_init`, `syscall_proc.c:355-361`). Le TID du thread principal est le PID. `gettid` renvoie `current_thread->guest_tid` (`syscall.c:1362-1364`), `getpgid` renvoie le PID (`syscall.c:1823-1825`), `getuid` et `getgid` renvoient ceux de l'hôte (`syscall.c:1665-1676`).
-- PID et TID viennent du même compteur. Il vit dans une page `MAP_SHARED` d'un fichier `mkstemp` supprimé, initialisé à 2, incrémenté par `compare_exchange`, plafond `GUEST_PID_MAX` = 0x3fffffff (sous le bit propriétaire de futex), sans rebouclage (`syscall_proc.c:76-113`, `syscall_proc.c:516-529`). Le descripteur est exporté vers l'enfant au fork (`fork_ipc.c:1847`) et importé avant tout thread invité (`fork_ipc.c:539`, `syscall_proc.c:538-562`). Les trois formes de clone appellent `proc_alloc_pid` (`fork_ipc.c:1295`, `1573`, `2614`).
-- Un enfant de fork reçoit `proc_set_identity(child_pid, parent_pid)` (`fork_ipc.c:530`, `1219`). Le PID ne change pas à l'exec ; l'allocateur et le registre survivent (`proc_names.h:15-17`).
-- Le registre `proc_names` est un fichier partagé avec verrous POSIX, en-tête versionné 4, un enregistrement par tâche `{tid, tgid, ppid, comm[16]}`, un instantané d'exec (chemin absolu et octets de `cmdline`), la relation de traçage et l'état zombie (`proc_names.h:8-60`, `proc_names.c:15-60`). Il sert `/proc/<tid>/{comm,status,cmdline,exe}` d'un autre processus (`proc_emulation.c:84-183`, `402-446`).
-- Correspondance PID invité et PID hôte : `proc_table[64]` `{host_pid, guest_pid, exited, exit_status}` (`syscall_proc.h:99-106`), donc 64 enfants vivants au plus par processus.
-- `prctl(PR_SET_NAME)` écrit dans le registre (`syscall.c:1834-1848`). `uname` annonce `Linux`, nœud `hl`, version `6.8.0-101-generic`, machine `aarch64` (`syscall_sys.c:28-45`).
+- The root process has PID 1 and PPID 0 (`proc_init`, `syscall_proc.c:355-361`). The TID of the main thread is the PID. `gettid` returns `current_thread->guest_tid` (`syscall.c:1362-1364`), `getpgid` returns the PID (`syscall.c:1823-1825`), `getuid` and `getgid` return the host's (`syscall.c:1665-1676`).
+- PID and TID come from the same counter. It lives in a `MAP_SHARED` page of a deleted `mkstemp` file, initialized to 2, incremented by `compare_exchange`, cap `GUEST_PID_MAX` = 0x3fffffff (below the futex owner bit), without wraparound (`syscall_proc.c:76-113`, `syscall_proc.c:516-529`). The descriptor is exported to the child at fork (`fork_ipc.c:1847`) and imported before any guest thread (`fork_ipc.c:539`, `syscall_proc.c:538-562`). The three forms of clone call `proc_alloc_pid` (`fork_ipc.c:1295`, `1573`, `2614`).
+- A fork child receives `proc_set_identity(child_pid, parent_pid)` (`fork_ipc.c:530`, `1219`). The PID does not change at exec; the allocator and the registry survive (`proc_names.h:15-17`).
+- The `proc_names` registry is a shared file with POSIX locks, header version 4, one record per task `{tid, tgid, ppid, comm[16]}`, an exec snapshot (absolute path and `cmdline` bytes), the tracing relation and the zombie state (`proc_names.h:8-60`, `proc_names.c:15-60`). It serves `/proc/<tid>/{comm,status,cmdline,exe}` of another process (`proc_emulation.c:84-183`, `402-446`).
+- Mapping between guest PID and host PID: `proc_table[64]` `{host_pid, guest_pid, exited, exit_status}` (`syscall_proc.h:99-106`), so 64 live children at most per process.
+- `prctl(PR_SET_NAME)` writes into the registry (`syscall.c:1834-1848`). `uname` announces `Linux`, node `hl`, version `6.8.0-101-generic`, machine `aarch64` (`syscall_sys.c:28-45`).
 
-### 1.6 Couplage mesuré par symboles non résolus
+### 1.6 Coupling measured by unresolved symbols
 
-MESURÉ. `nm -u` sur les 39 objets de `EXP/scratch-hl/hyper-linux-copy/_build/obj` (compilés sans exécution, voir 0.3). Cette mesure remplace l'impression que donnent les mentions dans le texte.
+MEASURED. `nm -u` on the 39 objects of `EXP/scratch-hl/hyper-linux-copy/_build/obj` (compiled without execution, see 0.3). This measurement replaces the impression given by mentions in the text.
 
-- 25 objets sur 39 n'ont aucun symbole `_hv_*` non résolu : `app_open`, `audio`, `audio_coreaudio`, `audio_oss`, `device`, `elf`, `fd_object`, `futex`, `proc_emulation`, `proc_names`, `proc_ptrace`, `stack`, `syscall_fd`, `syscall_fs`, `syscall_inotify`, `syscall_io`, `syscall_net`, `syscall_poll`, `syscall_reopen`, `syscall_stats`, `syscall_sys`, `syscall_time`, `trace`, `vdso`, `vfs`.
-- Les 14 autres appellent HVF : `guest` (9 fonctions), `thread` (8), `gdb_stub` (7), `syscall_proc` (7), `syscall_signal` (6), `fork_ipc` (5), `hl` (4), `syscall_exec` (4), `syscall` (3), `crash_report`, `fault_dump`, `syscall_filemap`, `syscall_shm` (2 chacun), `rosetta` (1). L'API HVF utilisée tient en 20 fonctions distinctes : `hv_vcpu_get_sys_reg`, `hv_vcpu_get_reg`, `hv_vcpu_set_sys_reg`, `hv_vcpu_set_reg`, `hv_vm_map`, `hv_vm_unmap`, `hv_vcpu_get/set_simd_fp_reg`, `hv_vcpus_exit`, `hv_vcpu_create`, `hv_vcpu_destroy`, `hv_vcpu_run`, `hv_vm_create`, `hv_vm_destroy`, `hv_vm_config_*` (4), `hv_vcpu_set_vtimer_mask`, `hv_vcpu_set_trap_debug_exceptions`.
-- Sept objets n'ont aucun symbole non résolu de HVF, de mémoire invitée (`guest_*`), de `proc_*`, de `thread_*` ni de `signal_*` : `vfs`, `fd_object`, `device`, `proc_names`, `syscall_reopen`, `trace`, `syscall_stats`. Ce sont les plus sûrs à reprendre. `syscall_time` reste classé « reprise » : il demande seulement deux accès à la mémoire invitée et `signal_get_itimer` avec `signal_set_itimer`.
-- Les objets de la classe « adapter » (`syscall_fs`, `syscall_io`, `syscall_fd`, `syscall_sys`, `syscall_time`, `proc_emulation`, `stack`, `syscall_net`, `syscall_poll`, `syscall_inotify`) n'ont besoin, côté mémoire invitée, que de cinq fonctions : `guest_write` (10 objets), `guest_read` (9), `guest_read_str` (2), `guest_ptr_avail` (2), `guest_ptr` (2). C'est l'interface minimale du shim en processus.
-- Leurs dépendances vers la couche processus sont courtes. `syscall_fs` : `proc_get_sysroot`, `proc_set_sysroot` et les cinq entrées de `proc_emulation`. `syscall_io` : `proc_get_hl_path`, `proc_get_pid`, `signal_pending`, `signal_queue`, `thread_host_io_begin`, `thread_host_io_end`. `proc_emulation` : `current_thread`, `proc_get_cmdline`, `proc_get_elf_path`, `proc_get_pid`, `proc_get_ppid`, `proc_names_*`, `thread_active_count`. `syscall_fd` : `proc_get_pid`, `signal_consume`, `signal_get_state`.
-- Le reste de `guest.c` est utilisé par 56 symboles au total hors de lui : 5 d'accès aux données, puis les régions (`guest_region_add` dans 6 objets, `guest_region_remove` 3, `guest_region_set_prot`), les PTE (`guest_invalidate_ptes` 4, `guest_update_perms` 3, `guest_map_pages` 2, `guest_extend_page_tables`, `guest_clear_pages`), les mappings hauts (`guest_map_va_range` 2, `guest_track_high_mapping`), le shim (`guest_shim_base` 2, `guest_shim_data_base` 3), `kbuf` (4), la VMA (`guest_vma_reserve` 2, `guest_vma_replace`, `guest_vma_remove`, `guest_vma_protect`) et les points d'entrée `guest_init`, `guest_init_from_shm`, `guest_destroy`, `guest_reset`, `guest_get_used_regions`. Parmi ces groupes, seule la VMA est à conserver ; tout le reste est le modèle de mémoire physique.
+- 25 objects out of 39 have no unresolved `_hv_*` symbol: `app_open`, `audio`, `audio_coreaudio`, `audio_oss`, `device`, `elf`, `fd_object`, `futex`, `proc_emulation`, `proc_names`, `proc_ptrace`, `stack`, `syscall_fd`, `syscall_fs`, `syscall_inotify`, `syscall_io`, `syscall_net`, `syscall_poll`, `syscall_reopen`, `syscall_stats`, `syscall_sys`, `syscall_time`, `trace`, `vdso`, `vfs`.
+- The 14 others call HVF: `guest` (9 functions), `thread` (8), `gdb_stub` (7), `syscall_proc` (7), `syscall_signal` (6), `fork_ipc` (5), `hl` (4), `syscall_exec` (4), `syscall` (3), `crash_report`, `fault_dump`, `syscall_filemap`, `syscall_shm` (2 each), `rosetta` (1). The HVF API used fits in 20 distinct functions: `hv_vcpu_get_sys_reg`, `hv_vcpu_get_reg`, `hv_vcpu_set_sys_reg`, `hv_vcpu_set_reg`, `hv_vm_map`, `hv_vm_unmap`, `hv_vcpu_get/set_simd_fp_reg`, `hv_vcpus_exit`, `hv_vcpu_create`, `hv_vcpu_destroy`, `hv_vcpu_run`, `hv_vm_create`, `hv_vm_destroy`, `hv_vm_config_*` (4), `hv_vcpu_set_vtimer_mask`, `hv_vcpu_set_trap_debug_exceptions`.
+- Seven objects have no unresolved symbol from HVF, guest memory (`guest_*`), `proc_*`, `thread_*` or `signal_*`: `vfs`, `fd_object`, `device`, `proc_names`, `syscall_reopen`, `trace`, `syscall_stats`. They are the safest to reuse. `syscall_time` stays classed as "reuse": it only needs two guest memory accesses and `signal_get_itimer` with `signal_set_itimer`.
+- The objects of the "adapt" class (`syscall_fs`, `syscall_io`, `syscall_fd`, `syscall_sys`, `syscall_time`, `proc_emulation`, `stack`, `syscall_net`, `syscall_poll`, `syscall_inotify`) need, on the guest memory side, only five functions: `guest_write` (10 objects), `guest_read` (9), `guest_read_str` (2), `guest_ptr_avail` (2), `guest_ptr` (2). This is the minimal interface of the in-process shim.
+- Their dependencies on the process layer are short. `syscall_fs`: `proc_get_sysroot`, `proc_set_sysroot` and the five entries of `proc_emulation`. `syscall_io`: `proc_get_hl_path`, `proc_get_pid`, `signal_pending`, `signal_queue`, `thread_host_io_begin`, `thread_host_io_end`. `proc_emulation`: `current_thread`, `proc_get_cmdline`, `proc_get_elf_path`, `proc_get_pid`, `proc_get_ppid`, `proc_names_*`, `thread_active_count`. `syscall_fd`: `proc_get_pid`, `signal_consume`, `signal_get_state`.
+- The rest of `guest.c` is used by 56 symbols in total outside of it: 5 for data access, then the regions (`guest_region_add` in 6 objects, `guest_region_remove` 3, `guest_region_set_prot`), the PTEs (`guest_invalidate_ptes` 4, `guest_update_perms` 3, `guest_map_pages` 2, `guest_extend_page_tables`, `guest_clear_pages`), the high mappings (`guest_map_va_range` 2, `guest_track_high_mapping`), the shim (`guest_shim_base` 2, `guest_shim_data_base` 3), `kbuf` (4), the VMA (`guest_vma_reserve` 2, `guest_vma_replace`, `guest_vma_remove`, `guest_vma_protect`) and the entry points `guest_init`, `guest_init_from_shm`, `guest_destroy`, `guest_reset`, `guest_get_used_regions`. Among these groups, only the VMA is to be kept; everything else is the physical memory model.
 
-### 1.7 Témoin en processus : les handlers de HL tournent sans HVF (MESURÉ)
+### 1.7 In-process witness: HL's handlers run without HVF (MEASURED)
 
-Pour vérifier la thèse « cinq fonctions suffisent » par exécution et non par lecture, j'ai lié les objets réels du scratch (tous sauf `hl.o` et `guest.o`) avec un shim de quinze lignes qui remplace `guest_ptr`, `guest_ptr_avail`, `guest_read`, `guest_write` et `guest_read_str` par l'identité et `memcpy` (annexe C). Les symboles HVF non résolus ne sont jamais appelés (`-Wl,-undefined,dynamic_lookup`). Trois pilotes C, compilés dans le répertoire temporaire de la session, appellent directement les fonctions `sys_*` avec de vrais pointeurs de l'hôte comme « adresses invitées » :
+To check the "five functions are enough" thesis by execution and not by reading, I linked the real objects of the scratch (all except `hl.o` and `guest.o`) with a fifteen-line shim that replaces `guest_ptr`, `guest_ptr_avail`, `guest_read`, `guest_write` and `guest_read_str` with the identity and `memcpy` (appendix C). The unresolved HVF symbols are never called (`-Wl,-undefined,dynamic_lookup`). Three C drivers, compiled in the session's temporary directory, call the `sys_*` functions directly with real host pointers as "guest addresses":
 
-- Pilote 1, 12 contrôles passés : montage du répertoire temporaire sur `/data` en mode rooted, `sys_openat(O_CREAT|O_RDWR)`, `sys_write`, `sys_lseek`, `sys_read`, `sys_fstat` (structure `linux_stat_t` de 128 octets), `sys_close`, `sys_getdents64`, lien symbolique hôte à cible absolue `/data/hello.txt` résolu dans la racine invitée, `ENOENT` renvoyé sous forme `-2`.
-- Pilote 2, 5 contrôles passés : les vraies fonctions `guest_vma_replace`, `guest_vma_protect` et `guest_vma_remove` (extraites de `guest.c:1107-1205` et compilées seules), puis `sys_openat("/proc/self/maps")` et `sys_read`. Le rendu montre les découpes exactes à 4 Kio et le chemin hôte reconverti par le bind :
-  `7f0000001000-7f0000002000 r-xp 00000000 00:00 0   /usr/lib/x86_64-linux-gnu/libc.so.6` puis `7f0000002000-7f0000003000 r--p 00001000 …`.
-- Pilote 3, 6 contrôles passés : le chemin de l'amorceur EAC. Écriture dans un fichier, `unlink`, puis `sys_openat("/proc/self/fd/A")` : la description rouverte lit le contenu depuis l'offset 0 pendant que le descripteur d'origine garde son curseur en fin de fichier, et une seconde réouverture en `O_RDWR` a son propre curseur à 0.
+- Driver 1, 12 checks passed: mount of the temporary directory on `/data` in rooted mode, `sys_openat(O_CREAT|O_RDWR)`, `sys_write`, `sys_lseek`, `sys_read`, `sys_fstat` (128-byte `linux_stat_t` structure), `sys_close`, `sys_getdents64`, host symbolic link with absolute target `/data/hello.txt` resolved inside the guest root, `ENOENT` returned as `-2`.
+- Driver 2, 5 checks passed: the real functions `guest_vma_replace`, `guest_vma_protect` and `guest_vma_remove` (extracted from `guest.c:1107-1205` and compiled alone), then `sys_openat("/proc/self/maps")` and `sys_read`. The rendering shows the exact 4 KiB splits and the host path converted back through the bind:
+  `7f0000001000-7f0000002000 r-xp 00000000 00:00 0   /usr/lib/x86_64-linux-gnu/libc.so.6` then `7f0000002000-7f0000003000 r--p 00001000 …`.
+- Driver 3, 6 checks passed: the EAC bootstrapper path. Write to a file, `unlink`, then `sys_openat("/proc/self/fd/A")`: the reopened description reads the contents from offset 0 while the original descriptor keeps its cursor at end of file, and a second reopen with `O_RDWR` has its own cursor at 0.
 
-Contraintes découvertes pendant ce témoin : `sys_read` et `sys_write` exigent un `current_thread` enregistré (`thread_host_io_begin` renvoie EAGAIN sans lui, `thread.c:100-106`) ; le pilote 1 a d'abord renvoyé `-11` pour cette raison. C'est une dépendance vers la couche processus : l'interruption des E/S bloquantes repose sur un signal privé par thread. Limites : l'ABI testée est ARM64 (`linux_stat_t` de 128 octets), les trois pilotes ne couvrent ni `mmap`, ni le dispatch, ni les sockets, et aucun code invité ne s'exécute.
+Constraints found during this witness: `sys_read` and `sys_write` require a registered `current_thread` (`thread_host_io_begin` returns EAGAIN without it, `thread.c:100-106`); driver 1 first returned `-11` for this reason. This is a dependency on the process layer: interruption of blocking I/O relies on a private per-thread signal. Limits: the ABI tested is ARM64 (128-byte `linux_stat_t`), the three drivers cover neither `mmap`, nor dispatch, nor sockets, and no guest code runs.
 
-## 2. Table par fichier
+## 2. Per-file table
 
-LOC : `wc -l` sur la copie de travail. Colonne couplage : symboles concrets. Verdict : reprise (telle quelle ou presque), adapter, réécrire, abandonner.
+LOC: `wc -l` on the working copy. Coupling column: concrete symbols. Verdict: reuse (as is or almost), adapt, rewrite, drop.
 
-| Fichier | LOC | Sous-système | Couplage HVF, EL1, Rosetta, mémoire physique | ABI invitée supposée | Verdict |
+| File | LOC | Subsystem | HVF, EL1, Rosetta, physical memory coupling | Assumed guest ABI | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| `guest.c` | 2402 | mémoire invitée, stage 1, régions, VMA | `hv_vm_create`, `hv_vm_config_*`, `hv_vm_map`, `hv_vm_unmap`, `hv_vm_destroy`, `hv_vcpu_destroy`, `guest_walk_pt`, `ttbr0`, `ttbr1`, `PT_*`, `MEM_PERM_EL1`, `need_tlbi`, `kbuf_*`, `va_aliases`, `overflow`, `is_rosetta` | neutre pour la VMA (l.1107-1235), ARM64 stage 1 ailleurs | réécrire ; extraire 130 lignes de VMA (l.1107-1205) |
-| `guest.h` | 516 | structures mémoire | `Hypervisor/Hypervisor.h`, `hv_vcpu_t`, `hv_vcpu_exit_t` dans `guest_t`, constantes `ROSETTA_*`, `KBUF_*` | `guest_vma_t` neutre | réécrire ; garder `guest_vma_t` après réduction de `name[4096]` |
-| `syscall.c` | 2512 | table fd, errno, drapeaux, mmap et brk, dispatch | 14 `hv_*`, `hv_vcpu_get_reg(HV_REG_X0-X8)` (l.1249-1255), `hv_vcpu_set_reg(X8)` pour le TLBI (l.2502-2507), `g->regions`, `kbuf`, `ttbr` | ARM64 générique, X8 et X0-X5 | scinder : l.70-494 adapter, l.495-1180 mémoire à réécrire, l.1181-2512 dispatch à reclasser en x86-64 |
-| `syscall.h` | 645 | numéros, constantes, structures `linux_*` | `Hypervisor.h`, `hv_vcpu_t` dans `syscall_dispatch` | ARM64 : numéros l.17-200, `O_*` l.352-356, `linux_stat_t` l.402 | adapter (numéros et `stat`) |
-| `syscall_internal.h` | 132 | ordre des verrous, externes | aucun | neutre | reprise |
-| `syscall_fs.c` | 2397 | stat, open, close, répertoires, fcntl, xattr, dirfd | 58 appels `guest_*`, `F_GETPATH`, `O_RESOLVE_BENEATH`, `fdopendir` | ARM64 : `linux_stat_t` (l.59-77), `O_*` | adapter |
-| `syscall_fs.h` | 108 | déclarations | aucun | neutre | reprise |
-| `syscall_io.c` | 1836 | read, write, ioctl tty, splice, sendfile | 29 `guest_*` ; l.638-1224 : serveur `rosettad`, cache AOT, `posix_spawn` | ARM64 (termios et ioctl identiques à x86-64) | adapter 1 249 lignes, abandonner 587 |
-| `syscall_io.h` | 63 | déclarations | `rosetta.h` | neutre | adapter |
-| `syscall_fd.c` | 814 | eventfd, timerfd, signalfd | `kqueue`, `signal_*` | `signalfd_siginfo` | adapter |
-| `syscall_fd.h` | 55 | déclarations | aucun | neutre | reprise |
-| `syscall_sys.c` | 301 | uname, getrandom, sysinfo, prlimit64, rusage | `mach/mach.h`, `sysctl` | `machine` = `aarch64` (l.37) | adapter |
-| `syscall_time.c` | 299 | horloges, nanosleep, itimer | `translate_clockid` | `timespec` identique | reprise |
-| `syscall_stats.c` | 439 | profil des appels | aucun | numéros ARM64 | reprise, optionnel |
-| `vfs.c` | 751 | montages, CWD virtuel, résolveur | `fd_table` (par `syscall.h`) | neutre | reprise |
-| `vfs.h` | 124 | API vfs | aucun | neutre | reprise |
-| `fd_object.c` | 492 | descriptions et descripteurs | aucun | neutre | reprise |
-| `fd_object.h` | 195 | modèle fd | `guest_t` en déclaration avancée | neutre | reprise |
-| `device.c` | 226 | registre /dev | `audio_oss.h` | neutre | reprise ; retirer OSS |
-| `proc_emulation.c` | 1078 | /proc, /dev, /etc synthétiques | `guest_t` (`vmas`, `regions`), `thread_active_count`, `sysctl`, cpuinfo ARM (l.501-518) | cpuinfo ARM, reste neutre | adapter |
-| `proc_names.c` | 479 | registre de tâches partagé | verrous POSIX | neutre | reprise |
-| `syscall_reopen.c` | 324 | description indépendante de procfd | `mmap` d'un fichier d'état | neutre | reprise |
-| `syscall_filemap.c` | 426 | `MAP_SHARED` de fichier | `hv_vm_map`, `hv_vm_unmap`, `guest_map_pages`, `guest_set_extra_resolve`, `g->host_base`, `vm_page_size` | 4 Kio sur 16 Kio | réécrire (environ 250 lignes) |
-| `syscall_shm.c` | 915 | SysV SHM | `hv_vm_map`, `guest_map_va_range`, IPA volée dans le stage 2 | idem | réécrire (environ 300 lignes) |
-| `syscall_shm.h`, `syscall_filemap.h`, `syscall_reopen.h`, `proc_emulation.h`, `proc_names.h` | 50, 40, 37, 35, 60 | déclarations | `guest.h` | neutre | suivre le fichier source |
-| `elf.c` | 331 | chargeur ELF | `elf_map_segments(guest_base, guest_size, load_base)` copie par `fread` dans le tampon | x86-64 et ARM64 | réécrire ; utiliser le chargeur de FEX |
-| `elf.h` | 145 | structures ELF | aucun | neutre | reprise |
-| `stack.c` | 296 | pile initiale et auxv | `guest_write` ; `AT_PLATFORM` `aarch64` (l.173-176), HWCAP ARM (l.56-130), `AT_PAGESZ` 4096 (l.257) | ARM64 | adapter ou utiliser le chargeur de FEX |
-| `stack.h` | 53 | API pile | aucun | neutre | reprise |
-| `vdso.c` | 507 | vDSO ARM64 et page [vvar] | `host_base`, pages fixes 0xE000 et 0xF000, publication toutes les 1 ms | ARM64 | abandonner ; `VDSO_Emulation.cpp` de FEX |
-| `vdso.h`, `vdso_guest.S` | 69, 110 | idem | idem | ARM64 | abandonner |
-| `hl.c` | 1463 | CLI, VM, profil par défaut | 25 `hv_*`, 55 mentions Rosetta, `shim_blob` | ARM64 et x86-64 par Rosetta | abandonner |
-| `shim.S` | 656 | shim EL1 | vecteurs d'exception, HVC, MMU, DC ZVA | ARM64 EL1 | abandonner |
-| `hv_util.h` | 121 | macros HVF | `HV_CHECK`, `SCTLR_*` | ARM64 EL1 | abandonner |
-| `rosetta.c`, `rosetta.h`, `aot_format.h`, `fd_digest.h` | 301, 136, 49, 50 | Rosetta et cache AOT | `ROSETTA_PATH`, `guest_add_va_alias` | ARM64 | abandonner |
-| `gdb_stub.c`, `gdb_stub.h` | 1732, 78 | stub GDB | `hv_vcpu_get_reg` | ARM64 | abandonner |
-| `crash_report.c`, `crash_report.h`, `fault_dump.c`, `fault_dump.h` | 195, 37, 162, 8 | diagnostics | `hv_vcpu_get_reg` | ARM64 | abandonner ; refaire en 100 lignes |
-| `trace.c`, `trace.h` | 209, 68 | traces par catégorie | aucun | neutre | reprise |
-| `audio.c`, `audio.h`, `audio_oss.c`, `audio_oss.h`, `audio_coreaudio.c`, `linux_oss_abi.h`, `app_open.c`, `app_open.h` | 639, 129, 701, 27, 255, 150, 60, 27 | OSS, Core Audio, ouverture d'application | Core Audio, `guest_*` (25 appels dans `audio_oss.c`) | OSS | abandonner pour Wine et EAC |
-| `thread.h` (détail, car lu pour cette étude) | 226 | table des threads invités | `hv_vcpu_t vcpu`, `hv_vcpu_exit_t *vexit`, `sp_el1`, `linux_user_pt_regs_t`, `linux_user_fpsimd_state_t`, `gdb_reg_snapshot[788]`, `_Thread_local current_thread` | registres ARM64 | réécrire ; ne garder que `guest_tid`, `clear_child_tid`, masque de signaux et pile alternative ; `proc_emulation.c` lit `current_thread` et `thread_active_count`, `syscall_io.c` exige `thread_host_io_begin` (voir 1.7) |
-| Couche processus : `thread.*`, `futex.*`, `syscall_proc.*`, `syscall_signal.*`, `syscall_exec.*`, `fork_ipc.*`, `proc_ptrace.*`, `signal_notify.h`, `syscall_net.*`, `syscall_poll.*`, `syscall_inotify.*` | 13 940 au total | threads, fork, exec, signaux, ptrace, réseau, polling | 72 `hv_*` dans `fork_ipc.c`, 87 dans `syscall_proc.c`, 34 dans `syscall_signal.c`, 30 dans `thread.c` | ARM64 | voir `hl-reuse-process.md` ; seul l'allocateur de PID (`syscall_proc.c:76-113`, `516-562`, environ 90 lignes) est repris ici |
+| `guest.c` | 2402 | guest memory, stage 1, regions, VMA | `hv_vm_create`, `hv_vm_config_*`, `hv_vm_map`, `hv_vm_unmap`, `hv_vm_destroy`, `hv_vcpu_destroy`, `guest_walk_pt`, `ttbr0`, `ttbr1`, `PT_*`, `MEM_PERM_EL1`, `need_tlbi`, `kbuf_*`, `va_aliases`, `overflow`, `is_rosetta` | neutral for the VMA (l.1107-1235), ARM64 stage 1 elsewhere | rewrite; extract 130 lines of VMA (l.1107-1205) |
+| `guest.h` | 516 | memory structures | `Hypervisor/Hypervisor.h`, `hv_vcpu_t`, `hv_vcpu_exit_t` in `guest_t`, constants `ROSETTA_*`, `KBUF_*` | `guest_vma_t` neutral | rewrite; keep `guest_vma_t` after shrinking `name[4096]` |
+| `syscall.c` | 2512 | fd table, errno, flags, mmap and brk, dispatch | 14 `hv_*`, `hv_vcpu_get_reg(HV_REG_X0-X8)` (l.1249-1255), `hv_vcpu_set_reg(X8)` for the TLBI (l.2502-2507), `g->regions`, `kbuf`, `ttbr` | generic ARM64, X8 and X0-X5 | split: l.70-494 adapt, l.495-1180 memory to rewrite, l.1181-2512 dispatch to reclassify as x86-64 |
+| `syscall.h` | 645 | numbers, constants, `linux_*` structures | `Hypervisor.h`, `hv_vcpu_t` in `syscall_dispatch` | ARM64: numbers l.17-200, `O_*` l.352-356, `linux_stat_t` l.402 | adapt (numbers and `stat`) |
+| `syscall_internal.h` | 132 | lock ordering, externs | none | neutral | reuse |
+| `syscall_fs.c` | 2397 | stat, open, close, directories, fcntl, xattr, dirfd | 58 `guest_*` calls, `F_GETPATH`, `O_RESOLVE_BENEATH`, `fdopendir` | ARM64: `linux_stat_t` (l.59-77), `O_*` | adapt |
+| `syscall_fs.h` | 108 | declarations | none | neutral | reuse |
+| `syscall_io.c` | 1836 | read, write, tty ioctl, splice, sendfile | 29 `guest_*`; l.638-1224: `rosettad` server, AOT cache, `posix_spawn` | ARM64 (termios and ioctl identical to x86-64) | adapt 1,249 lines, drop 587 |
+| `syscall_io.h` | 63 | declarations | `rosetta.h` | neutral | adapt |
+| `syscall_fd.c` | 814 | eventfd, timerfd, signalfd | `kqueue`, `signal_*` | `signalfd_siginfo` | adapt |
+| `syscall_fd.h` | 55 | declarations | none | neutral | reuse |
+| `syscall_sys.c` | 301 | uname, getrandom, sysinfo, prlimit64, rusage | `mach/mach.h`, `sysctl` | `machine` = `aarch64` (l.37) | adapt |
+| `syscall_time.c` | 299 | clocks, nanosleep, itimer | `translate_clockid` | `timespec` identical | reuse |
+| `syscall_stats.c` | 439 | call profiling | none | ARM64 numbers | reuse, optional |
+| `vfs.c` | 751 | mounts, virtual CWD, resolver | `fd_table` (through `syscall.h`) | neutral | reuse |
+| `vfs.h` | 124 | vfs API | none | neutral | reuse |
+| `fd_object.c` | 492 | descriptions and descriptors | none | neutral | reuse |
+| `fd_object.h` | 195 | fd model | `guest_t` as a forward declaration | neutral | reuse |
+| `device.c` | 226 | /dev registry | `audio_oss.h` | neutral | reuse; remove OSS |
+| `proc_emulation.c` | 1078 | synthetic /proc, /dev, /etc | `guest_t` (`vmas`, `regions`), `thread_active_count`, `sysctl`, ARM cpuinfo (l.501-518) | ARM cpuinfo, rest neutral | adapt |
+| `proc_names.c` | 479 | shared task registry | POSIX locks | neutral | reuse |
+| `syscall_reopen.c` | 324 | independent procfd description | `mmap` of a state file | neutral | reuse |
+| `syscall_filemap.c` | 426 | file `MAP_SHARED` | `hv_vm_map`, `hv_vm_unmap`, `guest_map_pages`, `guest_set_extra_resolve`, `g->host_base`, `vm_page_size` | 4 KiB on 16 KiB | rewrite (about 250 lines) |
+| `syscall_shm.c` | 915 | SysV SHM | `hv_vm_map`, `guest_map_va_range`, IPA stolen in stage 2 | same | rewrite (about 300 lines) |
+| `syscall_shm.h`, `syscall_filemap.h`, `syscall_reopen.h`, `proc_emulation.h`, `proc_names.h` | 50, 40, 37, 35, 60 | declarations | `guest.h` | neutral | follow the source file |
+| `elf.c` | 331 | ELF loader | `elf_map_segments(guest_base, guest_size, load_base)` copies by `fread` into the buffer | x86-64 and ARM64 | rewrite; use FEX's loader |
+| `elf.h` | 145 | ELF structures | none | neutral | reuse |
+| `stack.c` | 296 | initial stack and auxv | `guest_write`; `AT_PLATFORM` `aarch64` (l.173-176), ARM HWCAP (l.56-130), `AT_PAGESZ` 4096 (l.257) | ARM64 | adapt or use FEX's loader |
+| `stack.h` | 53 | stack API | none | neutral | reuse |
+| `vdso.c` | 507 | ARM64 vDSO and [vvar] page | `host_base`, fixed pages 0xE000 and 0xF000, publication every 1 ms | ARM64 | drop; FEX's `VDSO_Emulation.cpp` |
+| `vdso.h`, `vdso_guest.S` | 69, 110 | same | same | ARM64 | drop |
+| `hl.c` | 1463 | CLI, VM, default profile | 25 `hv_*`, 55 Rosetta mentions, `shim_blob` | ARM64 and x86-64 through Rosetta | drop |
+| `shim.S` | 656 | EL1 shim | exception vectors, HVC, MMU, DC ZVA | ARM64 EL1 | drop |
+| `hv_util.h` | 121 | HVF macros | `HV_CHECK`, `SCTLR_*` | ARM64 EL1 | drop |
+| `rosetta.c`, `rosetta.h`, `aot_format.h`, `fd_digest.h` | 301, 136, 49, 50 | Rosetta and AOT cache | `ROSETTA_PATH`, `guest_add_va_alias` | ARM64 | drop |
+| `gdb_stub.c`, `gdb_stub.h` | 1732, 78 | GDB stub | `hv_vcpu_get_reg` | ARM64 | drop |
+| `crash_report.c`, `crash_report.h`, `fault_dump.c`, `fault_dump.h` | 195, 37, 162, 8 | diagnostics | `hv_vcpu_get_reg` | ARM64 | drop; redo in 100 lines |
+| `trace.c`, `trace.h` | 209, 68 | per-category traces | none | neutral | reuse |
+| `audio.c`, `audio.h`, `audio_oss.c`, `audio_oss.h`, `audio_coreaudio.c`, `linux_oss_abi.h`, `app_open.c`, `app_open.h` | 639, 129, 701, 27, 255, 150, 60, 27 | OSS, Core Audio, application opening | Core Audio, `guest_*` (25 calls in `audio_oss.c`) | OSS | drop for Wine and EAC |
+| `thread.h` (detail, because read for this study) | 226 | guest thread table | `hv_vcpu_t vcpu`, `hv_vcpu_exit_t *vexit`, `sp_el1`, `linux_user_pt_regs_t`, `linux_user_fpsimd_state_t`, `gdb_reg_snapshot[788]`, `_Thread_local current_thread` | ARM64 registers | rewrite; keep only `guest_tid`, `clear_child_tid`, signal mask and alternate stack; `proc_emulation.c` reads `current_thread` and `thread_active_count`, `syscall_io.c` requires `thread_host_io_begin` (see 1.7) |
+| Process layer: `thread.*`, `futex.*`, `syscall_proc.*`, `syscall_signal.*`, `syscall_exec.*`, `fork_ipc.*`, `proc_ptrace.*`, `signal_notify.h`, `syscall_net.*`, `syscall_poll.*`, `syscall_inotify.*` | 13,940 in total | threads, fork, exec, signals, ptrace, networking, polling | 72 `hv_*` in `fork_ipc.c`, 87 in `syscall_proc.c`, 34 in `syscall_signal.c`, 30 in `thread.c` | ARM64 | see `hl-reuse-process.md`; only the PID allocator (`syscall_proc.c:76-113`, `516-562`, about 90 lines) is reused here |
 
-Totaux par classe, MESURÉS par somme de `wc -l` : reprise 3 835 lignes (`vfs`, `fd_object`, `syscall_reopen`, `proc_names`, `device`, `trace`, `syscall_stats`, `syscall_time` et leurs en-têtes) ; adapter 9 082 (`syscall_fs`, `syscall_io` hors `rosettad`, `syscall_fd`, `syscall_sys`, `proc_emulation`, `syscall.c` hors mémoire, `syscall.h`, `syscall_internal.h`, `stack`) ; réécrire 6 197 (`guest`, mémoire de `syscall.c`, `syscall_filemap`, `syscall_shm`, `elf`, `vdso`) ; abandonner 7 563 ; processus 13 940. Somme 40 617.
+Totals per class, MEASURED by summing `wc -l`: reuse 3,835 lines (`vfs`, `fd_object`, `syscall_reopen`, `proc_names`, `device`, `trace`, `syscall_stats`, `syscall_time` and their headers); adapt 9,082 (`syscall_fs`, `syscall_io` except `rosettad`, `syscall_fd`, `syscall_sys`, `proc_emulation`, `syscall.c` except memory, `syscall.h`, `syscall_internal.h`, `stack`); rewrite 6,197 (`guest`, memory part of `syscall.c`, `syscall_filemap`, `syscall_shm`, `elf`, `vdso`); drop 7,563; process 13,940. Sum 40,617.
 
-## 3. Logique VMA indépendante de HVF, réutilisable avec adresse invitée = adresse hôte sur 16 Kio
+## 3. VMA logic independent of HVF, reusable with guest address = host address on 16 KiB
 
-### 3.1 Ce qui se reprend
+### 3.1 What can be reused
 
-LU, sans appel Mach ni HVF :
+READ, without any Mach or HVF call:
 
-- `guest_vma_t` et ses opérations : `guest_vma_replace` (retrait des chevauchements, insertion triée, fusion), `guest_vma_remove` (découpe en deux), `guest_vma_protect` (découpe aux bornes), règles de fusion de `vma_merge` (mêmes droits, drapeaux, inode, dev, nom, offset contigu pour un fichier), ajustement d'offset à la découpe de `vma_trim_start` (`guest.c:1107-1205`). Les règles sont exactes à 4 Kio : `& ~4095` partout.
-- `record_mmap_vma` (`syscall.c:1163-1179`) : nom par `fcntl(F_GETPATH)`, inode et dev par `fstat`, dev découpé en majeur et mineur.
-- `proc_maps_fd` (`proc_emulation.c:222-288`) : tri, colonne de nom à 73, chemin invité par `hl_vfs_host_to_guest`, échappement du retour ligne. Il ne lit que `nvmas`, `vmas`, `preannounced` et `verbose` de `guest_t`.
-- Le test `test-page-table-pool.c` contient des oracles utiles pour les découpes (« exact shared/private pages, protection restore, replacement and clear »).
+- `guest_vma_t` and its operations: `guest_vma_replace` (removal of overlaps, sorted insertion, merging), `guest_vma_remove` (split in two), `guest_vma_protect` (split at the bounds), merge rules of `vma_merge` (same permissions, flags, inode, dev, name, contiguous offset for a file), offset adjustment at the split of `vma_trim_start` (`guest.c:1107-1205`). The rules are exact at 4 KiB: `& ~4095` everywhere.
+- `record_mmap_vma` (`syscall.c:1163-1179`): name through `fcntl(F_GETPATH)`, inode and dev through `fstat`, dev split into major and minor.
+- `proc_maps_fd` (`proc_emulation.c:222-288`): sorting, name column at 73, guest path through `hl_vfs_host_to_guest`, escaping of the newline. It only reads `nvmas`, `vmas`, `preannounced` and `verbose` from `guest_t`.
+- The test `test-page-table-pool.c` contains useful oracles for the splits ("exact shared/private pages, protection restore, replacement and clear").
 
-Défauts de structure à ne pas reprendre. Chaque entrée porte 4 096 octets de chemin (4 144 octets), le tableau monte à 16 384 entrées soit environ 65 Mio, et chaque insertion ou retrait fait un `memmove` de tout le suffixe (`guest.c:1127-1131`). L'ouverture de `/proc/self/maps` copie tout le tableau avant de le trier (`proc_emulation.c:224-228`). Il faut un arbre ordonné et un chemin interné.
+Structural defects not to reuse. Each entry carries 4,096 bytes of path (4,144 bytes), the array grows to 16,384 entries, that is about 65 MiB, and each insertion or removal does a `memmove` of the whole suffix (`guest.c:1127-1131`). Opening `/proc/self/maps` copies the whole array before sorting it (`proc_emulation.c:224-228`). An ordered tree and an interned path are needed.
 
-FEX a déjà un suivi à 4 Kio : `VMATracking` (`FEX/SyscallsVMATracking.h:102`, 594 + 171 lignes), une `std::map` indexée par adresse, avec droits, partage, offset et ressource `MRID` (dev, inode) ; il sert au code automodifiable et au cache de code. Deux écarts avec HL. Le nom de fichier n'est gardé que pour un fichier régulier exécutable (`FEX/SyscallsSMCTracking.cpp:595-609`, test `S_IXUSR`), alors que `/proc/self/maps` doit nommer toute DLL ou bibliothèque, y compris les DLL de Wine non exécutables. Les mappings anonymes partagés ont un identifiant, pas de nom (`SyscallsSMCTracking.cpp:699`). Recommandation : un seul suivi, celui de FEX étendu d'un chemin interné et du dev/inode complet, avec le rendu de `/proc/self/maps` repris de HL. Garder deux suivis en parallèle crée des divergences au premier `MAP_FIXED` sur un mapping existant.
+FEX already has 4 KiB tracking: `VMATracking` (`FEX/SyscallsVMATracking.h:102`, 594 + 171 lines), a `std::map` indexed by address, with permissions, sharing, offset and `MRID` resource (dev, inode); it serves self-modifying code and the code cache. Two differences from HL. The file name is kept only for an executable regular file (`FEX/SyscallsSMCTracking.cpp:595-609`, `S_IXUSR` test), whereas `/proc/self/maps` must name every DLL or library, including Wine's non-executable DLLs. Shared anonymous mappings have an identifier, no name (`SyscallsSMCTracking.cpp:699`). Recommendation: a single tracker, FEX's, extended with an interned path and the full dev/inode, with the `/proc/self/maps` rendering taken from HL. Keeping two trackers in parallel creates divergences at the first `MAP_FIXED` over an existing mapping.
 
-### 3.2 Ce qui doit changer sur un hôte à 16 Kio avec GVA = HVA
+### 3.2 What must change on a 16 KiB host with GVA = HVA
 
-MESURÉ (annexe A, M5 Max, pages de 16 Kio) :
+MEASURED (appendix A, M5 Max, 16 KiB pages):
 
-| Opération hôte | Résultat |
+| Host operation | Result |
 | --- | --- |
-| `mmap(MAP_FIXED)` à `base+0x1000` (longueur 0x1000) et à `base+0x2000` (longueur 0x4000) | échec EINVAL dans les deux cas |
-| `mmap(MAP_FIXED)` à `base+0x4000`, longueur 0x1000 | réussit et remplace 16 Kio : les octets de `+0x4000` à `+0x7fff` sont mis à zéro |
+| `mmap(MAP_FIXED)` at `base+0x1000` (length 0x1000) and at `base+0x2000` (length 0x4000) | EINVAL failure in both cases |
+| `mmap(MAP_FIXED)` at `base+0x4000`, length 0x1000 | succeeds and replaces 16 KiB: the bytes from `+0x4000` to `+0x7fff` are zeroed |
 | `mprotect(base+0x9000, 0x1000)` | EINVAL |
-| `mprotect(base+0x8000, 0x1000, PROT_READ)` | réussit et s'applique à 16 Kio (région de 0x4000 octets, droits 1) |
+| `mprotect(base+0x8000, 0x1000, PROT_READ)` | succeeds and applies to 16 KiB (region of 0x4000 bytes, permissions 1) |
 | `munmap(base+0x1000, 0x1000)` | EINVAL |
-| `munmap(base+0x10000, 0x1000)` | réussit et retire 16 Kio |
-| `mmap` de fichier, offset 0x1000, `MAP_PRIVATE` ou `MAP_SHARED` | EINVAL |
-| `mmap` de fichier, offset 0x4000, longueur 0x4000, `MAP_SHARED` | réussit |
-| `mach_vm_protect(a, 0x1000)` avec `a` aligné sur 16 Kio | réussit et protège 16 Kio (région de 0x4000 octets). `mach_vm_protect(a+0x1000, 0x1000)` réussit aussi, l'adresse est arrondie, son effet exact n'a pas été isolé |
+| `munmap(base+0x10000, 0x1000)` | succeeds and removes 16 KiB |
+| file `mmap`, offset 0x1000, `MAP_PRIVATE` or `MAP_SHARED` | EINVAL |
+| file `mmap`, offset 0x4000, length 0x4000, `MAP_SHARED` | succeeds |
+| `mach_vm_protect(a, 0x1000)` with `a` aligned on 16 KiB | succeeds and protects 16 KiB (region of 0x4000 bytes). `mach_vm_protect(a+0x1000, 0x1000)` also succeeds, the address is rounded, its exact effect was not isolated |
 
-Conséquences, point par point.
+Consequences, point by point.
 
-- Granularité des droits. L'hôte ne sait pas protéger 4 Kio. La table VMA reste la vérité de ce que l'invité attend (codes d'erreur, `/proc/self/maps`) ; les droits hôte sont une enveloppe sur 16 Kio. Une page de garde de 4 Kio dans une région lisible et inscriptible ne peut pas faire de faute. Trois voies, à trancher : annoncer 16 Kio à l'invité (`AT_PAGESZ`, `sysconf`) et faire tourner Wine en pages de 16 Kio (les sections PE sont alignées sur 4 Kio, Wine doit le gérer) ; émuler les droits de 4 Kio par fautes et table fantôme (coût de chaque faute) ; garder l'étage 1 d'HL, ce qui est exclu ici. Aucune n'a été testée. FEX suppose 4 096 (`FEXCore/include/FEXCore/Utils/TypeDefines.h:6-7`).
-- Blocs de support. `regions[]`, `va_ranges[]`, le débordement, les alias et `kbuf` disparaissent. `find_free_gap` est remplacé par le choix d'adresse de l'hôte (`mmap(NULL, …)` dans la fenêtre réservée) ou par une recherche dans la table VMA. L'équipe FEXCore réserve la fenêtre invitée en `PROT_NONE` (`reports/fexcore-darwin-port.md`, décision 3).
-- Mappings de fichiers à offset non aligné sur 16 Kio. HL les absorbe : copie par `pread` pour `MAP_PRIVATE`, `delta` dans une IPA alignée pour `MAP_SHARED` (`syscall_filemap.c:220-224`). En processus, un `MAP_PRIVATE` devient anonyme plus `pread` (comme `syscall.c:1112-1117`), avec le coût de mémoire résidente et la perte du partage de cache ; la VMA garde le nom et l'offset. Un `MAP_SHARED` n'est possible que si l'adresse et l'offset sont tous deux alignés sur 16 Kio et congrus ; sinon refuser (EINVAL) ou accepter une copie incohérente, à décider. Les vues de Wine suivent la granularité d'allocation de 64 Kio (INFÉRÉ de la conception de Wine, non vérifié ici).
-- Mappings partagés entre processus et fork. HL n'a pas de mémoire anonyme partagée (`MAP_SHARED|MAP_ANONYMOUS` devient privé, `syscall.c:837`). Pour les fichiers, il exporte par SCM_RIGHTS les descripteurs de support et les triplets (va, longueur, offset) et réimporte dans l'enfant (`syscall_filemap.c:334-426`) : ce schéma de 90 lignes se reprend tel quel pour un fork qui n'est pas un vrai `fork()`. Avec un vrai `fork()` hôte le partage est natif, mais la sûreté de `fork()` dans un processus multithread est du ressort de l'équipe processus.
-- `MAP_FIXED` sur un mapping existant. HL retire les régions, puis réécrit les PTE (`syscall.c:938-993`). En processus, `mmap(MAP_FIXED)` remplace atomiquement côté noyau, mais il faut mettre à jour la table VMA et invalider les traductions JIT sous le même verrou (modèle : `FEX/SyscallsSMCTracking.cpp:302-350`, `GuestMmap`). `MAP_FIXED_NOREPLACE` n'existe pas dans le SDK macOS (grep de `sys/mman.h`) : le test de chevauchement passe par la table VMA, comme `guest_mapping_overlaps` (`guest.c:103-119`).
-- `mremap`. Absent de HL (ENOSYS par le cas par défaut, `syscall.c:2451-2462`) et du SDK macOS. FEX appelle `::mremap` puis suit (`FEX/SyscallsSMCTracking.cpp:390-412`). À émuler : réduction par `munmap` de la queue ; agrandissement sur place si la table VMA montre un trou, par `mmap(MAP_FIXED)` ; déplacement par `mach_vm_remap` à 16 Kio puis mise à jour de la table et invalidation JIT. glibc retombe sur malloc, copie, free quand `mremap` échoue (INFÉRÉ de mémoire du code de `realloc`).
-- `munmap` et `mprotect`. En processus ils doivent être exacts : vrai `munmap`, vrai `PROT_NONE`. L'invité observera enfin un SIGSEGV après `munmap`, ce que HL ne produit pas dans le bas de l'espace.
-- Zéro. HL fait un `memset` à chaque `mmap` anonyme ; un `mmap` hôte neuf est déjà à zéro. Mais `madvise(MADV_DONTNEED)` ne remet pas la page à zéro sur Darwin (mesure de l'équipe FEXCore, `fexcore-darwin-port.md`), alors qu'il le fait sous Linux pour du privé anonyme.
-- Code automodifiable. Le suivi de FEX protège le code invité par `mprotect(PROT_READ)` en unités de 4 Kio (`SyscallsSMCTracking.cpp:136-196`, `FEX_PAGE_SIZE`). À 16 Kio il sur-invalidera, ce qui est sûr (décision 2 de `fexcore-darwin-port.md`).
+- Permission granularity. The host cannot protect 4 KiB. The VMA table remains the truth of what the guest expects (error codes, `/proc/self/maps`); the host permissions are an envelope over 16 KiB. A 4 KiB guard page inside a readable and writable region cannot fault. Three paths, to decide: announce 16 KiB to the guest (`AT_PAGESZ`, `sysconf`) and run Wine with 16 KiB pages (PE sections are aligned on 4 KiB, Wine must handle it); emulate 4 KiB permissions through faults and a shadow table (cost of each fault); keep HL's stage 1, which is ruled out here. None has been tested. FEX assumes 4,096 (`FEXCore/include/FEXCore/Utils/TypeDefines.h:6-7`).
+- Backing blocks. `regions[]`, `va_ranges[]`, the overflow, the aliases and `kbuf` disappear. `find_free_gap` is replaced by the host's address choice (`mmap(NULL, …)` in the reserved window) or by a lookup in the VMA table. The FEXCore team reserves the guest window as `PROT_NONE` (`reports/fexcore-darwin-port.md`, decision 3).
+- File mappings at an offset not aligned on 16 KiB. HL absorbs them: copy by `pread` for `MAP_PRIVATE`, `delta` in an aligned IPA for `MAP_SHARED` (`syscall_filemap.c:220-224`). In a process, a `MAP_PRIVATE` becomes anonymous plus `pread` (as in `syscall.c:1112-1117`), with the cost in resident memory and the loss of cache sharing; the VMA keeps the name and the offset. A `MAP_SHARED` is only possible if the address and the offset are both aligned on 16 KiB and congruent; otherwise refuse (EINVAL) or accept an incoherent copy, to decide. Wine's views follow the 64 KiB allocation granularity (INFERRED from Wine's design, not checked here).
+- Mappings shared between processes and fork. HL has no shared anonymous memory (`MAP_SHARED|MAP_ANONYMOUS` becomes private, `syscall.c:837`). For files, it exports through SCM_RIGHTS the backing descriptors and the (va, length, offset) triplets and reimports them in the child (`syscall_filemap.c:334-426`): this 90-line scheme can be reused as is for a fork that is not a real `fork()`. With a real host `fork()` the sharing is native, but the safety of `fork()` in a multithreaded process is the process team's concern.
+- `MAP_FIXED` over an existing mapping. HL removes the regions, then rewrites the PTEs (`syscall.c:938-993`). In a process, `mmap(MAP_FIXED)` replaces atomically on the kernel side, but the VMA table must be updated and the JIT translations invalidated under the same lock (model: `FEX/SyscallsSMCTracking.cpp:302-350`, `GuestMmap`). `MAP_FIXED_NOREPLACE` does not exist in the macOS SDK (grep of `sys/mman.h`): the overlap test goes through the VMA table, like `guest_mapping_overlaps` (`guest.c:103-119`).
+- `mremap`. Absent from HL (ENOSYS through the default case, `syscall.c:2451-2462`) and from the macOS SDK. FEX calls `::mremap` then tracks (`FEX/SyscallsSMCTracking.cpp:390-412`). To emulate: shrinking by `munmap` of the tail; growing in place if the VMA table shows a hole, by `mmap(MAP_FIXED)`; moving by `mach_vm_remap` at 16 KiB then updating the table and invalidating the JIT. glibc falls back to malloc, copy, free when `mremap` fails (INFERRED from memory of `realloc`'s code).
+- `munmap` and `mprotect`. In a process they must be exact: real `munmap`, real `PROT_NONE`. The guest will at last observe a SIGSEGV after `munmap`, which HL does not produce in the bottom of the space.
+- Zeroing. HL does a `memset` at each anonymous `mmap`; a fresh host `mmap` is already zeroed. But `madvise(MADV_DONTNEED)` does not zero the page on Darwin (measurement by the FEXCore team, `fexcore-darwin-port.md`), whereas it does under Linux for private anonymous memory.
+- Self-modifying code. FEX's tracking protects guest code by `mprotect(PROT_READ)` in 4 KiB units (`SyscallsSMCTracking.cpp:136-196`, `FEX_PAGE_SIZE`). At 16 KiB it will over-invalidate, which is safe (decision 2 of `fexcore-darwin-port.md`).
 
-## 4. Question d'ABI : ARM64 Linux générique contre x86-64 Linux
+## 4. ABI question: generic ARM64 Linux versus x86-64 Linux
 
-### 4.1 Comment HL représente les arguments et les structures
+### 4.1 How HL represents arguments and structures
 
-LU. `syscall_dispatch` lit X8 et X0-X5 dans le vCPU par `hv_vcpu_get_reg` (`syscall.c:1249-1255`), un `switch` sur le numéro ARM64 appelle des fonctions `sys_*(guest_t *g, …)` qui reçoivent des adresses invitées en `uint64_t` et les lisent par `guest_read` et `guest_write`, et le résultat retourne dans X0 (`syscall.c:2495`). Les structures sont des copies des structures noyau ARM64 : `linux_stat_t` de 128 octets (`syscall.h:402-423`), `linux_statfs_t` (`syscall.h:450-463`), `linux_epoll_event_t` de 16 octets non empaqueté (`syscall_poll.c:583-588`), `linux_sigaction_t` de 32 octets (`syscall_signal.h:80-85`). Chaque handler traduit entre la structure noyau Linux et l'API Darwin : `translate_stat` (`syscall_fs.c:59-77`) avec ré-encodage du `dev_t` (`syscall_fs.c:52-56`), errno (`linux_errno`, `syscall.c:330-414`), `AT_*` (`syscall.c:421-444`), `O_*` (`syscall.c:453-473`), identifiants de clocks, `RLIMIT_*` (`syscall_sys.c:228-242`), `sockaddr` avec `sa_len` BSD, `cmsghdr` (16 contre 12 octets d'en-tête, `SOL_SOCKET` 1 contre 0xFFFF).
+READ. `syscall_dispatch` reads X8 and X0-X5 from the vCPU through `hv_vcpu_get_reg` (`syscall.c:1249-1255`), a `switch` on the ARM64 number calls `sys_*(guest_t *g, …)` functions that receive guest addresses as `uint64_t` and read them through `guest_read` and `guest_write`, and the result goes back in X0 (`syscall.c:2495`). The structures are copies of the ARM64 kernel structures: 128-byte `linux_stat_t` (`syscall.h:402-423`), `linux_statfs_t` (`syscall.h:450-463`), unpacked 16-byte `linux_epoll_event_t` (`syscall_poll.c:583-588`), 32-byte `linux_sigaction_t` (`syscall_signal.h:80-85`). Each handler translates between the Linux kernel structure and the Darwin API: `translate_stat` (`syscall_fs.c:59-77`) with re-encoding of `dev_t` (`syscall_fs.c:52-56`), errno (`linux_errno`, `syscall.c:330-414`), `AT_*` (`syscall.c:421-444`), `O_*` (`syscall.c:453-473`), clock identifiers, `RLIMIT_*` (`syscall_sys.c:228-242`), `sockaddr` with BSD `sa_len`, `cmsghdr` (16 versus 12 bytes of header, `SOL_SOCKET` 1 versus 0xFFFF).
 
-### 4.2 Écarts ARM64 générique contre x86-64
+### 4.2 Differences between generic ARM64 and x86-64
 
-| Objet | ARM64 générique (HL) | x86-64 | Ce que fait FEX | État dans HL |
+| Object | Generic ARM64 (HL) | x86-64 | What FEX does | State in HL |
 | --- | --- | --- | --- | --- |
-| Numéros | asm-generic, `read`=63, `openat`=56, `mmap`=222 (`syscall.h:17-200`) | `read`=0, `write`=1, `open`=2, `mmap`=9 | environ 467 entrées x86-64 (`x64/SyscallsEnum.h`) vers environ 469 entrées ARM64 (`Arm64/SyscallsEnum.h`) par `SYSCALL_DEF` (`Syscalls.h:54`, 400 usages) | à refaire |
-| Registres | X8, X0-X5 | rax ; rdi, rsi, rdx, r10, r8, r9 | `CpuStateFrame`, handlers typés | à refaire |
-| Appels hérités absents d'ARM64 | sans objet | `open`, `stat`, `lstat`, `access`, `pipe`, `dup2`, `poll`, `select`, `rename`, `mkdir`, `rmdir`, `link`, `unlink`, `symlink`, `readlink`, `chmod`, `chown`, `creat`, `getdents`, `utime`, `time`, `fork`, `vfork`, `arch_prctl` | appelle les fonctions glibc (`Syscalls/FS.cpp:23-48`, `x64/FD.cpp:122-128`), émulation de `getdents` par `getdents64` (`GetDentsEmulation`) | à écrire (environ 30 appels) |
-| `struct stat` | 128 octets (`syscall.h:402`) | 144 octets : `st_dev`, `st_ino`, `st_nlink` (8), `st_mode`, `st_uid`, `st_gid`, `__pad0`, `st_rdev`, `st_size`, `st_blksize` (8), `st_blocks`, 3 horodatages, 3 mots libres | `guest_stat`, `static_assert` 144 (`x64/Types.h:112-215`), utilisé en `x64/FD.cpp:65-103` | nouvelle fonction de 25 lignes ; `mac_to_linux_dev` se reprend |
-| `dirent64` | en-tête de 19 octets, `d_ino`, `d_off`, `d_reclen`, `d_type` (`syscall_fs.c:97-103`) | identique | `linux_dirent_64`, `static_assert` 19 (`x64/Types.h:213-222`) | reprise |
-| `statfs` | `linux_statfs_t` (`syscall.h:450`) | même disposition 64 bits | passe `FM.Statfs` directement (`x64/FD.cpp:135-139`) | reprise |
-| `rlimit` | 16 octets, `RLIM_INFINITY` = 2^64-1 (`syscall_sys.c:244-299`) | identique | passthrough | reprise |
-| `flock` (`fcntl`) | 32 octets | identique | passthrough | reprise ; la conversion F_RDLCK 0, F_WRLCK 1, F_UNLCK 2 vers 1, 3, 2 de macOS est un correctif privé de `syscall_fs.c` |
-| `sockaddr`, `msghdr`, `cmsghdr` | LP64 Linux | identique | passthrough | reprise (`syscall_net.c`, autre rapport) |
-| `timespec`, `timeval`, `iovec`, `pollfd`, `sysinfo`, `rusage` | `linux_timespec_t` etc. (`syscall.h:437-545`) | identiques | passthrough | reprise |
-| `epoll_event` | 16 octets, non empaqueté (`syscall_poll.c:583`) | 12 octets empaquetés | `epoll_event_x86`, `static_assert` 12 (`Types.h:56-72`) et copie par vecteur (`x64/EPoll.cpp:24-94`) | à adapter (20 lignes) |
-| `O_*` | `O_DIRECTORY` 0x4000, `O_NOFOLLOW` 0x8000, `O_DIRECT` 0x10000, `O_LARGEFILE` 0x20000 (`syscall.h:352-356`) | `O_DIRECT` 040000, `O_LARGEFILE` 0100000, `O_DIRECTORY` 0200000, `O_NOFOLLOW` 0400000 | `RemapFromX86Flags` et `RemapToX86Flags` (`Syscalls.h:490-562`) | à adapter ; `translate_open_flags` (`syscall.c:453-473`) ignore `O_DIRECT`, `O_SYNC`, `O_DSYNC`, `O_NOATIME`, `O_PATH`, `O_TMPFILE` |
-| `sigaction` noyau | 32 octets : handler, flags, restorer, mask | 32 octets, même ordre | `GuestSigAction` (`Types.h:97-106`) | même taille ; la structure ARM64 réelle n'a pas de `restorer` d'après mes souvenirs des en-têtes noyau, non revérifié ici (équipe signaux) |
-| Trame de signal, `ucontext`, `rt_sigreturn` | trame ARM64 construite sur la pile invitée, restaurateur dans le vDSO (`vdso.h:34-38`) | trame x86-64 avec `fpstate` xsave, restaurateur fourni par la libc (`SA_RESTORER`) | `SignalDelegator` (1 352 + 856 lignes) | hors périmètre ; ne pas réutiliser |
-| `clone` | ordre des arguments ARM64 | `flags, stack, parent_tid, child_tid, tls` (les deux derniers sont inversés par rapport à ARM64) | `x64/Thread.cpp` | équipe processus |
-| `uname` | `machine` `aarch64` (`syscall_sys.c:37`) | `x86_64` | sans objet | une ligne |
-| `mmap` | mêmes drapeaux, pas de `MAP_32BIT` | `MAP_32BIT` 0x40 | `Get32BitAllocator()` pour les adresses sous 4 Gio (`SyscallsSMCTracking.cpp:316-325`) | inutile sur Darwin, l'espace sous 4 Gio n'existe pas |
-| `getrandom`, `futex`, `ppoll`, `pselect6`, `wait4`, `ioctl` (hors tty) | mêmes arguments | identiques | passthrough | reprise |
+| Numbers | asm-generic, `read`=63, `openat`=56, `mmap`=222 (`syscall.h:17-200`) | `read`=0, `write`=1, `open`=2, `mmap`=9 | about 467 x86-64 entries (`x64/SyscallsEnum.h`) to about 469 ARM64 entries (`Arm64/SyscallsEnum.h`) through `SYSCALL_DEF` (`Syscalls.h:54`, 400 uses) | to redo |
+| Registers | X8, X0-X5 | rax; rdi, rsi, rdx, r10, r8, r9 | `CpuStateFrame`, typed handlers | to redo |
+| Legacy calls absent from ARM64 | not applicable | `open`, `stat`, `lstat`, `access`, `pipe`, `dup2`, `poll`, `select`, `rename`, `mkdir`, `rmdir`, `link`, `unlink`, `symlink`, `readlink`, `chmod`, `chown`, `creat`, `getdents`, `utime`, `time`, `fork`, `vfork`, `arch_prctl` | calls the glibc functions (`Syscalls/FS.cpp:23-48`, `x64/FD.cpp:122-128`), emulation of `getdents` through `getdents64` (`GetDentsEmulation`) | to write (about 30 calls) |
+| `struct stat` | 128 bytes (`syscall.h:402`) | 144 bytes: `st_dev`, `st_ino`, `st_nlink` (8), `st_mode`, `st_uid`, `st_gid`, `__pad0`, `st_rdev`, `st_size`, `st_blksize` (8), `st_blocks`, 3 timestamps, 3 spare words | `guest_stat`, `static_assert` 144 (`x64/Types.h:112-215`), used in `x64/FD.cpp:65-103` | new 25-line function; `mac_to_linux_dev` can be reused |
+| `dirent64` | 19-byte header, `d_ino`, `d_off`, `d_reclen`, `d_type` (`syscall_fs.c:97-103`) | identical | `linux_dirent_64`, `static_assert` 19 (`x64/Types.h:213-222`) | reuse |
+| `statfs` | `linux_statfs_t` (`syscall.h:450`) | same 64-bit layout | passes `FM.Statfs` directly (`x64/FD.cpp:135-139`) | reuse |
+| `rlimit` | 16 bytes, `RLIM_INFINITY` = 2^64-1 (`syscall_sys.c:244-299`) | identical | passthrough | reuse |
+| `flock` (`fcntl`) | 32 bytes | identical | passthrough | reuse; the conversion of F_RDLCK 0, F_WRLCK 1, F_UNLCK 2 to macOS's 1, 3, 2 is a private fix in `syscall_fs.c` |
+| `sockaddr`, `msghdr`, `cmsghdr` | LP64 Linux | identical | passthrough | reuse (`syscall_net.c`, other report) |
+| `timespec`, `timeval`, `iovec`, `pollfd`, `sysinfo`, `rusage` | `linux_timespec_t` etc. (`syscall.h:437-545`) | identical | passthrough | reuse |
+| `epoll_event` | 16 bytes, unpacked (`syscall_poll.c:583`) | 12 bytes packed | `epoll_event_x86`, `static_assert` 12 (`Types.h:56-72`) and copy by vector (`x64/EPoll.cpp:24-94`) | to adapt (20 lines) |
+| `O_*` | `O_DIRECTORY` 0x4000, `O_NOFOLLOW` 0x8000, `O_DIRECT` 0x10000, `O_LARGEFILE` 0x20000 (`syscall.h:352-356`) | `O_DIRECT` 040000, `O_LARGEFILE` 0100000, `O_DIRECTORY` 0200000, `O_NOFOLLOW` 0400000 | `RemapFromX86Flags` and `RemapToX86Flags` (`Syscalls.h:490-562`) | to adapt; `translate_open_flags` (`syscall.c:453-473`) ignores `O_DIRECT`, `O_SYNC`, `O_DSYNC`, `O_NOATIME`, `O_PATH`, `O_TMPFILE` |
+| kernel `sigaction` | 32 bytes: handler, flags, restorer, mask | 32 bytes, same order | `GuestSigAction` (`Types.h:97-106`) | same size; the real ARM64 structure has no `restorer` as far as I remember the kernel headers, not rechecked here (signals team) |
+| Signal frame, `ucontext`, `rt_sigreturn` | ARM64 frame built on the guest stack, restorer in the vDSO (`vdso.h:34-38`) | x86-64 frame with xsave `fpstate`, restorer provided by the libc (`SA_RESTORER`) | `SignalDelegator` (1,352 + 856 lines) | out of scope; do not reuse |
+| `clone` | ARM64 argument order | `flags, stack, parent_tid, child_tid, tls` (the last two are swapped compared to ARM64) | `x64/Thread.cpp` | process team |
+| `uname` | `machine` `aarch64` (`syscall_sys.c:37`) | `x86_64` | not applicable | one line |
+| `mmap` | same flags, no `MAP_32BIT` | `MAP_32BIT` 0x40 | `Get32BitAllocator()` for addresses below 4 GiB (`SyscallsSMCTracking.cpp:316-325`) | useless on Darwin, the space below 4 GiB does not exist |
+| `getrandom`, `futex`, `ppoll`, `pselect6`, `wait4`, `ioctl` (except tty) | same arguments | identical | passthrough | reuse |
 
-### 4.3 Comment FEX convertit les appels x86-64 vers l'ABI hôte ARM64
+### 4.3 How FEX converts x86-64 calls to the ARM64 host ABI
 
-LU dans FEX. Chaque appel x86-64 est enregistré par `REGISTER_SYSCALL_IMPL_X64(nom, lambda)` ou `REGISTER_SYSCALL_IMPL(nom, lambda)` (les deux architectures). Quatre mécanismes :
+READ in FEX. Each x86-64 call is registered by `REGISTER_SYSCALL_IMPL_X64(name, lambda)` or `REGISTER_SYSCALL_IMPL(name, lambda)` (both architectures). Four mechanisms:
 
-1. Passthrough. 168 appels communs (`RegisterCommon`, `Syscalls/Passthrough.cpp:212-414`) plus 73 propres à x86-64 (`Passthrough.cpp:416-501`), soit 241 appels envoyés tels quels. Sur un hôte ARM64 Linux, un `svc #0` en assembleur en ligne avec le numéro ARM64 (`Passthrough.cpp:17-150`) ; sur les autres hôtes, `::syscall` (l.152-210). La liste inclut `read`, `write`, `ioctl`, `readv`, `writev`, `sendmsg`, `recvmsg`, `setsockopt`, `getsockopt`, `futex`, `wait4`, `ppoll`, `pselect6`, `clock_*`, `timerfd_*`, `preadv`, `pwritev`, `process_vm_readv`, `process_vm_writev`, `memfd_create`, `getrandom`, `futex_waitv`.
-2. Conversion de structure ou de drapeaux, environ 100 handlers : `stat` en `guest_stat` (`x64/FD.cpp:65-103`), `epoll_*` (`x64/EPoll.cpp`), `fcntl` avec remappage de `O_*` (`x64/FD.cpp:45-55`), `rt_sigaction` vers le délégué de signaux (`x64/Signals.cpp:21-28`), `getdents` hérité, `clone`.
-3. Appels hérités implémentés par les fonctions glibc (`::rename`, `::mkdir`, `::unlink`…), qui prennent le chemin invité tel quel.
-4. Mémoire : `GuestMmap`, `GuestMunmap`, `GuestMremap`, `GuestMprotect` appellent `::mmap`, `::munmap`, `::mremap`, `::mprotect` de l'hôte, puis mettent à jour `VMATracking` et invalident le code JIT (`SyscallsSMCTracking.cpp:302-514`). Les chemins passent par `FileManager`, qui superpose une racine (`RootFSFD`) et émule quelques fichiers : `/proc/cpuinfo`, `/proc/version`, `/proc/sys/kernel/osrelease`, `/proc/self/auxv`, `/sys/devices/system/cpu/online`, `/proc/self/exe` (`FEX/EmulatedFiles/EmulatedFiles.cpp:522-592`, `FEX/FileManagement.h`). Tout le reste de `/proc` est celui du vrai noyau Linux, ce qui n'existe pas sur Darwin.
+1. Passthrough. 168 common calls (`RegisterCommon`, `Syscalls/Passthrough.cpp:212-414`) plus 73 specific to x86-64 (`Passthrough.cpp:416-501`), that is 241 calls sent as is. On an ARM64 Linux host, an inline assembly `svc #0` with the ARM64 number (`Passthrough.cpp:17-150`); on other hosts, `::syscall` (l.152-210). The list includes `read`, `write`, `ioctl`, `readv`, `writev`, `sendmsg`, `recvmsg`, `setsockopt`, `getsockopt`, `futex`, `wait4`, `ppoll`, `pselect6`, `clock_*`, `timerfd_*`, `preadv`, `pwritev`, `process_vm_readv`, `process_vm_writev`, `memfd_create`, `getrandom`, `futex_waitv`.
+2. Structure or flag conversion, about 100 handlers: `stat` to `guest_stat` (`x64/FD.cpp:65-103`), `epoll_*` (`x64/EPoll.cpp`), `fcntl` with `O_*` remapping (`x64/FD.cpp:45-55`), `rt_sigaction` to the signal delegate (`x64/Signals.cpp:21-28`), legacy `getdents`, `clone`.
+3. Legacy calls implemented by the glibc functions (`::rename`, `::mkdir`, `::unlink`…), which take the guest path as is.
+4. Memory: `GuestMmap`, `GuestMunmap`, `GuestMremap`, `GuestMprotect` call the host's `::mmap`, `::munmap`, `::mremap`, `::mprotect`, then update `VMATracking` and invalidate the JIT code (`SyscallsSMCTracking.cpp:302-514`). Paths go through `FileManager`, which overlays a root (`RootFSFD`) and emulates a few files: `/proc/cpuinfo`, `/proc/version`, `/proc/sys/kernel/osrelease`, `/proc/self/auxv`, `/sys/devices/system/cpu/online`, `/proc/self/exe` (`FEX/EmulatedFiles/EmulatedFiles.cpp:522-592`, `FEX/FileManagement.h`). All the rest of `/proc` is the real Linux kernel's, which does not exist on Darwin.
 
-MESURÉ (comptage). Le répertoire `LinuxEmulation` hors `x32` fait 21 705 lignes dans 75 fichiers, `x32` 10 793. Hors `x32`, `grep` compte 137 lignes `::syscall(`, 400 usages de `SYSCALL_DEF`, 19 lignes `asm volatile` dans 5 fichiers, 39 inclusions d'en-têtes `<linux/…>` ou `<asm/…>` (le SDK macOS n'a aucun répertoire `usr/include/linux`) et 25 inclusions de 14 en-têtes `<sys/…>` absents du SDK : `auxv`, `epoll`, `eventfd`, `fsuid`, `inotify`, `klog`, `personality`, `prctl`, `sendfile`, `signalfd`, `statfs`, `swap`, `sysinfo`, `timerfd`.
+MEASURED (counting). The `LinuxEmulation` directory excluding `x32` is 21,705 lines in 75 files, `x32` 10,793. Excluding `x32`, `grep` counts 137 `::syscall(` lines, 400 uses of `SYSCALL_DEF`, 19 `asm volatile` lines in 5 files, 39 inclusions of `<linux/…>` or `<asm/…>` headers (the macOS SDK has no `usr/include/linux` directory) and 25 inclusions of 14 `<sys/…>` headers absent from the SDK: `auxv`, `epoll`, `eventfd`, `fsuid`, `inotify`, `klog`, `personality`, `prctl`, `sendfile`, `signalfd`, `statfs`, `swap`, `sysinfo`, `timerfd`.
 
-MESURÉ (comparaison de noms, script jetable). Sur les 241 appels passthrough, HL en implémente 128 et n'en a pas 113. Parmi les absents : `process_vm_readv`, `process_vm_writev`, `futex_waitv`, `timer_create` et cinq autres `timer_*`, `capget`, `capset`, `getsid`, `times`, `settimeofday`, `rt_sigqueueinfo`, `sched_*` (neuf appels), `semget`, `semop`, `semtimedop`, `msgget`, `msgsnd`, `msgrcv`, `msgctl`, `mq_*`, `io_*` (sept appels), `pidfd_*`, `readahead`, `sync_file_range`, `syncfs`, `mlockall`, `mlock2`, `getcpu`, `setgroups`, `setfsuid`, `setfsgid`, `syslog`, `unshare`, `setns`, `kcmp`.
+MEASURED (name comparison, throwaway script). Of the 241 passthrough calls, HL implements 128 and lacks 113. Among the missing: `process_vm_readv`, `process_vm_writev`, `futex_waitv`, `timer_create` and five other `timer_*`, `capget`, `capset`, `getsid`, `times`, `settimeofday`, `rt_sigqueueinfo`, `sched_*` (nine calls), `semget`, `semop`, `semtimedop`, `msgget`, `msgsnd`, `msgrcv`, `msgctl`, `mq_*`, `io_*` (seven calls), `pidfd_*`, `readahead`, `sync_file_range`, `syncfs`, `mlockall`, `mlock2`, `getcpu`, `setgroups`, `setfsuid`, `setfsgid`, `syslog`, `unshare`, `setns`, `kcmp`.
 
-### 4.4 Comparaison des deux compositions
+### 4.4 Comparison of the two compositions
 
-Composition A : `LinuxEmulation` de FEX compilé pour Darwin sur une bibliothèque « noyau ARM64 sur Darwin » dérivée des handlers de HL. Composition B : une couche x86-64 neuve écrite directement pour FEXCore.
+Composition A: FEX's `LinuxEmulation` compiled for Darwin on top of an "ARM64 kernel on Darwin" library derived from HL's handlers. Composition B: a new x86-64 layer written directly for FEXCore.
 
-Pour A, il faut :
+For A, the following is needed:
 
-- Remplacer les 7 gabarits de passthrough (`Passthrough.cpp:17-210`) et les 137 sites `::syscall` par un appel `hl_syscall(nr, a0..a5)`. Mécanique, environ 150 sites.
-- Fournir une libc « Linux » : FEX appelle directement `::open`, `::stat`, `::fcntl`, `::select`, `::rename`, `::mkdir`, `::epoll_*`… avec des valeurs de drapeaux Linux (`RemapToX86Flags` suppose des `O_*` ARM64 Linux, `Syscalls.h:528-562`). Sur Darwin ces appels renverraient des valeurs Darwin. Environ 100 enveloppes, plus l'isolation des en-têtes : 64 inclusions visent des en-têtes absents du SDK macOS (39 UAPI Linux et 25 `<sys/…>`) et, INFÉRÉ, les en-têtes UAPI importés risquent de redéfinir des types que le SDK définit aussi (`struct stat`, `timespec`).
-- Étendre la bibliothèque de 128 à environ 240 appels pour tenir le passthrough, ou marquer ENOSYS les appels que Wine et EAC n'utilisent pas.
-- Convertir deux fois : Darwin vers ARM64 dans la bibliothèque, ARM64 vers x86-64 dans FEX (`stat`, `epoll`, drapeaux). `st_dev` aurait deux encodages à enchaîner.
-- Porter ce qui reste Linux dans FEX de toute façon : création de threads par appels système bruts en assembleur (`Utils/Threads.cpp:128-173`), délégué de signaux sur `ucontext` ARM64 Linux (`ArchHelpers/MContext.h`, 409 lignes, `UContext.h`, 439), `execve` réalisé par `execveat(…, "/proc/self/exe", …)` (`Syscalls.cpp:443`), client FEXServer (`SyscallsSMCTracking.cpp:434-466`), allocateur 32 bits (`LinuxAllocator.cpp`), `GdbServer`.
-- Garder deux gestionnaires de chemins en conflit : le `FileManager` à racine de FEX et le vfs à montages de HL.
+- Replace the 7 passthrough templates (`Passthrough.cpp:17-210`) and the 137 `::syscall` sites with a `hl_syscall(nr, a0..a5)` call. Mechanical, about 150 sites.
+- Provide a "Linux" libc: FEX directly calls `::open`, `::stat`, `::fcntl`, `::select`, `::rename`, `::mkdir`, `::epoll_*`… with Linux flag values (`RemapToX86Flags` assumes ARM64 Linux `O_*`, `Syscalls.h:528-562`). On Darwin these calls would return Darwin values. About 100 wrappers, plus header isolation: 64 inclusions target headers absent from the macOS SDK (39 Linux UAPI and 25 `<sys/…>`) and, INFERRED, the imported UAPI headers risk redefining types that the SDK also defines (`struct stat`, `timespec`).
+- Extend the library from 128 to about 240 calls to cover the passthrough, or mark as ENOSYS the calls that Wine and EAC do not use.
+- Convert twice: Darwin to ARM64 in the library, ARM64 to x86-64 in FEX (`stat`, `epoll`, flags). `st_dev` would have two encodings to chain.
+- Port what remains Linux in FEX anyway: thread creation through raw system calls in assembly (`Utils/Threads.cpp:128-173`), signal delegate on ARM64 Linux `ucontext` (`ArchHelpers/MContext.h`, 409 lines, `UContext.h`, 439), `execve` done through `execveat(…, "/proc/self/exe", …)` (`Syscalls.cpp:443`), FEXServer client (`SyscallsSMCTracking.cpp:434-466`), 32-bit allocator (`LinuxAllocator.cpp`), `GdbServer`.
+- Keep two conflicting path managers: FEX's rooted `FileManager` and HL's mount-based vfs.
 
-Pour B, il faut :
+For B, the following is needed:
 
-- Une table de dispatch x86-64 sur `CpuStateFrame` : environ 150 à 200 appels, les 103 numéros ARM64 vus dans les traces Wine plus EAC (annexe B) étant la base.
-- Les convertisseurs x86-64 : `stat`, `epoll_event`, drapeaux `O_*`, `getdents`, `uname`, environ 30 appels hérités.
-- Les services « Linux sur Darwin » de HL tels quels : vfs, fd, procfs, noms de tâches, traductions d'errno et de drapeaux, `kqueue` pour epoll, timerfd, inotify.
+- An x86-64 dispatch table on `CpuStateFrame`: about 150 to 200 calls, with the 103 ARM64 numbers seen in the Wine plus EAC traces (appendix B) as the base.
+- The x86-64 converters: `stat`, `epoll_event`, `O_*` flags, `getdents`, `uname`, about 30 legacy calls.
+- HL's "Linux on Darwin" services as is: vfs, fd, procfs, task names, errno and flag translations, `kqueue` for epoll, timerfd, inotify.
 
-Raisons de choisir B :
+Reasons to choose B:
 
-1. MESURÉ : 241 appels de FEX sont des passthrough et HL n'en couvre que 128. A oblige à faire de HL un noyau ARM64 presque complet, B oblige à servir ce que Wine et EAC appellent. Les traces de l'expérience précédente (annexe B) donnent 103 appels distincts, 101 présents dans le dispatch de HL.
-2. La conversion se fait une fois, de Darwin vers x86-64.
-3. HL canalise les accès des handlers à la mémoire invitée par cinq fonctions (269 sites hors `guest.c`). En processus, `guest_ptr(g, gva)` devient l'identité et `guest_read`/`guest_write` des copies protégées (modèle : `FEX/FaultSafeUserMemAccess.cpp`, 183 lignes). Les 269 sites ne changent pas.
-4. Les parties de FEX qui valent la peine d'être importées sont couplées au CPU, pas au noyau, et s'importent dans B sans A : `SyscallsVMATracking.*` (765 lignes), `SyscallsSMCTracking.cpp` (816), `x64/Types.h` (222), `Types.h` (108), `FaultSafeUserMemAccess.cpp` (183), le générateur de `/proc/cpuinfo` (`EmulatedFiles.cpp:522-534`), `VDSO_Emulation.cpp` (906). Licences : FEX est MIT et HL Apache-2.0, toutes deux permissives. L'équipe FEXCore signale la règle de `CLAUDE.md` de FEX sur les contributions générées par IA (`fexcore-darwin-port.md`, dernière section) ; elle vise les contributions amont, pas ce banc privé.
-5. L'équipe FEXCore écrit déjà un hôte `fexdarwin-run` avec son chargeur ELF, sa pile initiale et son délégué de signaux (`fexcore-darwin-port.md`, prochaines étapes).
+1. MEASURED: 241 of FEX's calls are passthrough and HL covers only 128 of them. A forces HL to become an almost complete ARM64 kernel, B requires serving what Wine and EAC call. The traces of the previous experiment (appendix B) give 103 distinct calls, 101 present in HL's dispatch.
+2. The conversion happens once, from Darwin to x86-64.
+3. HL channels the handlers' accesses to guest memory through five functions (269 sites outside `guest.c`). In a process, `guest_ptr(g, gva)` becomes the identity and `guest_read`/`guest_write` protected copies (model: `FEX/FaultSafeUserMemAccess.cpp`, 183 lines). The 269 sites do not change.
+4. The parts of FEX worth importing are coupled to the CPU, not to the kernel, and can be imported into B without A: `SyscallsVMATracking.*` (765 lines), `SyscallsSMCTracking.cpp` (816), `x64/Types.h` (222), `Types.h` (108), `FaultSafeUserMemAccess.cpp` (183), the `/proc/cpuinfo` generator (`EmulatedFiles.cpp:522-534`), `VDSO_Emulation.cpp` (906). Licenses: FEX is MIT and HL Apache-2.0, both permissive. The FEXCore team points out the rule in FEX's `CLAUDE.md` on AI-generated contributions (`fexcore-darwin-port.md`, last section); it targets upstream contributions, not this private test bench.
+5. The FEXCore team is already writing a `fexdarwin-run` host with its ELF loader, its initial stack and its signal delegate (`fexcore-darwin-port.md`, next steps).
 
-Quantité de glue, INFÉRÉE de la table de la section 2 et des comptages ci-dessus : B demande environ 2 600 à 3 400 lignes pour la table et les convertisseurs, plus 1 800 à 2 400 lignes de retouches des handlers repris. A demande à peu près B plus 3 000 à 4 500 lignes : 2 000 à 3 000 de retouches dans FEX, 800 à 1 200 de libc Linux, 1 500 à 2 500 pour sortir HL de `guest_t`. Réserve : l'avantage de A est de suivre FEX en amont ; il est faible ici parce que le dépôt FEX est déjà forké pour Darwin.
+Amount of glue, INFERRED from the table in section 2 and the counts above: B needs about 2,600 to 3,400 lines for the table and the converters, plus 1,800 to 2,400 lines of touch-ups to the reused handlers. A needs roughly B plus 3,000 to 4,500 lines: 2,000 to 3,000 of touch-ups in FEX, 800 to 1,200 of Linux libc, 1,500 to 2,500 to get HL out of `guest_t`. Caveat: A's advantage is to track FEX upstream; it is small here because the FEX repository is already forked for Darwin.
 
-## 5. Lacunes du coeur face aux besoins de Wine et EAC
+## 5. Gaps of the core relative to the needs of Wine and EAC
 
-État dans la copie de travail. Les besoins viennent des traces de l'expérience précédente (`XP/README.md`, `XP/STATUS.md`) : l'amorceur EAC écrit de 6,6 à 9,7 Mo dans un memfd selon les essais, lit la carte mémoire pour trouver `libc`, rouvre le memfd par `/proc/self/fd/N`, tente `F_ADD_SEALS`, appelle `ptrace`, `readlinkat(/proc/self/exe)`.
+State in the working copy. The needs come from the traces of the previous experiment (`XP/README.md`, `XP/STATUS.md`): the EAC bootstrapper writes 6.6 to 9.7 MB into a memfd depending on the runs, reads the memory map to find `libc`, reopens the memfd through `/proc/self/fd/N`, tries `F_ADD_SEALS`, calls `ptrace`, `readlinkat(/proc/self/exe)`.
 
-| Élément | État | Détail |
+| Item | State | Detail |
 | --- | --- | --- |
-| `/proc/self/maps` | présent | Rendu depuis la table VMA, noms `[heap]`, `[stack]`, `[sysvshm]` (`hl.c:891-903`, `syscall_shm.c:584`) ; `[vdso]` et `[vvar]` seulement en mode Rosetta (`rosetta.c:238-241`). Le chemin invité est recalculé par `hl_vfs_host_to_guest`. |
-| `/proc/<pid>/maps`, autre processus | absent | Seul l'alias strict du PID courant est réécrit en `/proc/self` (`proc_emulation.c:60-68`). Cet alias a corrigé l'ouverture de `/proc/1/maps` par l'amorceur EAC quand son propre PID est 1 (`XP/README.md`, ligne 109). Aucune lecture de la carte d'un autre PID n'a été vue dans les traces citées. |
-| `/proc/self/status` | partiel | Name, State, Tgid, Pid, PPid, TracerPid, Uid, Gid, VmPeak, VmSize, VmRSS, Threads (`proc_emulation.c:521-576`). VmSize et VmRSS viennent des blocs de support. Absents : VmData, VmStk, VmExe, VmLib, Seccomp, NoNewPrivs, Cap*, Sig*, Cpus_allowed. |
-| `/proc/<tid>/status` d'un autre processus | partiel | Name, State (Z ou t), Tgid, Pid, PPid, TracerPid, Uid, Gid (`proc_emulation.c:133-166`). |
-| `/proc/self/stat` | partiel | 52 champs, seuls pid, comm, état `R`, ppid, pgrp, session, utime, stime, threads, vsize, rss sont remplis (`proc_emulation.c:804-855`). |
-| `/proc/self/task` | partiel | Ouverture de `/proc/<tgid>/task/<tid>/comm` et `status` (`proc_emulation.c:99-111`). Pas de listage de `/proc/self/task` ni de `/proc/self/task/<tid>/` : l'ouverture d'un répertoire sous un montage virtuel renvoie ENOENT (`syscall_fs.c:549`). |
-| `/proc/self/fd` | partiel | Ouverture, `readlink` et `stat` de `/proc/self/fd/N` (`proc_emulation.c:293-395`, `1053-1075`, `997-1007`) ; pas de listage du répertoire. Pas de `/proc/self/fdinfo`. |
-| `/proc/self/exe` | présent | `readlink` en chemin invité par `realpath` et `hl_vfs_host_to_guest` (`proc_emulation.c:1026-1031`), ouverture du binaire (`493-498`). Autres tâches : instantané d'exec. |
-| `/proc/self/cmdline` | présent | Octets NUL séparés, instantané d'exec pour les autres tâches (`proc_emulation.c:579-584`). |
-| `/proc/self/environ` | absent | Aucune occurrence. |
-| `/proc/self/mem` | absent | Aucune occurrence. |
-| `/proc/cpuinfo` | partiel | Champs ARM seulement : « CPU implementer 0x61 » (`proc_emulation.c:501-518`). Faux pour un invité x86-64 ; reprendre le générateur de FEX. |
-| `/proc/meminfo` | partiel | Rapports fixes : 50 % libre, 75 % disponible (`proc_emulation.c:730-782`). |
-| `/proc/self/smaps`, `pagemap`, `limits`, `auxv` | absent | Aucune occurrence dans `src/`. FEX fournit `auxv` (`FEX/EmulatedFiles/EmulatedFiles.cpp:589-592`). |
-| `/proc/self/io` | partiel | Fichier de zéros (`proc_emulation.c:787-797`). |
-| `/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/random`, `/dev/tty` | présent | Ouverture du nœud hôte (`device.c:47-105`, `proc_emulation.c:449-471`). |
-| `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N` | présent | `proc_emulation.c:473-487`. |
-| `/dev/shm` | absent | Aucun nœud ni montage. À contourner par un montage d'un répertoire hôte, à tester avec le chemin MAP_SHARED de fichier. |
-| `/dev/full`, `/dev/ptmx`, `/dev/pts` | absent | Aucune occurrence. |
-| `memfd_create` | partiel | Fichier temporaire supprimé, `MFD_CLOEXEC` seulement, nom ignoré (`syscall.c:2385-2398`). `readlink /proc/self/fd/N` ne donne pas `/memfd:nom (deleted)`. |
-| Seals (`F_ADD_SEALS`, `F_GET_SEALS`) | absent | Aucune occurrence de « seal ». `F_ADD_SEALS(0xf)` renvoie EINVAL (`XP/README.md`, ligne 209). Sonde `XP/probes/memfd-seals` : 8 contrôles sur 29 passent sous HL, 29 sur 29 sous Linux. L'essai allow contre deny sur un vrai noyau Linux garde 509/210 dans les deux cas (`XP/linux-reference/seal-comparison/README.md`), donc le lien avec le rejet d'EAC n'est pas établi. Sur Darwin, aucun contrôle ne bloque les écritures par un mapping existant : un scellement exact est impossible, il faudra décider d'un scellement approché et le documenter. |
+| `/proc/self/maps` | present | Rendered from the VMA table, names `[heap]`, `[stack]`, `[sysvshm]` (`hl.c:891-903`, `syscall_shm.c:584`); `[vdso]` and `[vvar]` only in Rosetta mode (`rosetta.c:238-241`). The guest path is recomputed by `hl_vfs_host_to_guest`. |
+| `/proc/<pid>/maps`, another process | absent | Only the strict alias of the current PID is rewritten to `/proc/self` (`proc_emulation.c:60-68`). This alias fixed the opening of `/proc/1/maps` by the EAC bootstrapper when its own PID is 1 (`XP/README.md`, line 109). No read of another PID's map was seen in the cited traces. |
+| `/proc/self/status` | partial | Name, State, Tgid, Pid, PPid, TracerPid, Uid, Gid, VmPeak, VmSize, VmRSS, Threads (`proc_emulation.c:521-576`). VmSize and VmRSS come from the backing blocks. Missing: VmData, VmStk, VmExe, VmLib, Seccomp, NoNewPrivs, Cap*, Sig*, Cpus_allowed. |
+| `/proc/<tid>/status` of another process | partial | Name, State (Z or t), Tgid, Pid, PPid, TracerPid, Uid, Gid (`proc_emulation.c:133-166`). |
+| `/proc/self/stat` | partial | 52 fields, only pid, comm, state `R`, ppid, pgrp, session, utime, stime, threads, vsize, rss are filled (`proc_emulation.c:804-855`). |
+| `/proc/self/task` | partial | Opening of `/proc/<tgid>/task/<tid>/comm` and `status` (`proc_emulation.c:99-111`). No listing of `/proc/self/task` nor of `/proc/self/task/<tid>/`: opening a directory under a virtual mount returns ENOENT (`syscall_fs.c:549`). |
+| `/proc/self/fd` | partial | Opening, `readlink` and `stat` of `/proc/self/fd/N` (`proc_emulation.c:293-395`, `1053-1075`, `997-1007`); no directory listing. No `/proc/self/fdinfo`. |
+| `/proc/self/exe` | present | `readlink` as a guest path through `realpath` and `hl_vfs_host_to_guest` (`proc_emulation.c:1026-1031`), opening of the binary (`493-498`). Other tasks: exec snapshot. |
+| `/proc/self/cmdline` | present | NUL-separated bytes, exec snapshot for the other tasks (`proc_emulation.c:579-584`). |
+| `/proc/self/environ` | absent | No occurrence. |
+| `/proc/self/mem` | absent | No occurrence. |
+| `/proc/cpuinfo` | partial | ARM fields only: "CPU implementer 0x61" (`proc_emulation.c:501-518`). Wrong for an x86-64 guest; reuse FEX's generator. |
+| `/proc/meminfo` | partial | Fixed ratios: 50% free, 75% available (`proc_emulation.c:730-782`). |
+| `/proc/self/smaps`, `pagemap`, `limits`, `auxv` | absent | No occurrence in `src/`. FEX provides `auxv` (`FEX/EmulatedFiles/EmulatedFiles.cpp:589-592`). |
+| `/proc/self/io` | partial | File of zeros (`proc_emulation.c:787-797`). |
+| `/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/random`, `/dev/tty` | present | Opening of the host node (`device.c:47-105`, `proc_emulation.c:449-471`). |
+| `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/N` | present | `proc_emulation.c:473-487`. |
+| `/dev/shm` | absent | No node or mount. To work around with a mount of a host directory, to test with the file MAP_SHARED path. |
+| `/dev/full`, `/dev/ptmx`, `/dev/pts` | absent | No occurrence. |
+| `memfd_create` | partial | Deleted temporary file, `MFD_CLOEXEC` only, name ignored (`syscall.c:2385-2398`). `readlink /proc/self/fd/N` does not give `/memfd:name (deleted)`. |
+| Seals (`F_ADD_SEALS`, `F_GET_SEALS`) | absent | No occurrence of "seal". `F_ADD_SEALS(0xf)` returns EINVAL (`XP/README.md`, line 209). Probe `XP/probes/memfd-seals`: 8 checks out of 29 pass under HL, 29 out of 29 under Linux. The allow versus deny trial on a real Linux kernel keeps 509/210 in both cases (`XP/linux-reference/seal-comparison/README.md`), so the link with EAC's rejection is not established. On Darwin, no check blocks writes through an existing mapping: exact sealing is impossible, an approximate sealing will have to be decided and documented. |
 | `mremap` | absent | ENOSYS (`syscall.c:2451-2462`). |
-| `madvise` | partiel (stub) | Renvoie 0 sans rien faire (`syscall.c:1692-1694`) ; `MADV_DONTNEED` ne vide pas la page. |
-| `mincore` | absent (ENOSYS explicite) | ENOSYS (`syscall.c:2409-2411`). |
-| `mlock`, `munlock`, `msync` | partiel (stub) | Renvoient 0 (`syscall.c:2399-2408`). |
-| `process_vm_readv`, `process_vm_writev` | absent | ENOSYS. `XP/STATUS.md` note sept lectures `process_vm_readv` en ENOSYS dans le témoin complexe. Sur Darwin la lecture dans un autre processus passe par `mach_vm_read_overwrite` sur le port de tâche du pair ; son obtention est du ressort de l'équipe processus. |
-| `userfaultfd` | absent | ENOSYS. Aucun équivalent Darwin ; je n'ai trouvé aucun usage dans les traces. |
-| Descripteurs au-delà de 1 024 | absent | `FD_TABLE_SIZE` = 1024 (`syscall.h:601`). |
-| Famille xattr, numéros | défaut | `SYS_fgetxattr` est 16 et `SYS_fremovexattr` 18 dans `syscall.h:166` et `169` ; les vrais numéros ARM64 sont 10 et 16. Un appel `fgetxattr` (numéro 10) tombe dans « unimplemented syscall 10 » (19, 36 et 22 fois dans les trois traces EAC) et un `fremovexattr` (16) irait au handler de `fgetxattr`. Défaut présent aussi à HEAD (`git show HEAD:src/syscall.h`). Contrôle systématique : sur les 177 `#define SYS_*` de `syscall.h`, 175 coïncident avec la table ARM64 que j'ai reconstituée de mémoire (script jetable) et ces deux seuls sont faux. |
-| `O_TMPFILE`, `O_PATH`, `O_SYNC`, `O_DSYNC`, `O_NOATIME` | absent | Ignorés sans erreur par `translate_open_flags` (`syscall.c:453-473`). |
+| `madvise` | partial (stub) | Returns 0 without doing anything (`syscall.c:1692-1694`); `MADV_DONTNEED` does not clear the page. |
+| `mincore` | absent (explicit ENOSYS) | ENOSYS (`syscall.c:2409-2411`). |
+| `mlock`, `munlock`, `msync` | partial (stub) | Return 0 (`syscall.c:2399-2408`). |
+| `process_vm_readv`, `process_vm_writev` | absent | ENOSYS. `XP/STATUS.md` notes seven `process_vm_readv` reads returning ENOSYS in the complex witness. On Darwin, reading another process goes through `mach_vm_read_overwrite` on the peer's task port; obtaining it is the process team's concern. |
+| `userfaultfd` | absent | ENOSYS. No Darwin equivalent; I found no use in the traces. |
+| Descriptors beyond 1,024 | absent | `FD_TABLE_SIZE` = 1024 (`syscall.h:601`). |
+| xattr family, numbers | defect | `SYS_fgetxattr` is 16 and `SYS_fremovexattr` 18 in `syscall.h:166` and `169`; the real ARM64 numbers are 10 and 16. An `fgetxattr` call (number 10) falls into "unimplemented syscall 10" (19, 36 and 22 times in the three EAC traces) and an `fremovexattr` (16) would go to the `fgetxattr` handler. Defect also present at HEAD (`git show HEAD:src/syscall.h`). Systematic check: of the 177 `#define SYS_*` in `syscall.h`, 175 match the ARM64 table that I reconstructed from memory (throwaway script) and only these two are wrong. |
+| `O_TMPFILE`, `O_PATH`, `O_SYNC`, `O_DSYNC`, `O_NOATIME` | absent | Ignored without error by `translate_open_flags` (`syscall.c:453-473`). |
 
-Défauts relevés en lisant le code et à ne pas reproduire : `MAP_SHARED` anonyme traité comme privé (`syscall.c:837`, `1120`) ; `munmap` ne libère rien et conserve les PTE du bas de l'espace (`syscall.c:1458-1470`) ; fichiers procfs alloués à partir du descripteur 128 (`syscall_fs.c:466`) ; table VMA de 65 Mio au pire.
+Defects found while reading the code and not to reproduce: anonymous `MAP_SHARED` treated as private (`syscall.c:837`, `1120`); `munmap` frees nothing and keeps the PTEs of the bottom of the space (`syscall.c:1458-1470`); procfs files allocated from descriptor 128 (`syscall_fs.c:466`); 65 MiB VMA table in the worst case.
 
-## 6. Estimation en lignes et cinq risques
+## 6. Line estimate and five risks
 
-### 6.1 Estimation INFÉRÉE pour un hôte FEXCore
+### 6.1 INFERRED estimate for a FEXCore host
 
-Base : sections 2 et 4. Marge : plus ou moins 35 %.
+Basis: sections 2 and 4. Margin: plus or minus 35%.
 
-| Poste | Lignes | Origine |
+| Item | Lines | Origin |
 | --- | --- | --- |
-| Reprise sans changement notable | environ 10 500 | 3 835 de classe reprise moins 150 à 300 retouchées, plus 6 700 à 7 300 des 9 082 de classe adapter qui ne changent pas |
-| Retouches de la classe adapter (numéros, `stat`, `O_*`, `epoll_event`, `machine`, retrait des types `hv_`, shim `guest_ptr`) | 1 800 à 2 400 | 20 à 25 % de 9 082 |
-| Retouches de la classe reprise (séparer `syscall.h` des constantes, retirer l'audio) | 150 à 300 | `vfs.c`, `fd_object.c`, `device.c` incluent `syscall.h` qui inclut `Hypervisor.h` |
-| Gestionnaire d'espace d'adressage : mmap, munmap, mprotect, MAP_FIXED, gestion 4 Kio sur 16 Kio, VMA, crochets d'invalidation JIT | 1 300 à 1 900 | remplace 2 918 lignes de `guest.*` et 686 de `syscall.c` |
-| Table de dispatch x86-64, appels hérités, convertisseurs | 2 600 à 3 400 | section 4.4 |
-| Mappings partagés, SysV SHM, memfd et scellement approché | 700 à 1 100 | `syscall_filemap`, `syscall_shm` réécrits (550) plus seals (250 à 500) |
-| Compléments de procfs : `task`, `fd`, `environ`, `mem`, `/proc/<pid>/maps`, `smaps`, cpuinfo x86, status complet | 700 à 1 100 | section 5 |
-| `mremap`, `madvise`, `mincore`, `process_vm_readv` et `writev` | 600 à 900 | section 5 |
-| Total écrit ou modifié | 8 000 à 11 000 | |
+| Reused without notable change | about 10,500 | 3,835 of the reuse class minus 150 to 300 touched up, plus 6,700 to 7,300 of the 9,082 of the adapt class that do not change |
+| Touch-ups of the adapt class (numbers, `stat`, `O_*`, `epoll_event`, `machine`, removal of the `hv_` types, `guest_ptr` shim) | 1,800 to 2,400 | 20 to 25% of 9,082 |
+| Touch-ups of the reuse class (separate `syscall.h` from the constants, remove audio) | 150 to 300 | `vfs.c`, `fd_object.c`, `device.c` include `syscall.h`, which includes `Hypervisor.h` |
+| Address space manager: mmap, munmap, mprotect, MAP_FIXED, 4 KiB on 16 KiB handling, VMA, JIT invalidation hooks | 1,300 to 1,900 | replaces 2,918 lines of `guest.*` and 686 of `syscall.c` |
+| x86-64 dispatch table, legacy calls, converters | 2,600 to 3,400 | section 4.4 |
+| Shared mappings, SysV SHM, memfd and approximate sealing | 700 to 1,100 | `syscall_filemap`, `syscall_shm` rewritten (550) plus seals (250 to 500) |
+| procfs additions: `task`, `fd`, `environ`, `mem`, `/proc/<pid>/maps`, `smaps`, x86 cpuinfo, full status | 700 to 1,100 | section 5 |
+| `mremap`, `madvise`, `mincore`, `process_vm_readv` and `writev` | 600 to 900 | section 5 |
+| Total written or modified | 8,000 to 11,000 | |
 
-### 6.2 Les cinq éléments les plus risqués
+### 6.2 The five riskiest items
 
-1. Granularité 4 Kio invitée sur pages hôte de 16 Kio avec adresse invitée = adresse hôte. MESURÉ : `mmap` et `mprotect` hôtes arrondissent à 16 Kio, un `MAP_FIXED` de 4 Kio détruit 12 Kio voisins, un offset de fichier à 0x1000 est refusé. HL résout cela avec son MMU invité, qui n'existe plus. Choix à faire tôt, car il conditionne Wine (taille de page annoncée, gardes de pile, `VirtualProtect`, sections PE) : annoncer 16 Kio, ou émuler par fautes. Aucune des deux n'a été testée.
-2. Adresses invitées basses. MESURÉ par l'équipe FEXCore : aucun `mmap` fixe sous 4 Gio, `__PAGEZERO` ne peut pas être réduit (`reports/fexcore-darwin-port.md`, tableau des mesures). HL l'évite (guest.h:95, `GUEST_IPA_BASE` = 0) et ses correctifs privés libèrent le bas de l'espace pour la zone DOS de Wine. Un ELF x86-64 lié à 0x400000 ou un préchargeur de Wine à adresse fixe basse ne se chargent pas en processus ; seule une traduction d'adresse dans le JIT ou des invités liés plus haut sortent de l'impasse.
-3. Sémantique exacte de `munmap`, `mprotect`, `mremap` et `madvise` et cohérence avec le JIT. HL triche : `munmap` ne libère rien, `madvise` et `mincore` sont des stubs. En processus l'invité observe les vraies fautes, `mremap` n'existe pas sur Darwin et `MADV_DONTNEED` ne remet pas à zéro. Toute écriture dans la table VMA doit être atomique avec l'invalidation des traductions (modèle : `GuestMmap` de FEX). Une course ici produit du code obsolète exécuté, difficile à diagnostiquer.
-4. Fidélité de `/proc` et de memfd pour EAC. L'amorceur ouvre `/proc/<son pid>/maps` pour localiser `libc` (ligne `/libc-` ou `libc.so`), rouvre le memfd par `/proc/self/fd/N` avec un curseur indépendant et tente `F_ADD_SEALS` (`XP/README.md`, section « Lecture de la carte mémoire par EAC »). Les seals ne sont pas imitables à l'identique sur Darwin. Chaque écart de `/proc` est un échec silencieux possible, sans référence autre que le Linux réel de comparaison.
-5. Partage de mémoire et identité entre processus sans noyau Linux. L'anonyme partagé n'existe pas dans HL, les vues de fichiers ne passent un fork que par export de descripteurs, le PID invité est découplé du PID hôte, `kill` et `wait4` passent par `proc_table[64]`, `/proc/<pid>` repose sur un fichier partagé verrouillé par POSIX. Un wineserver séparé qui lit la mémoire d'un client demande un port de tâche (équipe processus). Le risque est l'incohérence entre ces trois tables (VMA, descripteurs hôte, registre de noms) après `exec` ou crash.
+1. 4 KiB guest granularity on 16 KiB host pages with guest address = host address. MEASURED: host `mmap` and `mprotect` round to 16 KiB, a 4 KiB `MAP_FIXED` destroys 12 neighboring KiB, a file offset at 0x1000 is refused. HL solves this with its guest MMU, which no longer exists. A choice to make early, because it shapes Wine (announced page size, stack guards, `VirtualProtect`, PE sections): announce 16 KiB, or emulate through faults. Neither has been tested.
+2. Low guest addresses. MEASURED by the FEXCore team: no fixed `mmap` below 4 GiB, `__PAGEZERO` cannot be shrunk (`reports/fexcore-darwin-port.md`, measurement table). HL avoids it (guest.h:95, `GUEST_IPA_BASE` = 0) and its private fixes free the bottom of the space for Wine's DOS area. An x86-64 ELF linked at 0x400000 or a Wine preloader at a low fixed address does not load in a process; only address translation in the JIT or guests linked higher get out of the dead end.
+3. Exact semantics of `munmap`, `mprotect`, `mremap` and `madvise` and consistency with the JIT. HL cheats: `munmap` frees nothing, `madvise` and `mincore` are stubs. In a process the guest observes the real faults, `mremap` does not exist on Darwin and `MADV_DONTNEED` does not zero. Every write to the VMA table must be atomic with the invalidation of the translations (model: FEX's `GuestMmap`). A race here produces stale code being executed, hard to diagnose.
+4. Fidelity of `/proc` and memfd for EAC. The bootstrapper opens `/proc/<its pid>/maps` to locate `libc` (`/libc-` or `libc.so` line), reopens the memfd through `/proc/self/fd/N` with an independent cursor and tries `F_ADD_SEALS` (`XP/README.md`, section "EAC reading the memory map"). Seals cannot be imitated identically on Darwin. Each `/proc` difference is a possible silent failure, with no reference other than the real Linux used for comparison.
+5. Memory sharing and identity between processes without a Linux kernel. Shared anonymous memory does not exist in HL, file views only survive a fork through descriptor export, the guest PID is decoupled from the host PID, `kill` and `wait4` go through `proc_table[64]`, `/proc/<pid>` relies on a shared file locked with POSIX locks. A separate wineserver that reads a client's memory needs a task port (process team). The risk is inconsistency between these three tables (VMA, host descriptors, name registry) after `exec` or a crash.
 
-## 7. Tests hôte déjà exécutés
+## 7. Host tests already run
 
-MESURÉ, relancés pendant cette session (voir 0.3) :
+MEASURED, rerun during this session (see 0.3):
 
-- `test-fd-object-lite` : 12 lignes `OK` puis `PASS` (création, pipe, installation, `dup` partage la description, fermeture).
-- `test-vfs-unit` : 15 lignes `OK` puis `PASS` (résolution relative, liens internes, ELOOP à 41 liens, bind le plus long, refus des cibles hôte absolues).
-- `test-page-table-pool` : 6 lignes `OK` puis `PASS` (pool hors de l'arène, 512 blocs de découpe, réservations basses de Wine, trous exacts de fork, VA haute, droits). Il teste du code du stage 1 qui sera abandonné ; ses oracles sur les découpes de VMA restent utiles.
-- `test-aot-format`, `test-app-open`, `test-fd-digest`, `test-oss-abi`, `test-thread-vcpu-lifetime` : `PASS`, sans rapport direct avec le coeur FEX.
+- `test-fd-object-lite`: 12 `OK` lines then `PASS` (creation, pipe, installation, `dup` shares the description, close).
+- `test-vfs-unit`: 15 `OK` lines then `PASS` (relative resolution, internal links, ELOOP at 41 links, longest bind, refusal of absolute host targets).
+- `test-page-table-pool`: 6 `OK` lines then `PASS` (pool outside the arena, 512 split blocks, Wine's low reservations, exact fork holes, high VA, permissions). It tests stage 1 code that will be dropped; its oracles on VMA splits remain useful.
+- `test-aot-format`, `test-app-open`, `test-fd-digest`, `test-oss-abi`, `test-thread-vcpu-lifetime`: `PASS`, not directly related to the FEX core.
 
-## 8. Points non établis
+## 8. Points not established
 
-- Aucun test n'a exécuté de code invité. Les verdicts de la section 2 et les estimations de la section 6 sont des jugements sur lecture de code.
-- Les traces de l'annexe B s'arrêtent à l'erreur EAC 509 : le jeu d'appels d'une session complète de Rocket League est plus large (audio, réseau, GPU).
-- Taille de page annoncée à l'invité, fork réel contre export de mappings, partage de ports de tâche entre processus : décisions ouvertes, pas de mesure.
-- Le comportement de `fcntl(F_ADD_SEALS)` d'EAC lui-même n'a pas été enregistré sous Linux (`XP/linux-reference/seal-comparison/README.md`, « Limites et décision »).
+- No test has run guest code. The verdicts of section 2 and the estimates of section 6 are judgments based on reading code.
+- The traces of appendix B stop at EAC error 509: the call set of a full Rocket League session is wider (audio, networking, GPU).
+- Page size announced to the guest, real fork versus mapping export, sharing of task ports between processes: open decisions, no measurement.
+- The behavior of EAC's own `fcntl(F_ADD_SEALS)` was not recorded under Linux (`XP/linux-reference/seal-comparison/README.md`, "Limits and decision").
 
-## Annexe A. Sonde de granularité de page (MESURÉ)
+## Appendix A. Page granularity probe (MEASURED)
 
-Programme C compilé avec `clang -O0` et exécuté avec `perl -e 'alarm 20; exec @ARGV' ./pg2`, dans le répertoire temporaire de la session (non conservé hors de ce rapport). Il crée 256 Kio anonymes alignés sur 16 Kio, essaie les opérations puis lit la région par `mach_vm_region_recurse`.
+C program compiled with `clang -O0` and run with `perl -e 'alarm 20; exec @ARGV' ./pg2`, in the session's temporary directory (not kept outside this report). It creates 256 KiB of anonymous memory aligned on 16 KiB, tries the operations then reads the region through `mach_vm_region_recurse`.
 
 ```c
 #define TRY(label, expr) do { errno = 0; long _r = (long)(expr); int _e = errno; \
@@ -400,10 +400,10 @@ TRY("mprotect(base+0x9000, 0x1000, PROT_NONE)", mprotect(base+0x9000, 0x1000, PR
 TRY("mprotect(base+0x8000, 0x1000, PROT_READ)", mprotect(base+0x8000, 0x1000, PROT_READ));
 TRY("munmap(base+0x1000, 0x1000)", munmap(base+0x1000, 0x1000));
 TRY("munmap(base+0x10000, 0x1000)", munmap(base+0x10000, 0x1000));
-/* fichier de 64 Kio : mmap offset 0x1000 MAP_PRIVATE et MAP_SHARED, offset 0x4000 longueur 0x4000 MAP_SHARED */
+/* 64 KiB file: mmap offset 0x1000 MAP_PRIVATE and MAP_SHARED, offset 0x4000 length 0x4000 MAP_SHARED */
 ```
 
-Sortie (extraits, M5 Max, macOS 27.0.1) :
+Output (excerpts, M5 Max, macOS 27.0.1):
 
 ```
 getpagesize=16384 sysconf=16384 vm_page_size=16384
@@ -426,25 +426,25 @@ mach_vm_protect(a, 0x1000) 16K aligned, 4K len                   -> kr=0 ((os/ke
    region(after mach_vm_protect 4K len @0x102960000): kr=0 start=0x102960000 size=0x4000 prot=1 maxprot=7
 ```
 
-Une première version de la sonde a planté sur une écriture dans la page de 16 Kio que `mprotect` venait de passer en lecture seule : le plantage confirme l'arrondi.
+A first version of the probe crashed on a write into the 16 KiB page that `mprotect` had just made read-only: the crash confirms the rounding.
 
-Vérifications de SDK (`grep` dans `usr/include/sys/mman.h` et `fcntl.h` du SDK macOS) : `MAP_FIXED_NOREPLACE`, `mremap`, `memfd_create`, `epoll_create`, `eventfd` absents ; `MAP_32BIT` (0x8000), `MAP_JIT` (0x0800), `MADV_ZERO` (11), `O_RESOLVE_BENEATH` (0x1000) présents.
+SDK checks (`grep` in `usr/include/sys/mman.h` and `fcntl.h` of the macOS SDK): `MAP_FIXED_NOREPLACE`, `mremap`, `memfd_create`, `epoll_create`, `eventfd` absent; `MAP_32BIT` (0x8000), `MAP_JIT` (0x0800), `MADV_ZERO` (11), `O_RESOLVE_BENEATH` (0x1000) present.
 
-## Annexe B. Jeu d'appels vu dans les traces Wine et EAC de l'expérience précédente (MESURÉ)
+## Appendix B. Call set seen in the Wine and EAC traces of the previous experiment (MEASURED)
 
-Commande : `grep -a -o '^hl: syscall [0-9]*(' <trace> | sed … | sort -n | uniq -c`, sur `XP/run/logs/eac-syscall-trace.log` (282 379 appels, 102 numéros distincts) et `XP/run/logs/eac-parent-ptrace-regset.log` (251 693 appels, 103 numéros). Ce sont des appels ARM64 émis par Rosetta pour le compte de Wine et d'EAC, plus ceux de Rosetta lui-même, jusqu'à l'erreur EAC 509. Union des deux traces, 103 numéros (numéro et nom ARM64) :
+Command: `grep -a -o '^hl: syscall [0-9]*(' <trace> | sed … | sort -n | uniq -c`, on `XP/run/logs/eac-syscall-trace.log` (282,379 calls, 102 distinct numbers) and `XP/run/logs/eac-parent-ptrace-regset.log` (251,693 calls, 103 numbers). These are ARM64 calls issued by Rosetta on behalf of Wine and EAC, plus Rosetta's own, up to EAC error 509. Union of the two traces, 103 numbers (ARM64 number and name):
 
 8 getxattr, 10 fgetxattr, 17 getcwd, 19 eventfd2, 20 epoll_create1, 21 epoll_ctl, 22 epoll_pwait, 23 dup, 24 dup3, 25 fcntl, 29 ioctl, 32 flock, 34 mkdirat, 35 unlinkat, 38 renameat, 43 statfs, 44 fstatfs, 46 ftruncate, 48 faccessat, 49 chdir, 50 fchdir, 53 fchmodat, 56 openat, 57 close, 59 pipe2, 61 getdents64, 62 lseek, 63 read, 64 write, 66 writev, 67 pread64, 68 pwrite64, 72 pselect6, 73 ppoll, 78 readlinkat, 79 newfstatat, 80 fstat, 85 timerfd_create, 93 exit, 94 exit_group, 96 set_tid_address, 98 futex, 99 set_robust_list, 113 clock_gettime, 114 clock_getres, 115 clock_nanosleep, 117 ptrace, 122 sched_setaffinity, 123 sched_getaffinity, 124 sched_yield, 129 kill, 131 tgkill, 134 rt_sigaction, 135 rt_sigprocmask, 139 rt_sigreturn, 148 getresuid, 150 getresgid, 157 setsid, 160 uname, 163 getrlimit, 165 getrusage, 166 umask, 167 prctl, 169 gettimeofday, 172 getpid, 173 getppid, 174 getuid, 175 geteuid, 176 getgid, 177 getegid, 178 gettid, 179 sysinfo, 194 shmget, 195 shmctl, 196 shmat, 198 socket, 199 socketpair, 200 bind, 201 listen, 202 accept, 203 connect, 204 getsockname, 205 getpeername, 207 recvfrom, 208 setsockopt, 209 getsockopt, 210 shutdown, 211 sendmsg, 212 recvmsg, 215 munmap, 220 clone, 221 execve, 222 mmap, 223 fadvise64, 226 mprotect, 240 rt_tgsigqueueinfo, 260 wait4, 261 prlimit64, 264 name_to_handle_at, 269 sendmmsg, 278 getrandom, 279 memfd_create, 291 statx.
 
-Les plus fréquents dans la seconde trace : `read` 56 887, `rt_sigprocmask` 50 532, `write` 24 806, `clock_gettime` 22 401, `epoll_pwait` 20 658, `writev` 17 010, `mmap` 10 358, `mprotect` 6 001, `recvmsg` 4 798, `openat` 4 497, `readlinkat` 4 351, `newfstatat` 4 066.
+The most frequent in the second trace: `read` 56,887, `rt_sigprocmask` 50,532, `write` 24,806, `clock_gettime` 22,401, `epoll_pwait` 20,658, `writev` 17,010, `mmap` 10,358, `mprotect` 6,001, `recvmsg` 4,798, `openat` 4,497, `readlinkat` 4,351, `newfstatat` 4,066.
 
-Parmi les 103, seuls deux n'ont pas de `case` par numéro dans le dispatch de HL : 10 (`fgetxattr`, voir le défaut de numérotation en section 5) et 264 (`name_to_handle_at`, 2 appels). Les lignes « unimplemented syscall » des traces ne contiennent que ces deux numéros. Ni `mremap`, ni `madvise`, ni `mincore`, ni `process_vm_readv`, ni `userfaultfd` n'apparaissent dans ces traces, ce qui ne prouve pas que la suite de la session ne les utilise pas.
+Among the 103, only two have no `case` by number in HL's dispatch: 10 (`fgetxattr`, see the numbering defect in section 5) and 264 (`name_to_handle_at`, 2 calls). The "unimplemented syscall" lines of the traces contain only these two numbers. Neither `mremap`, nor `madvise`, nor `mincore`, nor `process_vm_readv`, nor `userfaultfd` appear in these traces, which does not prove that the rest of the session does not use them.
 
-## Annexe C. Témoin en processus (MESURÉ)
+## Appendix C. In-process witness (MEASURED)
 
-Les trois pilotes et le shim sont dans le répertoire temporaire de la session (`scratchpad/inproc`), non conservé hors de ce rapport. Empreintes SHA-256 des sources, 16 premiers caractères : `drv.c` b5ed6aa5886ee9d8, `drv2.c` fc8c3d444ea55dee, `drv3.c` f47ff861c37ea3e3, `shim.c` 27182628a6de137f, `vma_only.c` 232ba06c0cb12564.
+The three drivers and the shim are in the session's temporary directory (`scratchpad/inproc`), not kept outside this report. SHA-256 fingerprints of the sources, first 16 characters: `drv.c` b5ed6aa5886ee9d8, `drv2.c` fc8c3d444ea55dee, `drv3.c` f47ff861c37ea3e3, `shim.c` 27182628a6de137f, `vma_only.c` 232ba06c0cb12564.
 
-Shim, la totalité de l'interface mémoire invitée requise par les handlers de fichiers, d'I/O, de temps et de procfs :
+Shim, the whole guest memory interface required by the file, I/O, time and procfs handlers:
 
 ```c
 void *guest_ptr(const guest_t *g, uint64_t gva) { (void)g; return (void *)(uintptr_t)gva; }
@@ -458,13 +458,13 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
 }
 ```
 
-Ce shim n'est pas sûr face à un pointeur invalide : il fait un `memcpy` brut. En production il doit être remplacé par des copies protégées qui renvoient `-EFAULT` (modèle : `FEX/FaultSafeUserMemAccess.cpp`).
+This shim is not safe against an invalid pointer: it does a raw `memcpy`. In production it must be replaced by protected copies that return `-EFAULT` (model: `FEX/FaultSafeUserMemAccess.cpp`).
 
-Édition de liens (bash, sans exécution de HVF) : tous les `EXP/scratch-hl/hyper-linux-copy/_build/obj/*.o` sauf `hl.o` et `guest.o`, plus `drv.o` (ou `drv2.o` avec `vma_only.o`, ou `drv3.o`) et `shim.o` :
+Linking (bash, without running HVF): all the `EXP/scratch-hl/hyper-linux-copy/_build/obj/*.o` except `hl.o` and `guest.o`, plus `drv.o` (or `drv2.o` with `vma_only.o`, or `drv3.o`) and `shim.o`:
 
 ```
 clang -arch arm64 -o drv drv.o shim.o $OBJS -framework AudioToolbox -framework CoreAudio \
       -framework Hypervisor -Wl,-undefined,dynamic_lookup
 ```
 
-Sorties, lignes finales : pilote 1 `PASSED (0 failures)` avec 12 lignes `OK`, pilote 2 `PASSED (0 failures)` avec 5 `OK`, pilote 3 `PASSED (0 failures)` avec 6 `OK`. Premier essai du pilote 1 : `write` renvoyait `-11` faute de `current_thread` (voir 1.7), corrigé par `thread_init(0x100000)` et `thread_register_main(0, NULL, 1, 0x100000)`. Premier essai du pilote 2 : la ligne de chemin montrait `/tmp/…` au lieu de `/usr/…`, parce que mon nom de VMA n'était pas canonique alors que `hl_vfs_add_bind` canonicalise la racine du bind (`/tmp` est un lien vers `/private/tmp` sur macOS, `vfs.c:139-172`) ; en production `fcntl(F_GETPATH)` renvoie le chemin canonique, ce que le pilote simule par `realpath`.
+Outputs, final lines: driver 1 `PASSED (0 failures)` with 12 `OK` lines, driver 2 `PASSED (0 failures)` with 5 `OK`, driver 3 `PASSED (0 failures)` with 6 `OK`. First try of driver 1: `write` returned `-11` for lack of `current_thread` (see 1.7), fixed by `thread_init(0x100000)` and `thread_register_main(0, NULL, 1, 0x100000)`. First try of driver 2: the path line showed `/tmp/…` instead of `/usr/…`, because my VMA name was not canonical while `hl_vfs_add_bind` canonicalizes the root of the bind (`/tmp` is a link to `/private/tmp` on macOS, `vfs.c:139-172`); in production `fcntl(F_GETPATH)` returns the canonical path, which the driver simulates through `realpath`.

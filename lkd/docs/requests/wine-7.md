@@ -1,85 +1,85 @@
-# wine-7 : MAP_SHARED d'un memfd de 4 Kio à une adresse non congrue modulo 16 Kio -> EINVAL ; le module EAC du jeu boucle sans fin
+# wine-7: MAP_SHARED of a 4 KiB memfd at an address not congruent modulo 16 KiB -> EINVAL; the game's EAC module loops forever
 
-Demandeur : agent wine-linux. Bloquant : RocketLeague.exe s'arrête avant l'initialisation de kernel32 (aucune fenêtre, aucun périphérique D3D).
+Requester: wine-linux agent. Blocking: RocketLeague.exe stops before kernel32 initialization (no window, no D3D device).
 
-MESURE (evidence/eac-runs/20261002T223742, LKD_TRACE=1, guest.trimmed.log ; la boucle a produit 49 millions de lignes, 3,4 Go, tronqué) :
-- Processus du jeu (pid invité [71], juste après le chargement de ntdll à 0x6fffffd20000, pendant le mappage de kernel32) : boucle de
-  `memfd_create(name, MFD_CLOEXEC)` ; `ftruncate(fd, 0x1000)` ; `mmap(addr, 0x1000, PROT_READ|PROT_EXEC, MAP_SHARED|MAP_FIXED_NOREPLACE, fd, 0)` pour addr = 0x6fffffd17000, 0x6fffffd27000, ... 0x6fffffdb7000 (pas de 64 Kio, ntdll - 0x9000 + k*64 Kio) ; `close(fd)`.
-  Toutes les adresses rendent EEXIST (occupées par ntdll et ses voisins) sauf 0x6fffffd17000, la seule libre, qui rend EINVAL : `lkd: mm: MAP_SHARED at 0x6fffffd17000 offset 0x0: address and offset are not congruent modulo the 16 KiB host page`. 6970 tours de boucle en 100 s, sans fin.
-- Ce code n'est pas Wine (Wine n'appelle jamais memfd_create avec un mmap fixe exécutable près de ntdll) : INFERE c'est le code Linux du module EAC dans le processus du jeu (« Starting Wine module mapping » du bootstrapper, puis 301). Sous Linux à pages de 4 Kio ce mmap réussit ; on ne doit pas changer ce que fait EAC, donc c'est à mm de l'accepter.
-- Le memfd est neuf et fait 4 Kio ; la page hôte 0x6fffffd14000..0x6fffffd18000 n'a pas d'autre occupant d'après les EEXIST (à vérifier dans la table VMA).
-Demande : accepter MAP_SHARED d'un objet dont (adresse - décalage) n'est pas multiple de 16 Kio, au moins pour un memfd créé par l'invité. Piste INFERE : LKD crée lui-même les memfd ; il peut placer le contenu de l'objet hôte avec un décalage interne choisi au premier mmap (ou réallouer l'objet hôte quand il n'est encore mappé nulle part et que sa taille est < 16 Kio), pour que la page hôte contienne l'objet à la bonne position ; les autres pages de la page hôte restent inaccessibles (PROT_NONE) selon la règle actuelle des voisins.
+MEASURED (evidence/eac-runs/20261002T223742, LKD_TRACE=1, guest.trimmed.log; the loop produced 49 million lines, 3.4 GB, truncated):
+- Game process (guest pid [71], right after ntdll was loaded at 0x6fffffd20000, while kernel32 is being mapped): loop of
+  `memfd_create(name, MFD_CLOEXEC)`; `ftruncate(fd, 0x1000)`; `mmap(addr, 0x1000, PROT_READ|PROT_EXEC, MAP_SHARED|MAP_FIXED_NOREPLACE, fd, 0)` for addr = 0x6fffffd17000, 0x6fffffd27000, ... 0x6fffffdb7000 (step of 64 KiB, ntdll - 0x9000 + k*64 KiB); `close(fd)`.
+  All addresses return EEXIST (occupied by ntdll and its neighbors) except 0x6fffffd17000, the only free one, which returns EINVAL: `lkd: mm: MAP_SHARED at 0x6fffffd17000 offset 0x0: address and offset are not congruent modulo the 16 KiB host page`. 6970 loop rounds in 100 s, without end.
+- This code is not Wine (Wine never calls memfd_create with a fixed executable mmap near ntdll): INFERRED it is the Linux code of the EAC module in the game process ("Starting Wine module mapping" from the bootstrapper, then 301). Under Linux with 4 KiB pages this mmap succeeds; we must not change what EAC does, so it is up to mm to accept it.
+- The memfd is new and is 4 KiB; the host page 0x6fffffd14000..0x6fffffd18000 has no other occupant according to the EEXISTs (to check in the VMA table).
+Request: accept MAP_SHARED of an object whose (address - offset) is not a multiple of 16 KiB, at least for a memfd created by the guest. INFERRED lead: LKD creates the memfds itself; it can place the content of the host object with an internal offset chosen at the first mmap (or reallocate the host object when it is not mapped anywhere yet and its size is < 16 KiB), so that the host page contains the object at the right position; the other pages of the host page stay inaccessible (PROT_NONE) according to the current neighbor rule.
 
-## Traitée le 2026-10-02, 22 h 55 (mainteneur d'intégration)
+## Handled on 2026-10-02, 22:55 (integration maintainer)
 
-### 1. Phase d'un memfd (`src/fs/memfd.c`, `src/mm/sys.c`, `src/mm/mm.c`, `src/mm/remap.c`)
+### 1. Phase of a memfd (`src/fs/memfd.c`, `src/mm/sys.c`, `src/mm/mm.c`, `src/mm/remap.c`)
 
-Le fichier hôte d'un memfd peut stocker l'octet x du fichier invité à l'offset hôte x + B, B valant 0, 4, 8 ou 12 Kio (la « phase »).
-- Quand la phase est fixée : au premier mmap du memfd (tout processus de la famille, toute description). Ce mmap passe tous ses contrôles d'abord, ensuite la phase est fixée, et le contenu est déplacé si B n'est pas 0. Elle ne change plus ensuite.
-- Valeur choisie : pour un MAP_SHARED fixe, B = (adresse - offset) mod 16 Kio. Pour toute autre vue, la phase déjà fixée, ou 0.
-- Stockage : bits 16 à 18 du mot de scellés, qui est partagé par fork et par les réouvertures. F_GET_SEALS ne les montre pas.
-- Toutes les opérations de fs ajoutent B : read et write (offset propre ou offset de l'hôte), pread et pwrite, readv et writev (RWF_APPEND compris), sendfile, splice, copy_file_range, ftruncate, fallocate, lseek (SEEK_END, DATA, HOLE), fstat, et la limite de F_SEAL_GROW.
-- Côté mm : `mm_backing.hbias` s'applique au contrôle de congruence, à la projection hôte partagée, à la projection directe et aux copies `pread` des vues privées, à mremap, et à la recherche d'adresse (une vue non fixe reçoit une adresse congrue à offset + B).
-- `/proc/<pid>/maps` montre l'offset invité.
-- process_vm passe par la mémoire invitée, il n'est pas touché.
+The host file of a memfd can store byte x of the guest file at host offset x + B, B being 0, 4, 8 or 12 KiB (the "phase").
+- When the phase is set: at the first mmap of the memfd (any process of the family, any description). This mmap passes all its checks first, then the phase is set, and the content is moved if B is not 0. It no longer changes after that.
+- Value chosen: for a fixed MAP_SHARED, B = (address - offset) mod 16 KiB. For any other view, the phase already set, or 0.
+- Storage: bits 16 to 18 of the seals word, which is shared by fork and by reopens. F_GET_SEALS does not show them.
+- All fs operations add B: read and write (own offset or host offset), pread and pwrite, readv and writev (RWF_APPEND included), sendfile, splice, copy_file_range, ftruncate, fallocate, lseek (SEEK_END, DATA, HOLE), fstat, and the F_SEAL_GROW limit.
+- On the mm side: `mm_backing.hbias` applies to the congruence check, to the shared host mapping, to the direct mapping and to the `pread` copies of private views, to mremap, and to the address search (a non-fixed view gets an address congruent to offset + B).
+- `/proc/<pid>/maps` shows the guest offset.
+- process_vm goes through guest memory, it is not touched.
 
-Ce qui reste refusé, de façon visible (message une fois dans le journal) :
-- Une vue MAP_SHARED fixe qui demande une autre phase rend EINVAL.
-- Un fichier hôte ordinaire ne peut pas être décalé : la règle de congruence existante s'applique, avec EINVAL.
+What stays refused, visibly (message once in the log):
+- A fixed MAP_SHARED view that asks for another phase returns EINVAL.
+- An ordinary host file cannot be shifted: the existing congruence rule applies, with EINVAL.
 
-Usages bruts du descripteur hôte : `lkd_fs_pin_raw` fixe la phase à 0, ou refuse avec EOPNOTSUPP si elle vaut déjà autre chose. Il est appelé dans trois cas :
-- SCM_RIGHTS (`src/net/scm.c`) ;
-- exec par descripteur (`src/task/exec.c`) ;
-- réouverture `/proc/<pid>/fd/N` servie à un autre processus (`src/procfs/remote.c`).
+Raw uses of the host descriptor: `lkd_fs_pin_raw` sets the phase to 0, or refuses with EOPNOTSUPP if it is already something else. It is called in three cases:
+- SCM_RIGHTS (`src/net/scm.c`);
+- exec by descriptor (`src/task/exec.c`);
+- `/proc/<pid>/fd/N` reopen served to another process (`src/procfs/remote.c`).
 
-Considéré mais non fait :
-- Mémoire anonyme partagée : elle n'a pas d'offset, toute adresse de 4 Kio convient déjà.
-- Segments SysV : shmat à une adresse de 4 Kio non congrue rend toujours EINVAL. Un objet `shm_open` ne se lit ni ne s'écrit sous macOS, donc déplacer le contenu demanderait de le projeter ; non fait faute d'utilisateur connu.
+Considered but not done:
+- Shared anonymous memory: it has no offset, any 4 KiB address already works.
+- SysV segments: shmat at a non-congruent 4 KiB address still returns EINVAL. A `shm_open` object can be neither read nor written under macOS, so moving the content would require mapping it; not done for lack of a known user.
 
-Lacune : un autre processus qui lit ou écrit le memfd pendant le premier mmap qui fixe une phase non nulle peut voir le contenu en cours de déplacement.
+Gap: another process that reads or writes the memfd during the first mmap that sets a non-zero phase can see the content while it is being moved.
 
-MESURE : nouveau cas `phased_shared_mapping` de `test_fs_memfd`. Il couvre :
-- la séquence d'EAC (RX, MAP_SHARED|MAP_FIXED_NOREPLACE, 0x3000 dans la page hôte, offset 0) sur un memfd qui avait déjà du contenu ;
-- fstat, lseek et pread inchangés pour l'invité ;
-- une vue RW choisie par mm à une adresse congrue à 0x3000, avec les écritures partagées dans les deux sens et avec pwrite ;
-- EINVAL pour une autre phase, et une même phase acceptée à un autre offset ;
-- une vue privée qui lit les bons octets ;
-- EOPNOTSUPP de `lkd_fs_pin_raw`.
-Le premier mmap de ce cas rendait EINVAL avant (message cité dans la demande).
+MEASURED: new case `phased_shared_mapping` of `test_fs_memfd`. It covers:
+- EAC's sequence (RX, MAP_SHARED|MAP_FIXED_NOREPLACE, 0x3000 into the host page, offset 0) on a memfd that already had content;
+- fstat, lseek and pread unchanged for the guest;
+- an RW view chosen by mm at an address congruent to 0x3000, with shared writes in both directions and with pwrite;
+- EINVAL for another phase, and the same phase accepted at another offset;
+- a private view that reads the right bytes;
+- EOPNOTSUPP from `lkd_fs_pin_raw`.
+The first mmap of this case returned EINVAL before (message quoted in the request).
 
-### 2. Voisines
+### 2. Neighbors
 
-LU dans `evidence/eac-runs/20261002T223742/guest.trimmed.log` :
-- Les adresses essayées en boucle (0x6fffe4b57000, 0x700017f77000, 0x6fffed4b7000…, pas de 64 Kio, toujours 0x3000 dans la page hôte) sont toutes libres : MAP_FIXED_NOREPLACE n'a pas rendu EEXIST.
-- L'EINVAL venait seulement de la congruence.
-- Dans la première phase de la boucle (0x7f8275fb8000…, positions congrues), les adresses étaient occupées : EEXIST, comme sous Linux.
+READ in `evidence/eac-runs/20261002T223742/guest.trimmed.log`:
+- The addresses tried in the loop (0x6fffe4b57000, 0x700017f77000, 0x6fffed4b7000…, step of 64 KiB, always 0x3000 into the host page) are all free: MAP_FIXED_NOREPLACE did not return EEXIST.
+- The EINVAL came only from the congruence.
+- In the first phase of the loop (0x7f8275fb8000…, congruent positions), the addresses were occupied: EEXIST, as under Linux.
 
-INFERE : dans les pages de 16 Kio de ces candidats, les trois autres pages de 4 Kio sont non mappées. La règle des voisines est donc satisfaite et le premier essai réussit maintenant. Ce n'est pas vérifié sur un vrai lancement : la table des VMA du processus n'est pas dans le journal tronqué.
+INFERRED: in the 16 KiB pages of these candidates, the three other 4 KiB pages are unmapped. The neighbor rule is therefore satisfied and the first try now succeeds. This is not checked on a real launch: the process's VMA table is not in the truncated log.
 
-Voisine accessible privée : refusée, et il n'y a pas de solution exacte. Une page hôte de 16 Kio a une seule projection hôte : soit l'objet partagé, soit de la mémoire privée.
-- Les voisines d'une vue partagée lisent donc forcément des octets de l'objet partagé.
-- Avec une phase B, ce sont les octets de remplissage [0, B) du fichier hôte, eux-mêmes partagés avec toute autre vue de cette page hôte (autre processus, enfant de fork, autre vue du même processus).
-- Y loger des données privées les ferait voir et modifier par ces vues : c'est l'aliasing interdit.
+Accessible private neighbor: refused, and there is no exact solution. A 16 KiB host page has a single host mapping: either the shared object, or private memory.
+- The neighbors of a shared view therefore necessarily read bytes of the shared object.
+- With a phase B, these are the padding bytes [0, B) of the host file, themselves shared with any other view of this host page (other process, fork child, other view of the same process).
+- Putting private data there would make it seen and modified by these views: this is the forbidden aliasing.
 
-L'EINVAL visible reste la réponse.
+The visible EINVAL stays the answer.
 
-### 3. Code aliasé (`src/mm/watch.c`)
+### 3. Aliased code (`src/mm/watch.c`)
 
-Une surveillance de code JIT couvre maintenant toutes les pages hôtes du processus qui projettent les mêmes octets d'un objet partagé (`mm_alias_pages`).
-- Elles perdent PROT_WRITE ensemble.
-- Une faute d'écriture sur l'une les libère toutes et invalide la plage de chacune.
-- Une vue créée après hérite de la surveillance (`mm_watch_alias_sync`).
-- Une écriture par le descripteur (write, pwrite, kio) invalide aussi les vues surveillées (`lkd_mm_file_written`).
+A JIT code watch now covers all the host pages of the process that map the same bytes of a shared object (`mm_alias_pages`).
+- They lose PROT_WRITE together.
+- A write fault on one of them releases them all and invalidates the range of each.
+- A view created afterwards inherits the watch (`mm_watch_alias_sync`).
+- A write through the descriptor (write, pwrite, kio) also invalidates the watched views (`lkd_mm_file_written`).
 
-Lacune : les vues d'un AUTRE processus de la famille ne sont pas couvertes (comme avant pour MAP_SHARED).
+Gap: the views of ANOTHER process of the family are not covered (as before for MAP_SHARED).
 
-MESURE :
-- `test_mm_watch` cas `aliased_views_share_the_watch` : échoue sans le code d'alias (la vue A n'était pas surveillée), passe avec.
-- Témoin invité `witnesses/elf-x86_64/src/w19_memfd_alias.c` (`EXEC=1 ./build.sh src/w19_memfd_alias.c`), sous `build-integration/host/fexdarwin-run`, mode SMC mtrack par défaut. Il fait : vue RX à 0x3000 dans sa page hôte, offset 0 ; vue RW choisie par le noyau ; code écrit par A, exécuté par B, réécrit par A (2 fois, puis 100 tours), puis pwrite par le descripteur.
-  - Avec la bibliothèque corrigée : PASS 8/8.
-  - Avec le code d'alias désactivé : FAILED 5/8 (B exécute encore l'ancien code).
+MEASURED:
+- `test_mm_watch` case `aliased_views_share_the_watch`: fails without the alias code (view A was not watched), passes with it.
+- Guest witness `witnesses/elf-x86_64/src/w19_memfd_alias.c` (`EXEC=1 ./build.sh src/w19_memfd_alias.c`), under `build-integration/host/fexdarwin-run`, default SMC mtrack mode. It does: RX view at 0x3000 into its host page, offset 0; RW view chosen by the kernel; code written by A, executed by B, rewritten by A (2 times, then 100 rounds), then pwrite through the descriptor.
+  - With the fixed library: PASS 8/8.
+  - With the alias code disabled: FAILED 5/8 (B still executes the old code).
 
-Non-régression :
-- 41/41 programmes, 6154 assertions.
-- Témoins w01, w05, w06_smc, w10, w17, w18 : sortie 0.
-- `wine cmd /c echo hi` : affiche hi, code 0.
+Non-regression:
+- 41/41 programs, 6154 assertions.
+- Witnesses w01, w05, w06_smc, w10, w17, w18: exit 0.
+- `wine cmd /c echo hi`: prints hi, code 0.

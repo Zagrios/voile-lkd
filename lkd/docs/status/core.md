@@ -1,92 +1,92 @@
-# Statut du module core (LKD)
+# Status of the core module (LKD)
 
-Date : 2026-10-02. Jalons 1 à 4 atteints : squelette, contrats, tests, documentation. Le module core est livré aux sept autres agents.
+Date: 2026-10-02. Milestones 1 to 4 reached: skeleton, contracts, tests, documentation. The core module is delivered to the seven other agents.
 
-## Ce qui existe (MESURE : `./check.sh`, 4 programmes, 4 PASS)
+## What exists (MEASURED: `./check.sh`, 4 programs, 4 PASS)
 
-| Programme | Assertions | Cas | Contenu |
+| Program | Assertions | Cases | Content |
 | --- | --- | --- | --- |
-| `test_core_dispatch` | 155 | 16 | enregistrement et conflits, six arguments dans l'ordre x86-64, retours négatifs, ENOSYS compté (numéro libre, hors table, bit x32), dispositions, `ENOIOCTLCMD`, redémarrage (`ERESTARTSYS`, `ERESTARTNOHAND`, `RESTARTBLOCK`, `restart_syscall`), numéros de la table v6.12, trace (sans contenu mémoire, une ligne ENOSYS par numéro, niveau 2), attentes bloquantes (délai, interruption, réveil perdu), `lkd_fork_host` avec un vrai `fork` |
-| `test_core_usermem` | 113 | 11 | copies exactes sur tous les alignements, pointeurs invalides, page de garde, `strn`, base invitée non nulle (0x7ffe0000), gestionnaire du moteur installé après (`lkd_fault_try_recover`), chaînage vers le gestionnaire précédent, quatre threads qui fautent en parallèle, crochet de contrôle de plage |
-| `test_core_xlate` | 358 | 13 | errno, drapeaux `open`, `mmap`, signaux, `fcntl`, sockets, `MSG_*`, numéros de périphérique, `stat` octet par octet, `statx`, `statfs`, `d_type`, appels hôte réels avec les valeurs traduites |
-| `test_core_contract` | 89 | 5 | ce que les en-têtes promettent aux modules : identifiants uniques à travers un `fork`, `tid == pid` du thread principal, threads d'un même processus, recherche dans le registre, table de descripteurs POSIX (plus petit libre, `dup2`, `FD_CLOEXEC`, partage CLONE_FILES) |
+| `test_core_dispatch` | 155 | 16 | registration and conflicts, six arguments in x86-64 order, negative returns, ENOSYS counted (free number, outside the table, x32 bit), dispositions, `ENOIOCTLCMD`, restart (`ERESTARTSYS`, `ERESTARTNOHAND`, `RESTARTBLOCK`, `restart_syscall`), numbers of the v6.12 table, trace (no memory content, one ENOSYS line per number, level 2), blocking waits (timeout, interruption, lost wakeup), `lkd_fork_host` with a real `fork` |
+| `test_core_usermem` | 113 | 11 | exact copies on all alignments, invalid pointers, guard page, `strn`, non-zero guest base (0x7ffe0000), engine handler installed afterwards (`lkd_fault_try_recover`), chaining to the previous handler, four threads faulting in parallel, range check hook |
+| `test_core_xlate` | 358 | 13 | errno, `open` flags, `mmap`, signals, `fcntl`, sockets, `MSG_*`, device numbers, `stat` byte by byte, `statx`, `statfs`, `d_type`, real host calls with the translated values |
+| `test_core_contract` | 89 | 5 | what the headers promise to the modules: unique identifiers across a `fork`, `tid == pid` of the main thread, threads of the same process, lookup in the registry, POSIX descriptor table (lowest free, `dup2`, `FD_CLOEXEC`, CLONE_FILES sharing) |
 
-Autres contrôles lancés par `check.sh` : `tools/owners_check.py` (291 syscalls attribués, 84 sans propriétaire, 0 conflit) et `tools/verify_abi.py` (747 constantes `LX_*` comparées aux `#define` du uapi Linux v6.12 téléchargé dans `tools/data/uapi-v6.12`, 0 écart, 158 non vérifiables car énumérations ou macros à paramètres). Les tailles et décalages des structures sont des `_Static_assert` dans `abi_x64.h` (compilation C et C++ vérifiées une fois pour les en-têtes publics avec `clang++ -std=c++20`).
+Other checks run by `check.sh`: `tools/owners_check.py` (291 syscalls assigned, 84 without an owner, 0 conflicts) and `tools/verify_abi.py` (747 `LX_*` constants compared with the `#define`s of the Linux v6.12 uapi downloaded into `tools/data/uapi-v6.12`, 0 differences, 158 not verifiable because they are enumerations or parameterized macros). Structure sizes and offsets are `_Static_assert`s in `abi_x64.h` (C and C++ compilation checked once for the public headers with `clang++ -std=c++20`).
 
-Stabilité : 15 exécutions consécutives de l'ensemble sans échec.
+Stability: 15 consecutive runs of the whole set without failure.
 
-## Livrables
+## Deliverables
 
-- `CMakeLists.txt`, `build.sh`, `check.sh`, `tools/run_tests.sh`, `tools/runtest.sh` (limite de temps par perl).
-- `include/lkd/lkd.h` (API moteur et noyau), `abi_x64.h`, `xlate.h`, `syscall_nr.h` (généré par `tools/gen_syscall_table.py`, 375 syscalls, sha256 980ce311...).
-- `src/include/` : `lkd_internal.h`, `task.h`, `fd.h`, `mm.h`, `vfs.h`, `sig.h`, `futex.h`, `ptrace.h`, `net.h`.
-- `src/core/` : `api.c`, `dispatch.c`, `trace.c`, `usermem.c`, `block.c`, `hooks.c`, `weak_modules.c`, `xlate.c`, `stubs_{task,mm,fs,sig,ptrace,net}.c`.
+- `CMakeLists.txt`, `build.sh`, `check.sh`, `tools/run_tests.sh`, `tools/runtest.sh` (time limit through perl).
+- `include/lkd/lkd.h` (engine and kernel API), `abi_x64.h`, `xlate.h`, `syscall_nr.h` (generated by `tools/gen_syscall_table.py`, 375 syscalls, sha256 980ce311...).
+- `src/include/`: `lkd_internal.h`, `task.h`, `fd.h`, `mm.h`, `vfs.h`, `sig.h`, `futex.h`, `ptrace.h`, `net.h`.
+- `src/core/`: `api.c`, `dispatch.c`, `trace.c`, `usermem.c`, `block.c`, `hooks.c`, `weak_modules.c`, `xlate.c`, `stubs_{task,mm,fs,sig,ptrace,net}.c`.
 - `tests/ltest.h`, `tests/support/fake_engine.{h,c}`.
 - `OWNERS.md`, `docs/CONVENTIONS.md`, `README.md`, `NOTICE`.
 
-## Choix de conception à connaître (tous documentés dans les en-têtes)
+## Design choices to know (all documented in the headers)
 
-1. Récupération de faute des copies invitées : plage de PC (routine assembleur `lkd_uc_copy`, le gestionnaire met x0 = -1 et PC = LR), pas de point de reprise par thread. Pas de coût par appel, pas d'état par thread. arm64 seulement (arm64e non géré). Le moteur qui installe son gestionnaire après `lkd_init` appelle `lkd_fault_try_recover` en premier.
-2. `lkd_signal_next` appelle `ops->frame_build` lui-même (le moteur ne reçoit pas une description à construire). `rt_sigreturn` passe par `ops->frame_restore` dans le module sig. `lkd_signal_returned` existe pour un moteur qui restaure le cadre seul.
-3. Redémarrage des syscalls : décidé dans `lkd_syscall` par `lkd_sig_restart_decision` (module sig). Le moteur reçoit `LKD_RESTART` avec dans `*rax` le numéro à remettre (le numéro d'origine ou `restart_syscall`), recule RIP de 2.
-4. Attentes bloquantes : tube de réveil par tâche plus test d'interruption avant de dormir (`lkd_block_wait_fd`), pas de signal hôte pour les attentes que LKD maîtrise. Le futex (sig) suit un contrat séparé (`futex.h`).
-5. fork : `lkd_fork_host` orchestre les crochets dans l'ordre des rangs de verrous. exec : `lkd_exec_prepare` (task), `lkd_exec_commit` (core, crochets), `ops->exec_image` (moteur), `lkd_exec_finish`.
-6. Symboles faibles : les crochets de `weak_modules.c` et les remplaçants de `stubs_*.c` ne sont remplacés que si la bibliothèque est liée avec `-force_load` (fait par `CMakeLists.txt`, avec `LINK_DEPENDS` pour que les tests se relient). MESURE : une définition forte dans `src/mm/` et un test dans `tests/test_mm_*.c` ont été ajoutés puis retirés pour vérifier la prise en compte par `file(GLOB)`, le remplacement de `lkd_mm_check_range` et l'enregistrement de `brk` avec propriétaire `mm`.
-7. Les remplaçants faibles sont réels là où les autres modules en ont besoin pour leurs tests : registre local de tâches avec compteur d'identifiants en mémoire partagée (hérité par `fork`), table de descripteurs, objets fd. Le vfs, le mm, les signaux et ptrace y sont des coquilles (-ENOSYS, rien en attente, un accès ptrace refusé hors de soi-même).
+1. Fault recovery for guest copies: PC range (assembler routine `lkd_uc_copy`, the handler sets x0 = -1 and PC = LR), no per-thread resume point. No per-call cost, no per-thread state. arm64 only (arm64e not handled). An engine that installs its handler after `lkd_init` calls `lkd_fault_try_recover` first.
+2. `lkd_signal_next` calls `ops->frame_build` itself (the engine does not receive a description to build). `rt_sigreturn` goes through `ops->frame_restore` in the sig module. `lkd_signal_returned` exists for an engine that restores the frame on its own.
+3. Syscall restart: decided in `lkd_syscall` by `lkd_sig_restart_decision` (sig module). The engine receives `LKD_RESTART` with the number to put back in `*rax` (the original number or `restart_syscall`), and moves RIP back by 2.
+4. Blocking waits: per-task wakeup pipe plus an interruption test before sleeping (`lkd_block_wait_fd`), no host signal for the waits LKD controls. The futex (sig) follows a separate contract (`futex.h`).
+5. fork: `lkd_fork_host` runs the hooks in lock-rank order. exec: `lkd_exec_prepare` (task), `lkd_exec_commit` (core, hooks), `ops->exec_image` (engine), `lkd_exec_finish`.
+6. Weak symbols: the hooks of `weak_modules.c` and the stand-ins of `stubs_*.c` are only replaced if the library is linked with `-force_load` (done by `CMakeLists.txt`, with `LINK_DEPENDS` so that the tests are relinked). MEASURED: a strong definition in `src/mm/` and a test in `tests/test_mm_*.c` were added then removed to check that `file(GLOB)` picks them up, that `lkd_mm_check_range` is replaced, and that `brk` is registered with owner `mm`.
+7. The weak stand-ins are real where the other modules need them for their tests: local task registry with an identifier counter in shared memory (inherited by `fork`), descriptor table, fd objects. The vfs, mm, signals and ptrace are shells there (-ENOSYS, nothing pending, a ptrace access refused outside oneself).
 
-## Lacunes connues
+## Known gaps
 
-1. Pas de service d'appel inter-processus commun. Quatre besoins l'exigent : copie mémoire d'un autre processus (mm), boîte aux lettres de signaux (sig), transport ptrace, listage de `/proc/<pid>/fd` d'un autre processus (fs/procfs). Chaque module choisit son transport ; si les quatre divergent, un service commun dans core est à envisager (INFERE : un thread de service par processus et un socket par pid, avec codes d'opération enregistrés par module).
-2. Le listage des descripteurs d'un autre processus n'a aucun support (le registre partagé ne contient pas la table). procfs devra répondre honnêtement (ENOENT ou EACCES) tant qu'aucun transport n'existe.
-3. Le pas à pas (`ops->set_single_step`) est facultatif : NULL ou `-ENOSYS` rend `PTRACE_SINGLESTEP` honnêtement indisponible.
-4. Taille de l'état XSAVE : fixée par le moteur (`LKD_FP_XSAVE`, taille rendue dans `*len`).
-5. `lkd_mm_check_range` n'est validé qu'avec le remplaçant permissif ; la version stricte viendra avec le module mm. Les tests qui utilisent de la mémoire hôte brute comme mémoire invitée doivent appeler `lkd_usermem_set_check_fn` (déclaré dans `lkd_internal.h`).
-6. Aucun module n'existe encore : les tests de contrat de `test_core_contract` tournent contre les remplaçants et devront passer contre les modules.
-7. Le champ `exe` et `cmdline` du registre sont de taille fixe (512 et 4096 octets, tronqués au-delà).
+1. No common inter-process call service. Four needs require one: memory copy from another process (mm), signal mailbox (sig), ptrace transport, listing `/proc/<pid>/fd` of another process (fs/procfs). Each module picks its transport; if the four diverge, a common service in core is worth considering (INFERRED: one service thread per process and one socket per pid, with operation codes registered per module).
+2. Listing the descriptors of another process has no support (the shared registry does not contain the table). procfs will have to answer honestly (ENOENT or EACCES) as long as no transport exists.
+3. Single-stepping (`ops->set_single_step`) is optional: NULL or `-ENOSYS` makes `PTRACE_SINGLESTEP` honestly unavailable.
+4. XSAVE state size: set by the engine (`LKD_FP_XSAVE`, size returned in `*len`).
+5. `lkd_mm_check_range` is only validated with the permissive stand-in; the strict version will come with the mm module. Tests that use raw host memory as guest memory must call `lkd_usermem_set_check_fn` (declared in `lkd_internal.h`).
+6. No module exists yet: the contract tests of `test_core_contract` run against the stand-ins and will have to pass against the modules.
+7. The `exe` and `cmdline` fields of the registry have a fixed size (512 and 4096 bytes, truncated beyond).
 
-## Suite
+## Next
 
-Les sept agents de module démarrent. Le noyau commun ne change plus sans demande (`docs/requests/<module>-<n>.md`). A traiter à la réception des demandes : ajustements d'en-têtes, extensions du moteur factice.
+The seven module agents start. The common core no longer changes without a request (`docs/requests/<module>-<n>.md`). To handle when requests arrive: header adjustments, extensions of the fake engine.
 
-## Demandes traitées par le chef de projet (2026-10-02 16:20)
+## Requests handled by the project lead (2026-10-02 16:20)
 
-- fs-1 point 1, mm-1, task-1 (en partie) : `lkd_config_get` est déclaré dans `src/include/lkd_internal.h` ; les redéclarations locales des modules restent valides (même prototype) et peuvent être retirées.
-- fs-1 point 2 : `src/include/lkd_fs.h` renvoie à `src/fs/lkd_fs.h`.
-- En attente : `test_core_dispatch` enregistre ses propres `lkd_sys_read/write/open/ioctl` alors que tous les modules sont liés (`-force_load`) ; il faut le réécrire avec des gestionnaires `static` et des numéros non pris, ou le lier contre core seul. Les autres points de task-1 (notifications d'arrêt, `LKD_TF_IN_BLOCK`, ordre des crochets de fork) et les demandes sig-* restent à traiter.
+- fs-1 point 1, mm-1, task-1 (in part): `lkd_config_get` is declared in `src/include/lkd_internal.h`; the modules' local redeclarations stay valid (same prototype) and can be removed.
+- fs-1 point 2: `src/include/lkd_fs.h` points to `src/fs/lkd_fs.h`.
+- Pending: `test_core_dispatch` registers its own `lkd_sys_read/write/open/ioctl` while all modules are linked (`-force_load`); it must be rewritten with `static` handlers and unused numbers, or linked against core alone. The other points of task-1 (stop notifications, `LKD_TF_IN_BLOCK`, order of the fork hooks) and the sig-* requests are still to be handled.
 
-## Intégration (2026-10-02, 19 h 40 à 21 h 45, mainteneur d'intégration)
+## Integration (2026-10-02, 19:40 to 21:45, integration maintainer)
 
-Construction : `EXP/build-integration` (cmake Ninja, Debug, `nice -n 10`, `-j 4`). Lanceur : `build-integration/run_all.sh [motif]` (chaque programme sous `src/fexdarwin/scripts/run-with-timeout.sh 120`, contrôle `pgrep` après chacun). Hôte moteur lié à cette bibliothèque : `build-integration/host/fexdarwin-run`.
+Build: `EXP/build-integration` (cmake Ninja, Debug, `nice -n 10`, `-j 4`). Launcher: `build-integration/run_all.sh [pattern]` (each program under `src/fexdarwin/scripts/run-with-timeout.sh 120`, `pgrep` check after each one). Engine host linked to this library: `build-integration/host/fexdarwin-run`.
 
-### Totaux (MESURE)
+### Totals (MEASURED)
 
-| Moment | Programmes | PASS | Assertions | Cas |
+| Moment | Programs | PASS | Assertions | Cases |
 | --- | --- | --- | --- | --- |
-| avant | 41 | 40 (échec : `test_net_host`) | 5960 | |
-| après | 41 | 41, deux exécutions complètes de suite | 6108 | 403 |
+| before | 41 | 40 (failure: `test_net_host`) | 5960 | |
+| after | 41 | 41, two complete runs in a row | 6108 | 403 |
 
-`tools/owners_check.py` : 291 attribués, 84 sans propriétaire, 0 problème. `tools/verify_abi.py` : 749 vérifiés, 0 écart. Tous les gestionnaires de syscall sont `static` (la macro `LKD_SYSCALL` le garantit). Aucun processus de test restant.
+`tools/owners_check.py`: 291 assigned, 84 without an owner, 0 problems. `tools/verify_abi.py`: 749 checked, 0 differences. All syscall handlers are `static` (the `LKD_SYSCALL` macro guarantees it). No test process left.
 
-Sondes EAC x86-64 (`witnesses/eac-probes/run-probes.py`) : 1824 contrôles et 232 échecs avant, 4376 contrôles et 38 échecs après (20261002T214053). Détail dans `docs/status/ptrace.md`.
+x86-64 EAC probes (`witnesses/eac-probes/run-probes.py`): 1824 checks and 232 failures before, 4376 checks and 38 failures after (20261002T214053). Details in `docs/status/ptrace.md`.
 
-### Changements par module (chacun avec un test qui échoue avant et passe après, sauf mention)
+### Changes per module (each with a test that fails before and passes after, unless stated)
 
-- core : `lkd_block_wait_wake` (ptrace-2) ; `LKD_TF_IN_BLOCK` pendant `lkd_block_poll` (task-1) ; arrêt de sortie de syscall pour `LKD_CONTEXT_REPLACED`, drapeau relu à la sortie (ptrace-1) ; `lkd_user_cmpxchg32` récupérable (sig-1) ; crochet `lkd_sig_wake_hook` dans `lkd_task_wake` ; `LKD_BUG` avec fichier et ligne ; `LKD_SYSCALL` statique ; `lkd_fork_reinit_mutex/rwlock` ; déclarations ajoutées à `ptrace.h`, `sig.h`, `task.h`, `mm.h`, `net.h`, `lkd_internal.h` avec leurs remplaçants faibles ; `src/include/lkd_procfs.h` ; contrat de montage virtuel dans `vfs.h` ; commentaires de `fd.h` et de `lkd_config.guest_window_base` ; CONVENTIONS §3.4 (verrous du moteur avant ceux de LKD, aucun rappel du moteur sous verrou LKD) et §6.2 (reconstruction des verrous dans l'enfant d'un fork).
-- task : `wait4` se réveille au premier `lkd_task_wake` (11 ms par arrêt ptrace avant) ; `lkd_task_wake_waiters` atteint un autre processus hôte par famsvc (opcode 96) ; ECHILD selon le sélecteur (`lkd_ptrace_wait_has`) ; `si_status` complet pour un arrêt ptrace ; `lkd_guest_clock_ns`, `lkd_pid_peek`.
-- sig : `LKD_TF_TRACE_STOP` honoré (PTRACE_INTERRUPT d'un tracé bloqué) ; arrêt et reprise de contrôle de travaux rapportés à `wait4` ; CAS futex récupérable ; échéances absolues sur l'horloge invitée ; correction d'un réveil futex perdu (raccourci « pas d'attente » de `do_wake` retiré, `mutex_contention` bloquait environ une fois sur 20, 0 sur 60 après).
-- ptrace : `lkd_ptrace_syscall_exit_replaced` (exec et rt_sigreturn), contournement de l'exec retiré ; `lkd_ptrace_exec_commit` ne réécrit que les liens du même groupe de threads (cluster de sondes EAC : ESRCH après l'arrêt d'exec) ; attente bornée du lien d'un enfant auto-attaché avant l'arrêt PTRACE_EVENT_FORK.
-- mm : POKE forcé dans une page de code surveillée partagée avec des données ; `/dev/zero` mappable (procfs-2) ; `hiwater_vm` et `hiwater_rss` ; `mprotect(PROT_WRITE)` d'un memfd scellé refusé (fs-mm) ; reconstruction des verrous dans l'enfant d'un fork (témoin `w18_forkjit` : blocage avant, 3 passages sur 3 après) ; invalidations collectées hors du verrou mmap.
-- 2026-10-10 : `lkd_fd_ops.export_fds` et les enregistrements (`fd.h`, `src/core/fdrec.c`) : une description sans descripteur hôte part par SCM_RIGHTS comme un objet shm POSIX de 16 Kio (signature `LKDFREC1`, type, drapeaux d'état, données du module) ; chaque module enregistre l'importeur de son type (`lkd_fdrec_register`). Voir `net.md`.
-- fs : extrémité d'écriture d'un tube sans lecteur annoncée OUT|ERR (net-1) ; descripteur de répertoire ou de fichier reçu par SCM_RIGHTS retrouve chemin invité et montage (wine-3) ; déclarations pour procfs dans `lkd_fs.h`.
-- net : `IP_RECVERR`/`IPV6_RECVERR` et `MSG_ERRQUEUE` (wine-4, DNS de glibc dans l'invité) ; `lkd_net_inotify_limits`.
-- procfs : VmPeak et VmHWM réels ; limites inotify de net ; ligne `processes` de `/proc/stat`.
-- tests : `test_net_host` mis à jour (mm accepte maintenant un MAP_SHARED de 4 Kio à l'offset 4096) ; les tests d'exec de ptrace simulent la fin de `lkd_syscall`.
+- core: `lkd_block_wait_wake` (ptrace-2); `LKD_TF_IN_BLOCK` during `lkd_block_poll` (task-1); syscall-exit stop for `LKD_CONTEXT_REPLACED`, flag reread at exit (ptrace-1); recoverable `lkd_user_cmpxchg32` (sig-1); `lkd_sig_wake_hook` hook in `lkd_task_wake`; `LKD_BUG` with file and line; static `LKD_SYSCALL`; `lkd_fork_reinit_mutex/rwlock`; declarations added to `ptrace.h`, `sig.h`, `task.h`, `mm.h`, `net.h`, `lkd_internal.h` with their weak stand-ins; `src/include/lkd_procfs.h`; virtual mount contract in `vfs.h`; comments of `fd.h` and of `lkd_config.guest_window_base`; CONVENTIONS §3.4 (engine locks before LKD locks, no engine callback under an LKD lock) and §6.2 (lock rebuild in the child of a fork).
+- task: `wait4` wakes up at the first `lkd_task_wake` (11 ms per ptrace stop before); `lkd_task_wake_waiters` reaches another host process through famsvc (opcode 96); ECHILD according to the selector (`lkd_ptrace_wait_has`); complete `si_status` for a ptrace stop; `lkd_guest_clock_ns`, `lkd_pid_peek`.
+- sig: `LKD_TF_TRACE_STOP` honored (PTRACE_INTERRUPT of a blocked tracee); job control stop and resume reported to `wait4`; recoverable futex CAS; absolute deadlines on the guest clock; fix for a lost futex wakeup ("no wait" shortcut of `do_wake` removed, `mutex_contention` hung about once in 20, 0 in 60 after).
+- ptrace: `lkd_ptrace_syscall_exit_replaced` (exec and rt_sigreturn), exec workaround removed; `lkd_ptrace_exec_commit` only rewrites the links of the same thread group (EAC probe cluster: ESRCH after the exec stop); bounded wait for the link of a self-attached child before the PTRACE_EVENT_FORK stop.
+- mm: forced POKE into a watched code page shared with data; `/dev/zero` mappable (procfs-2); `hiwater_vm` and `hiwater_rss`; `mprotect(PROT_WRITE)` of a sealed memfd refused (fs-mm); lock rebuild in the child of a fork (witness `w18_forkjit`: hang before, 3 passes out of 3 after); invalidations collected outside the mmap lock.
+- 2026-10-10: `lkd_fd_ops.export_fds` and the records (`fd.h`, `src/core/fdrec.c`): a description without a host descriptor goes through SCM_RIGHTS as a 16 KiB POSIX shm object (signature `LKDFREC1`, type, status flags, module data); each module registers the importer of its type (`lkd_fdrec_register`). See `net.md`.
+- fs: write end of a pipe without a reader reported OUT|ERR (net-1); directory or file descriptor received through SCM_RIGHTS gets back its guest path and mount (wine-3); declarations for procfs in `lkd_fs.h`.
+- net: `IP_RECVERR`/`IPV6_RECVERR` and `MSG_ERRQUEUE` (wine-4, glibc DNS in the guest); `lkd_net_inotify_limits`.
+- procfs: real VmPeak and VmHWM; inotify limits from net; `processes` line of `/proc/stat`.
+- tests: `test_net_host` updated (mm now accepts a 4 KiB MAP_SHARED at offset 4096); the ptrace exec tests simulate the end of `lkd_syscall`.
 
-### Lacunes connues après l'intégration
+### Known gaps after the integration
 
-1. Ordre des crochets de fork dans l'enfant inchangé (task-1 point 3) : ptrace lit le lien du parent avec l'identité du parent.
-2. `hiwater_rss` est une borne inférieure (relevé aux lectures et aux grands démappages).
-3. File d'erreurs IP_RECVERR d'une seule entrée, sans détail ICMP.
-4. Sondes `peek/poke/poke-commit` : MAP_FIXED à 0x7fff... hors de la fenêtre invitée de 2^46 octets (mm-2 point 3).
-5. Tube plein sans lecteur annoncé OUT en plus de ERR.
-6. mm-3 (table SysV pour une ré-exécution hôte) et sig-2 point 4 : sans objet tant que l'exec reste dans le processus hôte.
+1. Order of the fork hooks in the child unchanged (task-1 point 3): ptrace reads the parent's link with the parent's identity.
+2. `hiwater_rss` is a lower bound (sampled on reads and on large unmaps).
+3. IP_RECVERR error queue of a single entry, without ICMP details.
+4. `peek/poke/poke-commit` probes: MAP_FIXED at 0x7fff... outside the guest window of 2^46 bytes (mm-2 point 3).
+5. Full pipe without a reader reported OUT in addition to ERR.
+6. mm-3 (SysV table for a host re-exec) and sig-2 point 4: not applicable as long as exec stays in the host process.

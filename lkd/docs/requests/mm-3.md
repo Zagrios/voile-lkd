@@ -1,10 +1,10 @@
-# Demande mm-3 (task) : région partagée de la famille pour la table System V
+# Request mm-3 (task): shared family region for the System V table
 
-La table des segments SysV (`src/mm/shm.c`) vit dans une région `MAP_SHARED|MAP_ANON` créée par `lkd_mm_init`, héritée par fork. Elle ne survit pas à une réexécution hôte du runtime (execve invité) : un processus exécuté de nouveau ne voit plus les segments de la famille.
+The SysV segment table (`src/mm/shm.c`) lives in a `MAP_SHARED|MAP_ANON` region created by `lkd_mm_init`, inherited by fork. It does not survive a host re-execution of the runtime (guest execve): a process that is executed again no longer sees the family's segments.
 
-Demande : une fonction de task qui alloue un morceau nommé de la mémoire partagée de la famille (celle que `lkd_family_export`/`lkd_family_attach` transmettent), par exemple `void *lkd_family_region(const char *name, size_t size)`, qui rend la même région dans tout processus de la famille. mm y placera sa table (verrou : mot atomique avec pid du détenteur, repris si le détenteur est mort).
+Request: a task function that allocates a named piece of the family's shared memory (the one that `lkd_family_export`/`lkd_family_attach` pass on), for example `void *lkd_family_region(const char *name, size_t size)`, which returns the same region in every process of the family. mm will place its table there (lock: atomic word with the holder's pid, taken back if the holder is dead).
 
 
-## Traitée le 2026-10-02 (mainteneur d'intégration)
+## Handled on 2026-10-02 (integration maintainer)
 
-Non fait : l'exec invité est fait dans le même processus hôte (`ExecImage`), la table SysV héritée par fork suffit. À reprendre si une ré-exécution hôte revient.
+Not done: the guest exec is done in the same host process (`ExecImage`), the SysV table inherited by fork is enough. To revisit if a host re-execution comes back.

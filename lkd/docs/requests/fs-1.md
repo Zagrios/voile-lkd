@@ -1,37 +1,37 @@
-# fs -> core : demandes sur les fichiers partagés
+# fs -> core: requests about the shared files
 
-## 1. Exposer `lkd_config_get`
+## 1. Expose `lkd_config_get`
 
-`lkd_fs_init` a besoin de `lkd_config.guest_root`, et `file.c` de l'uid/gid invités pour présenter le propriétaire des fichiers hôtes. `lkd_config_get` n'est déclaré que dans `src/core/core_priv.h`. Contournement local : `src/fs/fs_priv.h` le redéclare. Demande : le déclarer dans `src/include/lkd_internal.h`.
+`lkd_fs_init` needs `lkd_config.guest_root`, and `file.c` needs the guest uid/gid to present the owner of host files. `lkd_config_get` is declared only in `src/core/core_priv.h`. Local workaround: `src/fs/fs_priv.h` redeclares it. Request: declare it in `src/include/lkd_internal.h`.
 
-## 2. En-tête `lkd_fs.h` visible des autres modules
+## 2. Header `lkd_fs.h` visible to the other modules
 
-Les services fs pour le moteur, procfs, mm et task sont dans `src/fs/lkd_fs.h` (je ne peux écrire que sous `src/fs`). Demande : soit ajouter `src/fs` au chemin d'inclusion de `liblkd` et des tests, soit créer `src/include/lkd_fs.h` qui fait `#include "../fs/lkd_fs.h"`. En attendant, les tests incluent `"../src/fs/lkd_fs.h"`.
+The fs services for the engine, procfs, mm and task are in `src/fs/lkd_fs.h` (I can only write under `src/fs`). Request: either add `src/fs` to the include path of `liblkd` and of the tests, or create `src/include/lkd_fs.h` that does `#include "../fs/lkd_fs.h"`. Meanwhile, the tests include `"../src/fs/lkd_fs.h"`.
 
-## 3. Précisions de `vfs.h` (interface de montage virtuel, sans changement de signature)
+## 3. Clarifications of `vfs.h` (virtual mount interface, no signature change)
 
-Ce que le module fs implémente et que procfs peut considérer comme stable :
+What the fs module implements and what procfs can treat as stable:
 
-- `readdir` ne rend ni "." ni ".." : le vfs les ajoute (il ignore ces noms s'ils sont rendus). Le vfs ajoute aussi les points de montage situés juste sous le répertoire listé (par exemple `shm` sous `/dev`).
-- `getattr` est appelé avec `nofollow = 1` pendant la marche. Un lien ordinaire est lu par `readlink` et résolu dans l'espace invité (cible absolue depuis la racine de la tâche). Un nœud `magic_link` final suivi est ouvert par `open(rel)` ; `stat` qui suit un lien magique fait `open(rel, O_PATH)` puis `fstat` de l'objet. Un lien magique intérieur n'est suivi que si son texte est un chemin absolu, sinon `-ENOTDIR`.
-- `open` est appelé pour un nœud non répertoire et pour un lien magique final ; un répertoire virtuel est ouvert par le vfs lui-même (objet `LKD_FD_DIR` sans fd hôte, `getdents` passe par `readdir`).
-- Un montage n'est jamais démonté ; remonter au même point un montage hôte le remplace, un second montage virtuel au même point rend `-EBUSY`.
+- `readdir` returns neither "." nor "..": the vfs adds them (it ignores these names if they are returned). The vfs also adds the mount points located directly under the listed directory (for example `shm` under `/dev`).
+- `getattr` is called with `nofollow = 1` during the walk. An ordinary link is read by `readlink` and resolved in the guest space (absolute target from the task's root). A final `magic_link` node that is followed is opened by `open(rel)`; a `stat` that follows a magic link does `open(rel, O_PATH)` then `fstat` of the object. An inner magic link is followed only if its text is an absolute path, otherwise `-ENOTDIR`.
+- `open` is called for a non-directory node and for a final magic link; a virtual directory is opened by the vfs itself (`LKD_FD_DIR` object without a host fd, `getdents` goes through `readdir`).
+- A mount is never unmounted; mounting a host mount again at the same point replaces it, a second virtual mount at the same point returns `-EBUSY`.
 
-## 4. Commentaire de `fd.h` sur la réouverture des tubes
+## 4. Comment in `fd.h` on reopening pipes
 
-`fd.h` dit qu'un tube ne se rouvre pas par procfs. Linux le permet. Le module fs le fait pour la même extrémité (duplication du fd hôte) et rend `-ENXIO` pour l'autre extrémité, que l'objet ne détient pas. Demande : corriger le commentaire.
+`fd.h` says that a pipe cannot be reopened through procfs. Linux allows it. The fs module does it for the same end (duplication of the host fd) and returns `-ENXIO` for the other end, which the object does not hold. Request: fix the comment.
 
-## 5. Symboles de gestionnaires dans les tests du noyau
+## 5. Handler symbols in the kernel tests
 
-`tests/test_core_dispatch.c` définit ses propres `lkd_sys_read`, `lkd_sys_write`, `lkd_sys_open`, `lkd_sys_ioctl` par `LKD_SYSCALL`, ce que CONVENTIONS §10.6 interdit dès qu'un module définit ces noms : l'édition de liens échouait (symboles dupliqués, MESURE). Contournement côté fs : tous les gestionnaires fs sont `static LKD_SYSCALL(...)`. Demande : soit déclarer `static` dans `LKD_SYSCALL` lui-même (les gestionnaires ne sont référencés que par `LKD_REGISTER` du même fichier), soit renommer les gestionnaires du test.
+`tests/test_core_dispatch.c` defines its own `lkd_sys_read`, `lkd_sys_write`, `lkd_sys_open`, `lkd_sys_ioctl` with `LKD_SYSCALL`, which CONVENTIONS §10.6 forbids as soon as a module defines these names: linking failed (duplicate symbols, MEASURED). Workaround on the fs side: all fs handlers are `static LKD_SYSCALL(...)`. Request: either declare `static` in `LKD_SYSCALL` itself (handlers are referenced only by `LKD_REGISTER` in the same file), or rename the test's handlers.
 
-Construction complète (MESURE, 2026-10-02 fin de session) : `cmake --build` sans erreur, 24 programmes de test sur 24 passent.
+Full build (MEASURED, 2026-10-02 end of session): `cmake --build` without error, 24 test programs out of 24 pass.
 
-## 6. Moteur factice
+## 6. Fake engine
 
-`fake_make_task` ne crée ni table de descripteurs ni fsctx ; les tests fs les posent eux-mêmes (`tests/test_fs_util.h`). Suggestion : les créer dans `fake_make_task` comme `lkd_task_create_main`.
+`fake_make_task` creates neither a descriptor table nor an fsctx; the fs tests set them up themselves (`tests/test_fs_util.h`). Suggestion: create them in `fake_make_task` like `lkd_task_create_main`.
 
 
-## Traitée le 2026-10-02 (mainteneur d'intégration)
+## Handled on 2026-10-02 (integration maintainer)
 
-Points 1 et 2 : faits (lead). Point 3 : contrat recopié en tête de `src/include/vfs.h`. Point 4 : commentaire de `lkd_fdobj_reopen` corrigé dans `fd.h`. Point 5 : `LKD_SYSCALL` est `static` (voir task-1 point 5). Point 6 : non fait ; les tests posent fdt et fsctx eux-mêmes, et les créer dans `fake_make_task` doublerait les leurs.
+Points 1 and 2: done (lead). Point 3: contract copied at the top of `src/include/vfs.h`. Point 4: comment of `lkd_fdobj_reopen` fixed in `fd.h`. Point 5: `LKD_SYSCALL` is `static` (see task-1 point 5). Point 6: not done; the tests set up fdt and fsctx themselves, and creating them in `fake_make_task` would duplicate theirs.

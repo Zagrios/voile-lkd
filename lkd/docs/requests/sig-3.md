@@ -1,18 +1,18 @@
-# Contrat d'interruption (kick) entre le moteur et LKD, vu par sig
+# Interrupt (kick) contract between the engine and LKD, as seen by sig
 
-Demandeur : sig. Destinataires : chef, moteur (`src/fexdarwin/src/LkdGlue.cpp`). Date : 2026-10-02.
+Requester: sig. Recipients: lead, engine (`src/fexdarwin/src/LkdGlue.cpp`). Date: 2026-10-02.
 
-## Ce que sig fait
+## What sig does
 
-1. Quand un signal est mis en file pour une tâche qui peut le prendre (`complete_signal`), sig pose `LKD_TF_SIGPENDING`, puis, verrous relâchés : `lkd_task_wake(t)` (tube de réveil, réveille toute attente LKD), sonne l'attente futex partagée éventuelle (`sig_ring_futex`), et appelle `ops->kick(t)` si `t` n'est pas la tâche courante. Un signal fatal (SIGKILL, ou action par défaut terminante) marque tous les threads `LKD_TF_FATAL` et fait de même pour chacun.
-2. Une attente bloquante dans LKD ne compte jamais sur le signal hôte pour se terminer : tube de réveil, puis test de `lkd_sig_interrupted` avant de dormir. Le kick ne sert qu'au code JIT.
-3. Les attentes futex sur clé partagée dorment dans `os_sync_wait_on_address(SHARED)` par tranches de 50 ms ; le kick (SIGUSR2 sans SA_RESTART) les fait revenir avec EINTR (MESURE darwin-memory-facts-b.md:96), et sig les sonne directement.
-4. `lkd_signal_pending` est vrai aussi quand un masque temporaire (sigsuspend, ppoll, pselect6) attend d'être restauré : la boucle du moteur `while (lkd_signal_pending(t)) lkd_signal_next(t)` le restaure.
+1. When a signal is queued for a task that can take it (`complete_signal`), sig sets `LKD_TF_SIGPENDING`, then, with locks released: `lkd_task_wake(t)` (wake pipe, wakes any LKD wait), rings the shared futex wait if there is one (`sig_ring_futex`), and calls `ops->kick(t)` if `t` is not the current task. A fatal signal (SIGKILL, or a terminating default action) marks all threads `LKD_TF_FATAL` and does the same for each one.
+2. A blocking wait in LKD never relies on the host signal to end: wake pipe, then test of `lkd_sig_interrupted` before sleeping. The kick is only for JIT code.
+3. Futex waits on a shared key sleep in `os_sync_wait_on_address(SHARED)` in 50 ms slices; the kick (SIGUSR2 without SA_RESTART) makes them return with EINTR (MEASURED darwin-memory-facts-b.md:96), and sig rings them directly.
+4. `lkd_signal_pending` is also true when a temporary mask (sigsuspend, ppoll, pselect6) is waiting to be restored: the engine loop `while (lkd_signal_pending(t)) lkd_signal_next(t)` restores it.
 
-## Ce que le moteur doit faire (déjà fait d'après la lecture de LkdGlue.cpp:118-197)
+## What the engine must do (already done according to a reading of LkdGlue.cpp:118-197)
 
-1. SIGUSR2 réservé au kick, installé sans SA_RESTART, jamais utilisé pour autre chose ; le gestionnaire ne fait que lever un drapeau et, en code JIT, rediriger vers un point sûr qui appelle `lkd_signal_next`.
-2. Après chaque `lkd_syscall`, après un kick, après `lkd_fault` : boucler sur `lkd_signal_next` tant que `lkd_signal_pending` ; sur -1, dérouler le thread et appeler `lkd_task_release`.
-3. `lkd_fault` : SIGSEGV avec SEGV_MAPERR/SEGV_ACCERR et l'adresse exacte, SIGBUS, SIGILL, SIGFPE/FPE_INTDIV avec l'adresse de l'instruction, SIGTRAP de int3 avec SI_KERNEL (sig ne remplit alors pas si_addr, comme `force_sig`), pas à pas avec TRAP_TRACE et l'adresse. err et trapno vont dans le sigcontext construit par le moteur.
-4. Limite documentée : un thread en code JIT n'est atteint qu'à son prochain syscall tant que la page d'interruption n'existe pas ; le kick à 1 ms de relance du moteur couvre les zones non sûres.
-5. Garder `LKD_FAMSVC_DIR` et `LKD_FAMSVC_FD` (et le descripteur) à travers la ré-exécution hôte (voir sig-famsvc.md).
+1. SIGUSR2 reserved for the kick, installed without SA_RESTART, never used for anything else; the handler only raises a flag and, in JIT code, redirects to a safe point that calls `lkd_signal_next`.
+2. After each `lkd_syscall`, after a kick, after `lkd_fault`: loop on `lkd_signal_next` while `lkd_signal_pending`; on -1, unwind the thread and call `lkd_task_release`.
+3. `lkd_fault`: SIGSEGV with SEGV_MAPERR/SEGV_ACCERR and the exact address, SIGBUS, SIGILL, SIGFPE/FPE_INTDIV with the instruction's address, SIGTRAP from int3 with SI_KERNEL (sig then does not fill si_addr, like `force_sig`), single step with TRAP_TRACE and the address. err and trapno go into the sigcontext built by the engine.
+4. Documented limit: a thread in JIT code is reached only at its next syscall as long as the interrupt page does not exist; the engine's 1 ms re-kick covers the unsafe areas.
+5. Keep `LKD_FAMSVC_DIR` and `LKD_FAMSVC_FD` (and the descriptor) across the host re-execution (see sig-famsvc.md).

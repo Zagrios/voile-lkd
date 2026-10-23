@@ -1,16 +1,16 @@
-# Demande ptrace-2 (task, core) : wait4 ne se reveille pas sur un arret ptrace
+# Request ptrace-2 (task, core): wait4 does not wake up on a ptrace stop
 
-Demandeur : ptrace. Date : 2026-10-02. Destinataire principal : task (`src/task/wait.c`), accessoirement core (`src/core/block.c`).
+Requester: ptrace. Date: 2026-10-02. Main recipient: task (`src/task/wait.c`), secondarily core (`src/core/block.c`).
 
-## Constat (MESURE, `tests/test_ptrace_transport.c`)
+## Finding (MEASURED, `tests/test_ptrace_transport.c`)
 
-Un `wait4` bloquant qui attend un arret ptrace dure 11,1 ms en p50 (p99 11,3 ms), alors que le meme aller-retour (PTRACE_SYSCALL puis arret suivant) avec un `wait4(WNOHANG)` en boucle dure 42 us entre deux processus hotes. EAC fait environ 150 arrets de syscall : 1,7 s perdues sur ce seul mecanisme.
+A blocking `wait4` that waits for a ptrace stop takes 11.1 ms at p50 (p99 11.3 ms), while the same round trip (PTRACE_SYSCALL then next stop) with a `wait4(WNOHANG)` in a loop takes 42 us between two host processes. EAC makes about 150 syscall stops: 1.7 s lost on this mechanism alone.
 
-Cause (LU) : `do_wait` (`src/task/wait.c`, boucle `for (i < 10 && fam_seq() == seq)`) dort par `lkd_block_sleep(t, now + 10 ms)`. `lkd_block_poll` (`src/core/block.c:51-78`) vide le tube de reveil sur un `lkd_task_wake` mais, si la tache n'est pas interrompue, repart dormir jusqu'a l'echeance (c'est la semantique ecrite dans `lkd_internal.h`, "re-evalue"). Le notifieur fait pourtant son travail : ptrace appelle `lkd_task_wake_waiters(tracer_pid)` (qui incremente le compteur de famille et ecrit dans le tube du `wait4` marque `LT_IN_WAIT`) quelques dizaines de microsecondes apres l'arret, dans le processus du traceur (service de famille). Le reveil n'a aucun effet. Meme chose pour la mort d'un enfant d'un autre processus hote, `lkd_task_notify_stop` et les SIGCHLD : tous passent par `lkd_task_wake_waiters`.
+Cause (READ): `do_wait` (`src/task/wait.c`, loop `for (i < 10 && fam_seq() == seq)`) sleeps with `lkd_block_sleep(t, now + 10 ms)`. `lkd_block_poll` (`src/core/block.c:51-78`) drains the wake pipe on an `lkd_task_wake` but, if the task is not interrupted, goes back to sleep until the deadline (this is the semantics written in `lkd_internal.h`, "re-evalue"). The notifier does its job, though: ptrace calls `lkd_task_wake_waiters(tracer_pid)` (which increments the family counter and writes into the pipe of the `wait4` marked `LT_IN_WAIT`) a few tens of microseconds after the stop, in the tracer's process (family service). The wakeup has no effect. Same thing for the death of a child of another host process, `lkd_task_notify_stop` and the SIGCHLDs: they all go through `lkd_task_wake_waiters`.
 
-## Correctif propose (MESURE sur une copie de `wait.c` dans le scratchpad, sans toucher a l'arbre)
+## Proposed fix (MEASURED on a copy of `wait.c` in the scratchpad, without touching the tree)
 
-Dans la boucle de `do_wait`, remplacer l'appel a `lkd_block_sleep` par une attente sur le tube de reveil lui-meme :
+In the loop of `do_wait`, replace the call to `lkd_block_sleep` with a wait on the wake pipe itself:
 
 ```c
 for (int i = 0; i < 10 && fam_seq() == seq; i++) {
@@ -20,17 +20,17 @@ for (int i = 0; i < 10 && fam_seq() == seq; i++) {
 }
 ```
 
-Resultat avec ce correctif : `wait4` bloquant, tracee dans un autre processus hote, p50 43 us, p90 53 us, p99 73 us (n = 1500). Sans lui : p50 11 110 us. Une variante plus propre est une fonction de core `int lkd_block_wait_wake(lkd_task *t, int64_t deadline_ns)` qui rend 0 des qu'un `lkd_task_wake` est consomme (ou -LX_ERESTARTSYS si interrompue), a utiliser par `do_wait`. Piege mesure : `lkd_block_wait_fd(t, t->wake_rd, POLLIN, ...)` ne convient pas, car le meme descripteur est passe deux fois a `poll` et macOS n'en signale qu'une entree.
+Result with this fix: blocking `wait4`, tracee in another host process, p50 43 us, p90 53 us, p99 73 us (n = 1500). Without it: p50 11,110 us. A cleaner variant is a core function `int lkd_block_wait_wake(lkd_task *t, int64_t deadline_ns)` that returns 0 as soon as an `lkd_task_wake` is consumed (or -LX_ERESTARTSYS if interrupted), to be used by `do_wait`. Measured pitfall: `lkd_block_wait_fd(t, t->wake_rd, POLLIN, ...)` does not work, because the same descriptor is passed twice to `poll` and macOS reports only one entry of it.
 
-## Autre point pour task : `lkd_ptrace_has_tracees` et le selecteur
+## Other point for task: `lkd_ptrace_has_tracees` and the selector
 
-`scan()` rend 0 (attendre) des que `lkd_ptrace_has_tracees(t)` est vrai, meme si `wait4(pid)` vise un pid qui n'est ni un enfant ni un tracee. Linux rend ECHILD dans ce cas (`do_wait` ne trouve aucun enfant qui satisfait le selecteur). Pour que ptrace puisse repondre exactement, task peut appeler a la place `int lkd_ptrace_wait_has(lkd_task *waiter, int32_t sel_pid, unsigned options)` (definie dans `src/ptrace/life.c`, meme selecteur que `lkd_ptrace_wait_event`, a declarer dans `ptrace.h`). Il faut aussi que `lkd_ptrace_wait_event` rende toujours `CLD_TRAPPED` pour un arret ptrace, y compris un arret de groupe (`why = ptrace ? CLD_TRAPPED : CLD_STOPPED` dans `wait_task_stopped`) : c'est fait.
+`scan()` returns 0 (wait) as soon as `lkd_ptrace_has_tracees(t)` is true, even if `wait4(pid)` targets a pid that is neither a child nor a tracee. Linux returns ECHILD in this case (`do_wait` finds no child that satisfies the selector). So that ptrace can answer exactly, task can call instead `int lkd_ptrace_wait_has(lkd_task *waiter, int32_t sel_pid, unsigned options)` (defined in `src/ptrace/life.c`, same selector as `lkd_ptrace_wait_event`, to declare in `ptrace.h`). `lkd_ptrace_wait_event` must also always return `CLD_TRAPPED` for a ptrace stop, including a group stop (`why = ptrace ? CLD_TRAPPED : CLD_STOPPED` in `wait_task_stopped`): this is done.
 
-Aussi `waitid` : pour un arret ptrace le `si_status` de `waitid` doit etre le code d'arret complet (`exit_code`, par exemple 0x405 pour PTRACE_EVENT_EXEC, 0x80 | 5 pour un arret de syscall), pas `(status >> 8) & 0xff` (`src/task/wait.c`, `scan`, branche ptrace). C'est `ev.status >> 8` en entier (kernel/exit.c v6.12 ligne 1358, `wait_task_stopped` : `infop->status = exit_code`).
+Also `waitid`: for a ptrace stop the `si_status` of `waitid` must be the full stop code (`exit_code`, for example 0x405 for PTRACE_EVENT_EXEC, 0x80 | 5 for a syscall stop), not `(status >> 8) & 0xff` (`src/task/wait.c`, `scan`, ptrace branch). It is `ev.status >> 8` in full (kernel/exit.c v6.12 line 1358, `wait_task_stopped`: `infop->status = exit_code`).
 
 
-## Traitée le 2026-10-02 (mainteneur d'intégration)
+## Handled on 2026-10-02 (integration maintainer)
 
-Point 1 (réveil) : nouvelle attente de core `lkd_block_wait_wake` (`src/core/block.c`), qui rend la main dès qu'un octet de réveil est consommé ; `do_wait` (`src/task/wait.c`) l'utilise au lieu de `lkd_block_sleep`. `lkd_task_wake_waiters` (`src/task/tasks.c`) atteint aussi les attentes d'un AUTRE processus hôte par famsvc (opcode task 96), pour la mort, l'arrêt et la reprise d'un enfant. MESURE : `test_ptrace_life` cas `blocking_wait4_wakes_at_once` (20 arrêts sous 100 ms ; avant : blocage, le test ne finit pas en 100 s) ; `test_task_proc` cas `wait4_wakes_at_once_across_host_processes` (10 tours sous 65 ms ; avant : environ 100 ms) ; `test_ptrace_transport` passe de 18 s à 1 s.
-Point 2 (sélecteur) : `scan()` appelle `lkd_ptrace_wait_has` (déclarée dans `ptrace.h`, faible dans core). ECHILD pour un pid qui n'est ni enfant ni tracé, et pour `__WNOTHREAD` depuis un thread sans tracé. Pour que `wait4(nouveau pid)` juste après PTRACE_EVENT_FORK ne rende pas ECHILD, `lkd_ptrace_event` attend (borné à 2 s) que l'enfant forké ait créé son lien. Tests : `test_ptrace_life` `wait_selectors_see_tracees`, `wait_semantics`.
-Point 3 (si_status) : code d'arrêt complet (`status >> 8`). Test : `test_ptrace_life` `group_stop_of_a_traced_task` (0x8013).
+Point 1 (wakeup): new core wait `lkd_block_wait_wake` (`src/core/block.c`), which returns as soon as a wake byte is consumed; `do_wait` (`src/task/wait.c`) uses it instead of `lkd_block_sleep`. `lkd_task_wake_waiters` (`src/task/tasks.c`) also reaches the waits of ANOTHER host process through famsvc (task opcode 96), for the death, stop and continuation of a child. MEASURED: `test_ptrace_life` case `blocking_wait4_wakes_at_once` (20 stops under 100 ms; before: hang, the test does not finish in 100 s); `test_task_proc` case `wait4_wakes_at_once_across_host_processes` (10 rounds under 65 ms; before: about 100 ms); `test_ptrace_transport` goes from 18 s to 1 s.
+Point 2 (selector): `scan()` calls `lkd_ptrace_wait_has` (declared in `ptrace.h`, weak in core). ECHILD for a pid that is neither a child nor a tracee, and for `__WNOTHREAD` from a thread without a tracee. So that `wait4(new pid)` right after PTRACE_EVENT_FORK does not return ECHILD, `lkd_ptrace_event` waits (bounded to 2 s) for the forked child to have created its link. Tests: `test_ptrace_life` `wait_selectors_see_tracees`, `wait_semantics`.
+Point 3 (si_status): full stop code (`status >> 8`). Test: `test_ptrace_life` `group_stop_of_a_traced_task` (0x8013).

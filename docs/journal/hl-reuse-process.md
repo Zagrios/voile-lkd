@@ -1,184 +1,184 @@
-# Réutilisation de la couche processus de HyperLinux par un moteur FEXCore en processus
+# Reuse of the HyperLinux process layer by an in-process FEXCore engine
 
-Date : 2026-10-02. Statut : version complète relue sur les sources (brouillon 3). Seconde moitié de l'étude de réutilisation de HyperLinux : threads, fork, exec, wait, signaux, futex, ptrace, réseau, polling. La mémoire, les VMA, le vfs et procfs sont traités dans `reports/hl-reuse-core.md` ; je ne cite leurs symboles que pour mesurer le couplage.
+Date: 2026-10-02. Status: complete version reviewed against the sources (draft 3). Second half of the HyperLinux reuse study: threads, fork, exec, wait, signals, futex, ptrace, network, polling. Memory, VMAs, the vfs and procfs are covered in `reports/hl-reuse-core.md`; I cite their symbols only to measure the coupling.
 
-Conventions. MESURÉ : sortie d'une commande ou d'un programme lancé dans cette session, avec le journal cité. LU : lecture d'une source, avec `fichier:ligne`. INFÉRÉ : déduction de ma part, non exécutée. Les chemins `src/...` désignent `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-hyperlinux-20260928/hyper-linux/src/` (HL). `EXP` désigne `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-wine-fex-darwin-20261002`. Les chemins `probes/...` désignent `rocket-hyperlinux-20260928/probes/...`.
+Conventions. MEASURED: output of a command or of a program launched in this session, with the log cited. READ: reading of a source, with `file:line`. INFERRED: deduction on my part, not executed. The paths `src/...` refer to `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-hyperlinux-20260928/hyper-linux/src/` (HL). `EXP` refers to `/Users/mathieu/Documents/Github/Zagrios/sailover/build/experiments/rocket-wine-fex-darwin-20261002`. The paths `probes/...` refer to `rocket-hyperlinux-20260928/probes/...`.
 
-## Résultat en bref
+## Result in brief
 
-1. HyperLinux n'est pas un noyau réutilisable tel quel. Sa couche processus est soudée à la boucle `vcpu_run_loop` (HVC, ESR_EL1, registres HVF) et à un fork par `posix_spawn` plus transfert d'état. Sur 18 527 lignes de fichiers liés aux processus que j'ai classées par plages de lignes, j'estime 9 500 lignes à garder avec des changements mécaniques (accès mémoire invitée, registres), 2 300 à réécrire et 6 700 à abandonner (boucle HVC, IPC de fork, Rosetta, stub GDB). INFÉRÉ à plus ou moins 30 %.
-2. Huit modules n'ont aucune référence HVF (comptage `grep`) : `futex.c`, `syscall_poll.c`, `syscall_net.c`, `syscall_inotify.c`, `syscall_fd.c`, `proc_ptrace.c`, `proc_names.c`, `trace.c`. Leur seule dépendance d'exécution au moteur est la copie de mémoire invitée (`guest_read`, `guest_write`, `guest_ptr`). Dépendance de compilation : onze en-têtes incluent `<Hypervisor/Hypervisor.h>` (dont `syscall.h`, `guest.h`, `thread.h`, `syscall_signal.h`, `syscall_proc.h`), que sept de ces huit modules incluent par transitivité (`trace.c` en est exempt) ; il faut les en purger (types `hv_vcpu_t` dans les prototypes de signaux et dans `guest_t`).
-3. Le dispatch de HL est indexé par les numéros de syscall arm64 (`src/syscall.h:17-170`). Les 276 enregistrements de la couche Linux de FEX qui font un « passthrough » appellent le noyau hôte avec ces mêmes numéros arm64 par `svc #0` (`Syscalls/Passthrough.cpp:18-150`). HL peut donc jouer le rôle de noyau hôte derrière le front-end x86-64 de FEX, ce qui évite de refaire la conversion x86-64 (numéros, `epoll_event` packé, `stat`). La couverture par nom est de 128 syscalls sur 241 noms de passthrough FEX (53 %) ; 113 manquent.
-4. `proc_ptrace.c` est déjà une émulation en espace utilisateur de la relation traceur/tracee entre deux processus du runtime, sans ptrace noyau : fichier d'état partagé, verrou `fcntl`, socket de notification, arrêt coopératif du tracee. Je l'ai recompilé dans la copie de travail : 79 contrôles PASS, 0 FAIL (`logs/host-test-proc-ptrace-host.log`). Son contenu est ARM64 (34 mots) : la vue x86 (216 octets, que demande EAC) est à écrire. FEXCore garde l'état x86 réel en mémoire ordinaire (`CPUState`), donc la vue x86 est exacte par construction, contrairement au contexte ARM de Rosetta.
-5. Cinq lacunes cassent Wine avant même EAC : pas de signal vers un autre processus invité hors SIGKILL/SIGCONT d'un enfant (Wine server envoie SIGUSR1 aux clients, `voile-wine/server/thread.c:961`) ; futex locale au processus ; pas de SIGCHLD à la mort d'un enfant ; `fork` ignore `CLONE_CHILD_SETTID` ; `vfork` et `posix_spawn` mènent à un chemin vm-clone non qualifié.
-6. MESURÉ sur cette machine : un descripteur kqueue ne passe pas par `SCM_RIGHTS` (`EINVAL`) et n'est pas hérité par `fork` (`EBADF` dans l'enfant) (`logs/host-test-kq-fork-scm.log`). Le fork de HL ferait échouer `clone` si un timerfd est ouvert. Epoll, timerfd et inotify doivent être reconstruits après `fork`.
-7. Le `fork()` natif de macOS 27 tient dans un processus multithread avec `MAP_JIT` (journal du coéquipier `evidence/darwin-process/f1_fork_mt.log`, 17 PASS, 0 FAIL). Les 2 300 lignes de transfert d'état de `fork_ipc.c` deviennent inutiles. Le prix : les verrous tenus par les threads absents restent verrouillés dans l'enfant (mutex, `os_unfair_lock`, stdio), donc le schéma `LockBeforeFork`/`UnlockAfterFork` de FEX est obligatoire.
-8. Infrastructure de test : l'arbre complet se compile sans avertissement en 2,9 s (39 objets, lien réussi, aucune exécution) ; 8 programmes de test hôte passent en 2,7 s sans HVF ; le test `test-thread-vcpu-lifetime` ne se lie pas avec le Makefile tel quel (symbole `proc_trace_tracer_exit`). 77 programmes invités x86-64 statiques sont déjà compilés (`test-binaries/amd64/bin`) et peuvent servir de tests d'acceptation d'un hôte FEX.
-9. Constat annexe (hors périmètre mais mesuré) : `SYS_fgetxattr` vaut 16 et `SYS_fremovexattr` 18 dans `src/syscall.h:166,169`, alors que les numéros arm64 sont 10 et 16 (`FEX Arm64/SyscallsEnum.h:22,28`). Les journaux EAC contiennent 304 événements `unimplemented_syscall` pour le numéro 10.
+1. HyperLinux is not a kernel reusable as is. Its process layer is welded to the `vcpu_run_loop` loop (HVC, ESR_EL1, HVF registers) and to a fork through `posix_spawn` plus state transfer. Out of 18,527 lines of process-related files that I classified by line ranges, I estimate 9,500 lines to keep with mechanical changes (guest memory access, registers), 2,300 to rewrite and 6,700 to drop (HVC loop, fork IPC, Rosetta, GDB stub). INFERRED to within about 30%.
+2. Eight modules have no HVF reference (`grep` count): `futex.c`, `syscall_poll.c`, `syscall_net.c`, `syscall_inotify.c`, `syscall_fd.c`, `proc_ptrace.c`, `proc_names.c`, `trace.c`. Their only runtime dependency on the engine is the guest memory copy (`guest_read`, `guest_write`, `guest_ptr`). Compile dependency: eleven headers include `<Hypervisor/Hypervisor.h>` (among them `syscall.h`, `guest.h`, `thread.h`, `syscall_signal.h`, `syscall_proc.h`), which seven of these eight modules include transitively (`trace.c` is exempt); they have to be purged of it (`hv_vcpu_t` types in the signal prototypes and in `guest_t`).
+3. HL's dispatch is indexed by the arm64 syscall numbers (`src/syscall.h:17-170`). The 276 registrations of FEX's Linux layer that do a "passthrough" call the host kernel with these same arm64 numbers through `svc #0` (`Syscalls/Passthrough.cpp:18-150`). HL can therefore play the role of host kernel behind FEX's x86-64 front end, which avoids redoing the x86-64 conversion (numbers, packed `epoll_event`, `stat`). Coverage by name is 128 syscalls out of 241 FEX passthrough names (53%); 113 are missing.
+4. `proc_ptrace.c` is already a user-space emulation of the tracer/tracee relation between two processes of the runtime, without kernel ptrace: shared state file, `fcntl` lock, notification socket, cooperative stop of the tracee. I recompiled it in the working copy: 79 PASS checks, 0 FAIL (`logs/host-test-proc-ptrace-host.log`). Its content is ARM64 (34 words): the x86 view (216 bytes, which EAC asks for) is to be written. FEXCore keeps the real x86 state in ordinary memory (`CPUState`), so the x86 view is exact by construction, unlike Rosetta's ARM context.
+5. Five gaps break Wine even before EAC: no signal to another guest process other than SIGKILL/SIGCONT of a child (Wine server sends SIGUSR1 to the clients, `voile-wine/server/thread.c:961`); process-local futex; no SIGCHLD at the death of a child; `fork` ignores `CLONE_CHILD_SETTID`; `vfork` and `posix_spawn` lead to an unqualified vm-clone path.
+6. MEASURED on this machine: a kqueue descriptor does not go through `SCM_RIGHTS` (`EINVAL`) and is not inherited by `fork` (`EBADF` in the child) (`logs/host-test-kq-fork-scm.log`). HL's fork would make `clone` fail if a timerfd is open. Epoll, timerfd and inotify have to be rebuilt after `fork`.
+7. The native `fork()` of macOS 27 holds in a multithreaded process with `MAP_JIT` (teammate's log `evidence/darwin-process/f1_fork_mt.log`, 17 PASS, 0 FAIL). The 2,300 state transfer lines of `fork_ipc.c` become useless. The price: the locks held by the absent threads stay locked in the child (mutex, `os_unfair_lock`, stdio), so FEX's `LockBeforeFork`/`UnlockAfterFork` scheme is mandatory.
+8. Test infrastructure: the full tree compiles without warnings in 2.9 s (39 objects, link successful, no execution); 8 host test programs pass in 2.7 s without HVF; the test `test-thread-vcpu-lifetime` does not link with the Makefile as is (symbol `proc_trace_tracer_exit`). 77 static x86-64 guest programs are already compiled (`test-binaries/amd64/bin`) and can serve as acceptance tests for a FEX host.
+9. Side finding (out of scope but measured): `SYS_fgetxattr` is 16 and `SYS_fremovexattr` 18 in `src/syscall.h:166,169`, whereas the arm64 numbers are 10 and 16 (`FEX Arm64/SyscallsEnum.h:22,28`). The EAC logs contain 304 `unimplemented_syscall` events for number 10.
 
-## 0. Sources, état de l'arbre, méthode
+## 0. Sources, state of the tree, method
 
-Arbre lu : HL en état copie de travail, HEAD 8048a96 (« docs: link the public examples sibling »). MESURÉ (`git status --short`, `git diff --stat`, lecture seule) : 45 entrées, soit 33 fichiers suivis modifiés (4475 insertions, 1560 suppressions) et 12 non suivis (11 sources plus `.DS_Store`). Non suivis, donc entièrement privés : `src/fault_dump.c/h`, `src/proc_names.c/h`, `src/proc_ptrace.c/h`, `src/signal_notify.h`, `src/syscall_filemap.c/h`, `src/syscall_reopen.c/h`.
+Tree read: HL in working copy state, HEAD 8048a96 ("docs: link the public examples sibling"). MEASURED (`git status --short`, `git diff --stat`, read-only): 45 entries, that is 33 modified tracked files (4475 insertions, 1560 deletions) and 12 untracked (11 sources plus `.DS_Store`). Untracked, therefore entirely private: `src/fault_dump.c/h`, `src/proc_names.c/h`, `src/proc_ptrace.c/h`, `src/signal_notify.h`, `src/syscall_filemap.c/h`, `src/syscall_reopen.c/h`.
 
-Intégrité : j'ai relancé `shasum -a 256 -c EXP/evidence/hl-source-manifest-after.sha256` depuis HL : 214 entrées, aucune ligne non OK. Je n'ai rien écrit dans HL, dans le jeu, dans le runtime installé ni dans les dépôts. Je n'ai lancé ni jeu, ni EAC, ni QEMU, ni UTM, ni HVF.
+Integrity: I reran `shasum -a 256 -c EXP/evidence/hl-source-manifest-after.sha256` from HL: 214 entries, no line not OK. I wrote nothing in HL, in the game, in the installed runtime or in the repositories. I launched neither the game, nor EAC, nor QEMU, nor UTM, nor HVF.
 
-Lecture complète des fichiers : `thread.c/h`, `syscall_proc.c/h`, `syscall_signal.c/h`, `futex.c/h`, `fork_ipc.c/h`, `syscall_exec.c`, `proc_ptrace.c/h`, `syscall_internal.h`, `signal_notify.h`, `rosetta.h`, `gdb_stub.h`, `trace.h`, `crash_report.h`, `hv_util.h`, `proc_names.h`, `syscall_poll.h`, `syscall_net.h`, `syscall_inotify.h`. Lecture ciblée (fonctions, en-têtes, tables) : `syscall.c` (dispatch), `syscall_poll.c`, `syscall_net.c`, `syscall_inotify.c`, `syscall_fd.c`, `proc_names.c`, `trace.c`, `crash_report.c`, `fault_dump.c`, `hl.c`, `syscall_sys.c`. Documents lus : `proc-ptrace-module.md`, `ptrace-runtime.md`, `ptrace-options-contract.md`, `ptrace-syscall-contract.md`, `ptrace-regset-contract.md`, `regset-architecture.md`, le README de `ptrace-remote-setregset-runtime-20261001`, `ptrace-x86-feasibility-20260929.md`, `eac-ptrace-target-role-20260929.md`, les README des audits EAC, ainsi que `docs/research/rocket-league-eac-technologies-macos-2026-10-01.md`.
+Full reading of the files: `thread.c/h`, `syscall_proc.c/h`, `syscall_signal.c/h`, `futex.c/h`, `fork_ipc.c/h`, `syscall_exec.c`, `proc_ptrace.c/h`, `syscall_internal.h`, `signal_notify.h`, `rosetta.h`, `gdb_stub.h`, `trace.h`, `crash_report.h`, `hv_util.h`, `proc_names.h`, `syscall_poll.h`, `syscall_net.h`, `syscall_inotify.h`. Targeted reading (functions, headers, tables): `syscall.c` (dispatch), `syscall_poll.c`, `syscall_net.c`, `syscall_inotify.c`, `syscall_fd.c`, `proc_names.c`, `trace.c`, `crash_report.c`, `fault_dump.c`, `hl.c`, `syscall_sys.c`. Documents read: `proc-ptrace-module.md`, `ptrace-runtime.md`, `ptrace-options-contract.md`, `ptrace-syscall-contract.md`, `ptrace-regset-contract.md`, `regset-architecture.md`, the README of `ptrace-remote-setregset-runtime-20261001`, `ptrace-x86-feasibility-20260929.md`, `eac-ptrace-target-role-20260929.md`, the READMEs of the EAC audits, as well as `docs/research/rocket-league-eac-technologies-macos-2026-10-01.md`.
 
-Hypothèse de moteur, reprise de la consigne : FEXCore dans un processus macOS arm64 natif, adresses invitées égales aux adresses hôtes, sans Hypervisor.framework, sans shim EL1, sans Rosetta. L'invité visé est un processus Linux x86-64 (Wine Linux, jeu Windows, module EAC Linux). Réserve : le rapport `reports/fexcore-darwin-port.md` mesure qu'un processus arm64 macOS ne peut pas réserver la mémoire sous 4 Gio ni au-dessus de 0x7ffffe000000, alors que `wine64-preloader` demande 0x10000-0x68000000 et 0x7f000000-0x7fff0000. L'identité parfaite des adresses ne pourra donc peut-être pas héberger Wine, et un décalage de base invité pourrait être nécessaire. Je recommande de garder une couche d'accès mémoire invitée explicite (section 3), ce qui rend ce décalage peu coûteux.
+Engine assumption, taken from the instructions: FEXCore in a native arm64 macOS process, guest addresses equal to host addresses, without Hypervisor.framework, without EL1 shim, without Rosetta. The target guest is a Linux x86-64 process (Linux Wine, Windows game, Linux EAC module). Caveat: the report `reports/fexcore-darwin-port.md` measures that an arm64 macOS process cannot reserve memory below 4 GiB nor above 0x7ffffe000000, whereas `wine64-preloader` asks for 0x10000-0x68000000 and 0x7f000000-0x7fff0000. Perfect address identity may therefore not be able to host Wine, and a guest base offset could be needed. I recommend keeping an explicit guest memory access layer (section 3), which makes this offset cheap.
 
-## 1. Architecture telle qu'implémentée
+## 1. Architecture as implemented
 
-### 1.1 Un processus invité est un processus macOS avec sa propre VM HVF
+### 1.1 A guest process is a macOS process with its own HVF VM
 
-LU : `src/fork_ipc.h:6-8` (HVF n'autorise qu'une VM par processus, donc fork lance un nouveau processus hl). Le PID invité est un entier d'un compteur partagé par toute la famille de fork : fichier `mkstemp` non lié d'une page, mappé `MAP_SHARED`, entier atomique `next` initialisé à 2, PID initial 1 (`src/syscall_proc.c:45-46,80-113`, `proc_alloc_pid` 516-529, export et import 531-562). Les PID restent sous `0x3fffffff`, limite du champ propriétaire des futex PI (`src/syscall_proc.c:77-81`). Le registre des tâches (`comm`, `exe`, `cmdline`, relation ptrace publiée) est un second fichier partagé indexé par TID, protégé par un verrou `fcntl` (`src/proc_names.c:1-80`, 479 lignes), transmis à l'enfant par descripteur.
+READ: `src/fork_ipc.h:6-8` (HVF allows only one VM per process, so fork launches a new hl process). The guest PID is an integer from a counter shared by the whole fork family: unlinked one-page `mkstemp` file, mapped `MAP_SHARED`, atomic integer `next` initialized to 2, initial PID 1 (`src/syscall_proc.c:45-46,80-113`, `proc_alloc_pid` 516-529, export and import 531-562). PIDs stay below `0x3fffffff`, limit of the owner field of PI futexes (`src/syscall_proc.c:77-81`). The task registry (`comm`, `exe`, `cmdline`, published ptrace relation) is a second shared file indexed by TID, protected by an `fcntl` lock (`src/proc_names.c:1-80`, 479 lines), passed to the child by descriptor.
 
-### 1.2 vCPU contre threads invités
+### 1.2 vCPU versus guest threads
 
-LU. Un thread invité est un `thread_entry_t` (`src/thread.h:28-102`) dans une table de `MAX_THREADS = 64` entrées (`src/thread.h:25`), sous un mutex global `thread_lock` de rang 5 (`src/thread.c:34`), avec un pointeur `_Thread_local current_thread` (`src/thread.c:45`). Chaque thread invité possède un `hv_vcpu_t` créé sur son propre pthread hôte, parce que HVF lie un vCPU à son thread créateur (`src/fork_ipc.c:1442-1445`). Il reçoit une pile EL1 de 4 Kio tirée d'un bitmap de 64 emplacements (`src/thread.c:36-40,373-393`). Le thread porte aussi : masque de signaux et pile alternative par thread (`src/thread.h:42-51`), état ptrace local de Rosetta (`53-77`), instantané GDB (`88-91`), état des clones `CLONE_VM` (`93-101`).
+READ. A guest thread is a `thread_entry_t` (`src/thread.h:28-102`) in a table of `MAX_THREADS = 64` entries (`src/thread.h:25`), under a global mutex `thread_lock` of rank 5 (`src/thread.c:34`), with a `_Thread_local current_thread` pointer (`src/thread.c:45`). Each guest thread owns an `hv_vcpu_t` created on its own host pthread, because HVF binds a vCPU to its creating thread (`src/fork_ipc.c:1442-1445`). It receives a 4 KiB EL1 stack taken from a bitmap of 64 slots (`src/thread.c:36-40,373-393`). The thread also carries: per-thread signal mask and alternate stack (`src/thread.h:42-51`), Rosetta's local ptrace state (`53-77`), GDB snapshot (`88-91`), state of `CLONE_VM` clones (`93-101`).
 
-Interruption : `hv_vcpus_exit` sous le verrou de table (`src/thread.c:283-296`, `454-472`). Un signal invité ou `exit_group` réveille tous les vCPU ; la boucle voit `HV_EXIT_REASON_CANCELED` (`src/syscall_proc.c:2073-2136`). Les appels hôte bloquants ne sont interruptibles que sur le chemin `read`, `write`, `pread`, `pwrite` (`interruptible_iov_io`, `src/syscall_io.c:304-324`) : le thread publie son pthread, un thread « waker » lui envoie SIGUSR2 hôte toutes les 2 ms tant que le réveil est en attente (`src/thread.c:47-140`). `ppoll`, `pselect6` et `epoll_pwait` sans délai se réveillent par le pipe `wakeup_pipe` et l'époque d'interruption (`src/syscall_poll.c:221-265,436-497,846-911`) ; `wait4` boucle par pas de 1 ms et `futex` par pas de 100 ms. En revanche `nanosleep` et `clock_nanosleep` appellent le `nanosleep` hôte sans condition de sortie (`src/syscall_time.c`), et `syscall_net.c` ne contient ni `signal_pending`, ni `EINTR`, ni `poll(` : `accept`, `connect`, `recv*` et `send*` bloquent sur l'hôte sans être interrompus par un signal invité. INFÉRÉ de ces absences, non exécuté.
+Interruption: `hv_vcpus_exit` under the table lock (`src/thread.c:283-296`, `454-472`). A guest signal or `exit_group` wakes all vCPUs; the loop sees `HV_EXIT_REASON_CANCELED` (`src/syscall_proc.c:2073-2136`). Blocking host calls are interruptible only on the `read`, `write`, `pread`, `pwrite` path (`interruptible_iov_io`, `src/syscall_io.c:304-324`): the thread publishes its pthread, a "waker" thread sends it host SIGUSR2 every 2 ms as long as the wakeup is pending (`src/thread.c:47-140`). `ppoll`, `pselect6` and `epoll_pwait` without timeout wake up through the `wakeup_pipe` pipe and the interruption epoch (`src/syscall_poll.c:221-265,436-497,846-911`); `wait4` loops in steps of 1 ms and `futex` in steps of 100 ms. On the other hand `nanosleep` and `clock_nanosleep` call the host `nanosleep` without an exit condition (`src/syscall_time.c`), and `syscall_net.c` contains neither `signal_pending`, nor `EINTR`, nor `poll(`: `accept`, `connect`, `recv*` and `send*` block on the host without being interrupted by a guest signal. INFERRED from these absences, not executed.
 
-Fin de thread : écriture de 0 dans `clear_child_tid` puis `futex_wake_one`, après destruction du vCPU (`src/fork_ipc.c:1515-1541`). `exit_group` positionne `exit_group_requested`, réveille tout (`thread_interrupt_all`, pipe de réveil) et joint les workers pendant au plus 50 ms avant de les détacher (`src/syscall_proc.c:125-138`, `src/thread.c:405-439`).
+Thread end: write of 0 into `clear_child_tid` then `futex_wake_one`, after destruction of the vCPU (`src/fork_ipc.c:1515-1541`). `exit_group` sets `exit_group_requested`, wakes everything (`thread_interrupt_all`, wakeup pipe) and joins the workers for at most 50 ms before detaching them (`src/syscall_proc.c:125-138`, `src/thread.c:405-439`).
 
-### 1.3 Variantes de clone
+### 1.3 Clone variants
 
-LU : le dispatcher `sys_clone` (`src/fork_ipc.c:2623-2642`) n'a que trois branches.
+READ: the `sys_clone` dispatcher (`src/fork_ipc.c:2623-2642`) has only three branches.
 
-| Flags | Chemin | Effet |
+| Flags | Path | Effect |
 |---|---|---|
-| `CLONE_THREAD` (pthread_create glibc, musl) | `sys_clone_thread`, `src/fork_ipc.c:1290-1440` | Nouveau pthread hôte de 2 Mio, nouveau vCPU, mêmes tables de pages. Copie des 31 GPR et des registres système du parent, X0=0, SP=`child_stack`, TPIDR_EL0=`tls` si `CLONE_SETTLS` (1484-1488). `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, `CLONE_CHILD_CLEARTID` traités (1384-1407). |
-| `CLONE_VM` sans `CLONE_THREAD` | `sys_clone_vm`, `src/fork_ipc.c:1568-1701` | Un thread hôte détaché avec `is_vm_clone=1`, TID propre, attendable par wait4 via la table de threads (`src/thread.c:783-869`). Conçu pour le JIT à deux processus de Rosetta. `CLONE_VFORK` n'est pas honoré ; si `child_stack` vaut 0 le « enfant » reprend la pile du parent (1633-1634). La sortie du dernier vm-clone déclenche `exit_group` (1795-1808). |
-| Tout le reste, dont `fork()` glibc (flags 0x1200011, observé pour EAC) | `sys_clone_fork` puis `sys_clone_fork_inner`, `src/fork_ipc.c:1841-2617` | `posix_spawn` d'un `hl --fork-child <fd>` (1873-1930) puis transfert d'état (1.4). Seul `CLONE_VFORK` y est lu : le parent attend le `waitpid` de l'enfant (2595). |
+| `CLONE_THREAD` (pthread_create glibc, musl) | `sys_clone_thread`, `src/fork_ipc.c:1290-1440` | New 2 MiB host pthread, new vCPU, same page tables. Copy of the parent's 31 GPRs and system registers, X0=0, SP=`child_stack`, TPIDR_EL0=`tls` if `CLONE_SETTLS` (1484-1488). `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, `CLONE_CHILD_CLEARTID` handled (1384-1407). |
+| `CLONE_VM` without `CLONE_THREAD` | `sys_clone_vm`, `src/fork_ipc.c:1568-1701` | A detached host thread with `is_vm_clone=1`, own TID, waitable by wait4 through the thread table (`src/thread.c:783-869`). Designed for Rosetta's two-process JIT. `CLONE_VFORK` is not honored; if `child_stack` is 0 the "child" takes over the parent's stack (1633-1634). The exit of the last vm-clone triggers `exit_group` (1795-1808). |
+| Everything else, including glibc `fork()` (flags 0x1200011, observed for EAC) | `sys_clone_fork` then `sys_clone_fork_inner`, `src/fork_ipc.c:1841-2617` | `posix_spawn` of an `hl --fork-child <fd>` (1873-1930) then state transfer (1.4). Only `CLONE_VFORK` is read there: the parent waits for the child's `waitpid` (2595). |
 
-Constats LUS :
+READ findings:
 
-- `sys_clone_fork(vcpu, g, flags, verbose)` ne reçoit ni `child_stack`, ni `ptid`, ni `tls`, ni `ctid` (`src/fork_ipc.c:2612-2642`). Un `fork()` glibc passe `CLONE_CHILD_SETTID` avec `ctid = &THREAD_SELF->tid` : l'enfant ne reçoit donc pas son TID dans cette variable. INFÉRÉ : tout code glibc qui lit le TID mis en cache dans l'enfant voit celui du parent (mutex PI, `pthread_kill(pthread_self())`).
-- `vfork()` et `posix_spawn()` de glibc utilisent `CLONE_VM|CLONE_VFORK` (0x4111 avec SIGCHLD). INFÉRÉ : ils tombent dans `sys_clone_vm`, le parent n'est pas suspendu, et un `execve` de l'« enfant » appelle `guest_reset(g)` sur la mémoire invitée partagée (`src/syscall_exec.c:373`). Aucun test HL n'exerce vfork ni posix_spawn (`grep` sur `test/test-*.c` : seul `test-shm.c:216` en parle, dans un commentaire).
-- `clone3` renvoie ENOSYS (`src/syscall.c:2417-2420`) ; glibc retombe sur `clone`. `unshare`, `setns`, `pidfd_open` sont absents du dispatch.
+- `sys_clone_fork(vcpu, g, flags, verbose)` receives neither `child_stack`, nor `ptid`, nor `tls`, nor `ctid` (`src/fork_ipc.c:2612-2642`). A glibc `fork()` passes `CLONE_CHILD_SETTID` with `ctid = &THREAD_SELF->tid`: the child therefore does not receive its TID in this variable. INFERRED: any glibc code that reads the cached TID in the child sees the parent's (PI mutex, `pthread_kill(pthread_self())`).
+- glibc's `vfork()` and `posix_spawn()` use `CLONE_VM|CLONE_VFORK` (0x4111 with SIGCHLD). INFERRED: they fall into `sys_clone_vm`, the parent is not suspended, and an `execve` from the "child" calls `guest_reset(g)` on the shared guest memory (`src/syscall_exec.c:373`). No HL test exercises vfork or posix_spawn (`grep` over `test/test-*.c`: only `test-shm.c:216` mentions it, in a comment).
+- `clone3` returns ENOSYS (`src/syscall.c:2417-2420`); glibc falls back to `clone`. `unshare`, `setns`, `pidfd_open` are missing from the dispatch.
 
-### 1.4 Comment fork copie la mémoire invitée et les trous de fork corrigés
+### 1.4 How fork copies guest memory, and the fork holes fixed
 
-LU : deux chemins, IPC version 18 (`src/fork_ipc.c:57`).
+READ: two paths, IPC version 18 (`src/fork_ipc.c:57`).
 
-1. Chemin COW. Si la mémoire invitée est un fichier `mkstemp` `MAP_SHARED` (`g->shm_fd >= 0`) et hors Rosetta, le parent envoie le descripteur par `SCM_RIGHTS` et l'enfant le mappe `MAP_PRIVATE` (`src/fork_ipc.c:575-592,1954-1964,2041-2047`). Zéro octet copié. Le parent ne remappe jamais, car HVF met en cache la correspondance VA hôte vers PA (1966-1978).
-2. Chemin copie. Rosetta et repli : énumération des régions utilisées, blocs de 1 Mio sur le socket (`src/fork_ipc.c:2080-2135`).
+1. COW path. If guest memory is a `mkstemp` `MAP_SHARED` file (`g->shm_fd >= 0`) and outside Rosetta, the parent sends the descriptor through `SCM_RIGHTS` and the child maps it `MAP_PRIVATE` (`src/fork_ipc.c:575-592,1954-1964,2041-2047`). Zero bytes copied. The parent never remaps, because HVF caches the host VA to PA mapping (1966-1978).
+2. Copy path. Rosetta and fallback: enumeration of the used regions, 1 MiB blocks over the socket (`src/fork_ipc.c:2080-2135`).
 
-État envoyé dans l'ordre : en-tête `ipc_header_t` (brk, pile, mmap, TTBR0/1, placement Rosetta, 62-91), descripteur de l'allocateur de PID, descripteur des noms, deux descripteurs ptrace avec ACK de l'enfant (2014-2038), registres `ipc_registers_t` (93-108), mémoire, table de FD par `SCM_RIGHTS` (dup de chaque FD hôte, 2251-2261), objets OSS recréés vides, états « reopen » procfd, états epoll (les kqueue ne passent pas, 161-163 et 243-250), cwd et umask, instantané VFS, segments SysV shm, vues de fichiers partagées, sysroot, chemin ELF, chemin hl, cmdline, régions sémantiques, plages VA hautes, VMA, alias VA, régions pré-annoncées, état de signaux, blob du shim, sentinelle.
+State sent in order: header `ipc_header_t` (brk, stack, mmap, TTBR0/1, Rosetta placement, 62-91), PID allocator descriptor, names descriptor, two ptrace descriptors with ACK from the child (2014-2038), registers `ipc_registers_t` (93-108), memory, FD table through `SCM_RIGHTS` (dup of each host FD, 2251-2261), OSS objects recreated empty, procfd "reopen" states, epoll states (kqueues do not go through, 161-163 and 243-250), cwd and umask, VFS snapshot, SysV shm segments, shared file views, sysroot, ELF path, hl path, cmdline, semantic regions, high VA ranges, VMAs, VA aliases, pre-announced regions, signal state, shim blob, sentinel.
 
-Trous de fork corrigés par les correctifs privés (LU, motifs dans les commentaires) : identité de tâche et noms partagés dans la famille (`src/syscall_proc.c:76-81` : un compteur local donnait au premier pthread de l'enfant le PID de l'enfant) ; ACK d'import des descripteurs ptrace (sans lui, Darwin signalait un EOF sur le socket reçu pendant que l'alias émetteur se fermait, faux décès du parent mesuré 3 fois sur 100 ; `src/fork_ipc.c:313-336,2029-2038`, `probes/ptrace-scm-diagnosis.md`) ; kqueue d'epoll recréés dans l'enfant (`src/fork_ipc.c:164-243`, `src/syscall_poll.c:742-810`) ; états procfd rouverts sans fermer d'alias, car fermer un alias libère les verrous POSIX (343-446) ; mappings `MAP_SHARED` de fichiers conservés partagés (448-504, `src/syscall_filemap.c`) ; segments SysV rattachés (2431-2452) ; page `[vvar]` du vDSO, dont le thread publieur n'existe pas dans l'enfant (1233-1243) ; masque de signaux et pile alternative restaurés après `thread_register_main` (1119-1125, 1226-1231) ; tampons FD sur le tas parce que la pile d'un worker macOS fait 512 Kio (1832-1840, 2140-2150).
+Fork holes fixed by the private fixes (READ, reasons in the comments): task identity and names shared in the family (`src/syscall_proc.c:76-81`: a local counter gave the child's first pthread the child's PID); import ACK of the ptrace descriptors (without it, Darwin reported an EOF on the received socket while the sending alias was closing, false death of the parent measured 3 times out of 100; `src/fork_ipc.c:313-336,2029-2038`, `probes/ptrace-scm-diagnosis.md`); epoll kqueues recreated in the child (`src/fork_ipc.c:164-243`, `src/syscall_poll.c:742-810`); procfd states reopened without closing aliases, because closing an alias releases POSIX locks (343-446); `MAP_SHARED` file mappings kept shared (448-504, `src/syscall_filemap.c`); SysV segments reattached (2431-2452); vDSO `[vvar]` page, whose publisher thread does not exist in the child (1233-1243); signal mask and alternate stack restored after `thread_register_main` (1119-1125, 1226-1231); FD buffers on the heap because a macOS worker's stack is 512 KiB (1832-1840, 2140-2150).
 
-Trous de fork restants (LUS ou INFÉRÉS) :
+Remaining fork holes (READ or INFERRED):
 
-- MESURÉ avec `EXP/scratch-hl/probe-src/kq_fork_scm.c` : `dup(kqueue)` réussit, `sendmsg(SCM_RIGHTS)` d'un fd kqueue échoue avec `EINVAL`, et après `fork()` le fd kqueue n'existe pas dans l'enfant (`fcntl` et `kevent` répondent `EBADF`), le kqueue du parent restant intact (`logs/host-test-kq-fork-scm.log`).
-- `FD_TIMERFD` a pour fd hôte le kqueue lui-même (`src/syscall_fd.c:79-89`) et passe par le chemin générique `dup` puis `SCM_RIGHTS` (`src/fork_ipc.c:2251-2261`). INFÉRÉ : `send_fds` échoue (2320-2334) et `clone` renvoie ENOMEM tant qu'un timerfd est ouvert. Non exécuté.
-- `FD_EVENTFD`, `FD_SIGNALFD` et `FD_INOTIFY` ont un pipe comme fd hôte, mais leur état (compteur, masque, kqueue) vit dans des tableaux locaux au processus (`src/syscall_fd.c:389-397,626`, `src/syscall_inotify.c:69-94`). `src/fork_ipc.c` ne contient aucune occurrence de ces trois types : l'enfant a le fd mais pas l'état.
-- Un eventfd passé par `SCM_RIGHTS` à un autre processus perd aussi son compteur. C'est le schéma d'esync dans Wine (non activé par défaut).
+- MEASURED with `EXP/scratch-hl/probe-src/kq_fork_scm.c`: `dup(kqueue)` succeeds, `sendmsg(SCM_RIGHTS)` of a kqueue fd fails with `EINVAL`, and after `fork()` the kqueue fd does not exist in the child (`fcntl` and `kevent` answer `EBADF`), the parent's kqueue staying intact (`logs/host-test-kq-fork-scm.log`).
+- `FD_TIMERFD` has the kqueue itself as host fd (`src/syscall_fd.c:79-89`) and goes through the generic path `dup` then `SCM_RIGHTS` (`src/fork_ipc.c:2251-2261`). INFERRED: `send_fds` fails (2320-2334) and `clone` returns ENOMEM as long as a timerfd is open. Not executed.
+- `FD_EVENTFD`, `FD_SIGNALFD` and `FD_INOTIFY` have a pipe as host fd, but their state (counter, mask, kqueue) lives in process-local arrays (`src/syscall_fd.c:389-397,626`, `src/syscall_inotify.c:69-94`). `src/fork_ipc.c` contains no occurrence of these three types: the child has the fd but not the state.
+- An eventfd passed through `SCM_RIGHTS` to another process also loses its counter. This is the esync scheme in Wine (not enabled by default).
 
 ### 1.5 exec
 
-LU (`src/syscall_exec.c:70-764`). Le runtime ne se relance pas : exec se fait dans le même processus macOS. Séquence : lecture de path, argv, envp dans la mémoire invitée (limites 256 arguments, 4096 variables, 256 Kio, lignes 100-102), résolution VFS, chargement ELF ou shebang (133-250), pré-validation de l'interpréteur ou de Rosetta (251-308), point de non-retour (310), fermeture des FD `O_CLOEXEC` avec nettoyage des sous-systèmes eventfd, signalfd, timerfd, inotify (316-370), `guest_reset(g)` qui met toute la mémoire invitée à zéro (373), remise à zéro de `exit_group_requested` (379), `signal_reset_for_exec` (384), rechargement du shim, des segments et de l'interpréteur (386-421), reconstruction des tables de pages (460-575), nouvelle pile (625-684), écriture de TTBR0, ELR, SP_EL0, SPSR, TPIDR_EL0 et mise à zéro des 31 GPR (696-736), puis arrêt ptrace d'exec (`proc_trace_exec_stop`, 746-757).
+READ (`src/syscall_exec.c:70-764`). The runtime does not relaunch itself: exec happens in the same macOS process. Sequence: reading of path, argv, envp in guest memory (limits 256 arguments, 4096 variables, 256 KiB, lines 100-102), VFS resolution, ELF or shebang loading (133-250), pre-validation of the interpreter or of Rosetta (251-308), point of no return (310), closing of `O_CLOEXEC` FDs with cleanup of the eventfd, signalfd, timerfd, inotify subsystems (316-370), `guest_reset(g)` which zeroes all guest memory (373), reset of `exit_group_requested` (379), `signal_reset_for_exec` (384), reloading of the shim, the segments and the interpreter (386-421), rebuild of the page tables (460-575), new stack (625-684), write of TTBR0, ELR, SP_EL0, SPSR, TPIDR_EL0 and zeroing of the 31 GPRs (696-736), then ptrace exec stop (`proc_trace_exec_stop`, 746-757).
 
-Limites LUES : aucun appel qui arrête les autres threads (le fichier ne référence que `current_thread` et `exit_group_requested`) ; l'exec depuis un thread non-leader (de_thread) n'est pas géré, ce que confirme `probes/ptrace-syscall-contract.md:33` (« full nonleader exec ... remain outside this lot »). Le lien ptrace survit à l'exec (`src/proc_ptrace.h:67-69`).
+READ limits: no call that stops the other threads (the file references only `current_thread` and `exit_group_requested`); exec from a non-leader thread (de_thread) is not handled, which `probes/ptrace-syscall-contract.md:33` confirms ("full nonleader exec ... remain outside this lot"). The ptrace link survives exec (`src/proc_ptrace.h:67-69`).
 
 ### 1.6 wait4, waitid, SIGCHLD
 
-LU (`src/syscall_proc.c:1077-1196`). `proc_wait_event` interroge en boucle : les événements ptrace distants (`proc_trace_wait`), la table de threads locale (`thread_ptrace_wait`, clones Rosetta) et la table des enfants `proc_table[64]` avec un `wait4(WNOHANG)` hôte par enfant. Sans `WNOHANG` il dort 1 ms (`nanosleep`, 1150-1151) et teste `signal_pending` et `exit_group`. Les statuts d'arrêt sont recodés en numéros Linux (1121-1128). `waitid` accepte `P_ALL` et `P_PID` seulement (1170), avec `WSTOPPED`, `WEXITED`, `WCONTINUED`, `WNOWAIT`. Les options `__WALL` et `__WCLONE` sont ignorées.
+READ (`src/syscall_proc.c:1077-1196`). `proc_wait_event` polls in a loop: remote ptrace events (`proc_trace_wait`), the local thread table (`thread_ptrace_wait`, Rosetta clones) and the child table `proc_table[64]` with one host `wait4(WNOHANG)` per child. Without `WNOHANG` it sleeps 1 ms (`nanosleep`, 1150-1151) and tests `signal_pending` and `exit_group`. Stop statuses are re-encoded as Linux numbers (1121-1128). `waitid` accepts `P_ALL` and `P_PID` only (1170), with `WSTOPPED`, `WEXITED`, `WCONTINUED`, `WNOWAIT`. The options `__WALL` and `__WCLONE` are ignored.
 
-Constats LUS :
+READ findings:
 
-- Aucun SIGCHLD n'est mis en file à la mort d'un enfant ordinaire. `LINUX_SIGCHLD` n'apparaît que dans la notification d'arrêt ptrace (`src/syscall_signal.c:300-318`), le champ `exit_signal` des vm-clones (jamais livré) et la valeur du `waitid` (`src/syscall_proc.c:1179`). `SA_NOCLDWAIT` et l'auto-récolte ne sont pas gérés.
-- Un processus invité tué par un signal par défaut sort avec le code `128 + signum` (`src/syscall_signal.c:1002-1007`), donc le parent lit `WIFEXITED` avec ce code, pas `WIFSIGNALED`. INFÉRÉ à partir de ce code ; non exécuté.
-- Pas de reparentage ni de sous-reaper ; `getppid` renvoie le PID du parent d'origine ; `setpgid` et `setsid` sont des stubs (`src/syscall.c:2088-2093`).
+- No SIGCHLD is queued at the death of an ordinary child. `LINUX_SIGCHLD` appears only in the ptrace stop notification (`src/syscall_signal.c:300-318`), the `exit_signal` field of vm-clones (never delivered) and the value of `waitid` (`src/syscall_proc.c:1179`). `SA_NOCLDWAIT` and auto-reaping are not handled.
+- A guest process killed by a default signal exits with code `128 + signum` (`src/syscall_signal.c:1002-1007`), so the parent reads `WIFEXITED` with this code, not `WIFSIGNALED`. INFERRED from this code; not executed.
+- No reparenting nor subreaper; `getppid` returns the PID of the original parent; `setpgid` and `setsid` are stubs (`src/syscall.c:2088-2093`).
 
-### 1.7 Signaux vers l'invité
+### 1.7 Signals to the guest
 
-LU (`src/syscall_signal.c/.h`).
+READ (`src/syscall_signal.c/.h`).
 
-- Les actions (`actions[64]`) sont uniques par processus, sous `sig_lock` (rang 4). Les signaux dirigés (tkill, tgkill, `rt_tgsigqueueinfo`) ont des ensembles en attente par thread `directed_pending[MAX_THREADS]` (`src/syscall_signal.c:37-47,165-189`) avec un `siginfo` complet. Signaux standards coalescés ; signaux temps réel 32..64 en file de 32 (`RT_SIGQUEUE_MAX`, `src/syscall_signal.h:177`).
-- Livraison seulement à des points de la boucle : après chaque syscall (`src/syscall_proc.c:1380-1385`) ou après annulation du vCPU (2124-2131). `signal_queue_info` réveille tous les vCPU, les E/S hôte du thread visé, signalfd et le pipe de réveil (`src/syscall_signal.c:284-289`).
-- Cadre : `linux_rt_sigframe_t` arm64 sur la pile invitée (siginfo de 128 octets, `ucontext`, `sigcontext` avec 31 GPR, SP, PC, PSTATE), contexte FPSIMD (magic `0x46508001`, 528 octets, 843-899), contexte ESR pour les fautes synchrones, restaurateur toujours égal à la page vDSO (`src/syscall_signal.c:1153-1156`, `sa_restorer` ignoré comme le noyau arm64).
-- Masques et pile alternative par thread. `SA_ONSTACK`, `SA_NODEFER`, `SA_RESETHAND`, `SA_SIGINFO`, `SA_RESTART` traités. Le redémarrage `SA_RESTART` sauvegarde x0..x5, x8 et le PC avant chaque appel redémarrable (`signal_syscall_begin`, `src/syscall_signal.c:389-396`, liste `src/syscall.c:1185-1211`) puis recule le PC de 4 octets (403, 1037).
-- `sigsuspend` renvoie toujours EINTR sans dormir (`src/syscall_signal.c:727-777`) : une boucle `while (!flag) sigsuspend()` tourne à vide.
-- `ITIMER_REAL` invité est émulé à la main parce que l'`alarm()` hôte sert au chien de garde vCPU (80-90, 541-621).
-- Signaux entre processus : `kill` n'accepte que soi-même, le « groupe » supposé égal à soi, ou un enfant enregistré avec SIGKILL ou SIGCONT seulement (`src/syscall.c:1982-2001`, `src/syscall_proc.c:641-665` ; tout autre signal renvoie EOPNOTSUPP). `tgkill` avec un `tgid` différent du PID courant renvoie ESRCH (`src/syscall.c:2025-2028`). `probes/ptrace-runtime.md:51` le confirme.
-- Fautes synchrones : le shim EL1 les transmet par HVC #11 (abort, instruction indéfinie) et HVC #10 (BRK) ; la boucle fabrique `si_code`, `si_addr` et l'ESR (`src/syscall_proc.c:1692-1887`).
+- The actions (`actions[64]`) are unique per process, under `sig_lock` (rank 4). Directed signals (tkill, tgkill, `rt_tgsigqueueinfo`) have per-thread pending sets `directed_pending[MAX_THREADS]` (`src/syscall_signal.c:37-47,165-189`) with a full `siginfo`. Standard signals coalesced; real-time signals 32..64 queued up to 32 (`RT_SIGQUEUE_MAX`, `src/syscall_signal.h:177`).
+- Delivery only at points of the loop: after each syscall (`src/syscall_proc.c:1380-1385`) or after cancellation of the vCPU (2124-2131). `signal_queue_info` wakes all vCPUs, the host I/O of the target thread, signalfd and the wakeup pipe (`src/syscall_signal.c:284-289`).
+- Frame: arm64 `linux_rt_sigframe_t` on the guest stack (128-byte siginfo, `ucontext`, `sigcontext` with 31 GPRs, SP, PC, PSTATE), FPSIMD context (magic `0x46508001`, 528 bytes, 843-899), ESR context for synchronous faults, restorer always equal to the vDSO page (`src/syscall_signal.c:1153-1156`, `sa_restorer` ignored like the arm64 kernel).
+- Per-thread masks and alternate stack. `SA_ONSTACK`, `SA_NODEFER`, `SA_RESETHAND`, `SA_SIGINFO`, `SA_RESTART` handled. The `SA_RESTART` restart saves x0..x5, x8 and the PC before each restartable call (`signal_syscall_begin`, `src/syscall_signal.c:389-396`, list `src/syscall.c:1185-1211`) then moves the PC back by 4 bytes (403, 1037).
+- `sigsuspend` always returns EINTR without sleeping (`src/syscall_signal.c:727-777`): a `while (!flag) sigsuspend()` loop spins.
+- Guest `ITIMER_REAL` is emulated by hand because the host `alarm()` serves the vCPU watchdog (80-90, 541-621).
+- Signals between processes: `kill` accepts only itself, the "group" assumed equal to itself, or a registered child with SIGKILL or SIGCONT only (`src/syscall.c:1982-2001`, `src/syscall_proc.c:641-665`; any other signal returns EOPNOTSUPP). `tgkill` with a `tgid` different from the current PID returns ESRCH (`src/syscall.c:2025-2028`). `probes/ptrace-runtime.md:51` confirms it.
+- Synchronous faults: the EL1 shim forwards them through HVC #11 (abort, undefined instruction) and HVC #10 (BRK); the loop builds `si_code`, `si_addr` and the ESR (`src/syscall_proc.c:1692-1887`).
 
 ### 1.8 futex
 
-LU (`src/futex.c`, 905 lignes). Table de 64 seaux indexés par l'adresse virtuelle invitée, attendeur alloué sur la pile de l'appelant, une condvar par attendeur (91-137). Opérations : WAIT, WAKE, WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE, WAKE_OP, LOCK_PI, UNLOCK_PI, TRYLOCK_PI (857-893) ; le reste renvoie ENOSYS (895-898).
+READ (`src/futex.c`, 905 lines). Table of 64 buckets indexed by the guest virtual address, waiter allocated on the caller's stack, one condvar per waiter (91-137). Operations: WAIT, WAKE, WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE, WAKE_OP, LOCK_PI, UNLOCK_PI, TRYLOCK_PI (857-893); the rest returns ENOSYS (895-898).
 
-- La table est locale au processus. Aucune attente ni réveil entre processus, même sur une mémoire `MAP_SHARED`. C'est l'écart principal pour Wine, dont les processus partagent des sections.
-- `FUTEX_WAIT` sans délai se réveille toutes les 100 ms et renvoie EINTR après 1 s (`futex.c:230-269`) : substitut de livraison de signal, pas la sémantique Linux.
-- `FUTEX_WAIT_BITSET` utilise `pthread_cond_timedwait` en CLOCK_REALTIME et traite le délai absolu comme temps réel, que `FUTEX_CLOCK_REALTIME` soit posé ou non (`futex.c:143-165`) ; Linux utilise CLOCK_MONOTONIC par défaut. INFÉRÉ : `pthread_cond_clockwait` et `sem_clockwait` de glibc se comportent mal.
-- PI : propriété du mot sous le verrou du seau, récupération d'un propriétaire mort par `thread_tid_alive`, pas d'héritage de priorité, pas d'`OWNER_DIED` (`futex.c:78-87,596-771`).
-- `set_robust_list` renvoie 0 sans rien faire (`src/syscall.c:1810-1814`). Absents : `get_robust_list`, `futex_waitv` (449), `futex_wake/wait/requeue` (454-456), `FUTEX_CMP_REQUEUE_PI`, `FUTEX_WAIT_REQUEUE_PI`, `FUTEX_LOCK_PI2`.
+- The table is process-local. No wait or wake between processes, even on `MAP_SHARED` memory. This is the main gap for Wine, whose processes share sections.
+- `FUTEX_WAIT` without timeout wakes up every 100 ms and returns EINTR after 1 s (`futex.c:230-269`): a substitute for signal delivery, not the Linux semantics.
+- `FUTEX_WAIT_BITSET` uses `pthread_cond_timedwait` in CLOCK_REALTIME and treats the absolute timeout as real time, whether `FUTEX_CLOCK_REALTIME` is set or not (`futex.c:143-165`); Linux uses CLOCK_MONOTONIC by default. INFERRED: glibc's `pthread_cond_clockwait` and `sem_clockwait` misbehave.
+- PI: ownership of the word under the bucket lock, recovery of a dead owner through `thread_tid_alive`, no priority inheritance, no `OWNER_DIED` (`futex.c:78-87,596-771`).
+- `set_robust_list` returns 0 without doing anything (`src/syscall.c:1810-1814`). Missing: `get_robust_list`, `futex_waitv` (449), `futex_wake/wait/requeue` (454-456), `FUTEX_CMP_REQUEUE_PI`, `FUTEX_WAIT_REQUEUE_PI`, `FUTEX_LOCK_PI2`.
 
 ### 1.9 poll, select, epoll, eventfd, timerfd, signalfd
 
-LU. `ppoll` et `pselect6` : `src/syscall_poll.c:117-553`. epoll par kqueue : `EVFILT_READ` et `EVFILT_WRITE`, `EV_CLEAR` pour ET, `EV_ONESHOT` pour ONESHOT, table de 256 kevents par appel, EPOLLEXCLUSIVE non pris en charge (`syscall_poll.c:554-990`, commentaire 561). Le réveil des attentes indéfinies passe par un pipe global `wakeup_pipe` (`src/syscall_poll.h:46-52`). `epoll_event` suit la disposition arm64 de 16 octets (`syscall_poll.c:583-588`).
+READ. `ppoll` and `pselect6`: `src/syscall_poll.c:117-553`. epoll over kqueue: `EVFILT_READ` and `EVFILT_WRITE`, `EV_CLEAR` for ET, `EV_ONESHOT` for ONESHOT, table of 256 kevents per call, EPOLLEXCLUSIVE not supported (`syscall_poll.c:554-990`, comment 561). Waking indefinite waits goes through a global pipe `wakeup_pipe` (`src/syscall_poll.h:46-52`). `epoll_event` follows the 16-byte arm64 layout (`syscall_poll.c:583-588`).
 
-`src/syscall_fd.c` (814 lignes) : eventfd = pipe non bloquant plus compteur dans un tableau de 32 entrées (`:384-444`) ; timerfd = kqueue `EVFILT_TIMER` à usage unique réarmé à la lecture, 32 entrées, `TFD_TIMER_ABSTIME` ignoré (`:30-60,121-126`) ; signalfd = pipe plus masque, 16 entrées (`:626,686-720`). Aucun de ces objets n'est partageable entre processus.
+`src/syscall_fd.c` (814 lines): eventfd = non-blocking pipe plus counter in an array of 32 entries (`:384-444`); timerfd = one-shot `EVFILT_TIMER` kqueue rearmed on read, 32 entries, `TFD_TIMER_ABSTIME` ignored (`:30-60,121-126`); signalfd = pipe plus mask, 16 entries (`:626,686-720`). None of these objects can be shared between processes.
 
-### 1.10 ptrace tel qu'il existe aujourd'hui
+### 1.10 ptrace as it exists today
 
-Deux implémentations disjointes derrière `sys_ptrace` (`src/syscall_proc.c:870-1044`).
+Two disjoint implementations behind `sys_ptrace` (`src/syscall_proc.c:870-1044`).
 
-A. Locale, propre à Rosetta (`src/thread.c:577-869`, `src/syscall_proc.c:909-1039`) : SEIZE, CONT, INTERRUPT, GETSIGINFO, GETREGSET et SETREGSET `NT_PRSTATUS`, plus `NT_PRFPREG` et `NT_ARM_HW_WATCH`. Le traceur et le tracee sont deux threads du même processus (clones `CLONE_VM`). Le tracee s'arrête de lui-même sur BRK (HVC #10) ou sur INTERRUPT, copie ses registres ARM dans `ptrace_regs` et dort sur une condvar (`src/thread.c:607-683`). Registres ARM64 seulement. À abandonner.
+A. Local, specific to Rosetta (`src/thread.c:577-869`, `src/syscall_proc.c:909-1039`): SEIZE, CONT, INTERRUPT, GETSIGINFO, GETREGSET and SETREGSET `NT_PRSTATUS`, plus `NT_PRFPREG` and `NT_ARM_HW_WATCH`. The tracer and the tracee are two threads of the same process (`CLONE_VM` clones). The tracee stops by itself on BRK (HVC #10) or on INTERRUPT, copies its ARM registers into `ptrace_regs` and sleeps on a condvar (`src/thread.c:607-683`). ARM64 registers only. To drop.
 
-B. Distante, module `proc_ptrace.c` (807 lignes, non suivi) : relation parent vers enfant créée au fork (1.11).
+B. Remote, module `proc_ptrace.c` (807 lines, untracked): parent to child relation created at fork (1.11).
 
-Requêtes traitées pour la relation distante (`src/syscall_proc.c:873-893`) : TRACEME (0), SETOPTIONS (0x4200, masque 0x11 uniquement), GETEVENTMSG (0x4201), CONT (7), DETACH (17), SYSCALL (24), GETREGSET `NT_PRSTATUS` (0x4204, 34 mots ARM64). Tout le reste renvoie EINVAL ou ESRCH.
+Requests handled for the remote relation (`src/syscall_proc.c:873-893`): TRACEME (0), SETOPTIONS (0x4200, mask 0x11 only), GETEVENTMSG (0x4201), CONT (7), DETACH (17), SYSCALL (24), GETREGSET `NT_PRSTATUS` (0x4204, 34 ARM64 words). Everything else returns EINVAL or ESRCH.
 
-Usage réel par EAC (LU dans `probes/`) : TRACEME dans l'enfant PID 148, puis dans le parent SETOPTIONS(148, 0x11) et 66 GETREGSET de 216 octets (`probes/eac-ptrace-audit-regset-linux-20260929/README.md`) ; PTRACE_SYSCALL (24) 146 fois (`eac-ptrace-regset-transition`) ; dans le run `eac-ptrace-poke-20260930/run-20260930T133949334669Z/progress-finding.json` : POKEDATA (5) d'un mot dont l'octet bas est 0xCC, CONT (7), wait4 avec statut 1407 (0x57f, SIGTRAP), GETREGSET, PEEKDATA (2), POKEDATA de restauration, kill ; puis un SETREGSET de 216 octets qui recule RIP d'un octet (`probes/ptrace-remote-setregset-runtime-20261001/README.md:3-9`). Le module EAC contient 21 sites d'appel statiques à `ptrace` (`probes/eac-current-module-static-20260929/verified-ptrace-call-sites.json`) ; seules les requêtes ci-dessus sont observées à l'exécution, les autres sites sont inconnus. La taille 216 est celle du `user_regs_struct` x86-64 (27 mots) : EAC demande une vue x86, que Rosetta remplit avec les 27 premiers registres ARM (`probes/regset-architecture.md:9`).
+Actual use by EAC (READ in `probes/`): TRACEME in the child PID 148, then in the parent SETOPTIONS(148, 0x11) and 66 GETREGSET of 216 bytes (`probes/eac-ptrace-audit-regset-linux-20260929/README.md`); PTRACE_SYSCALL (24) 146 times (`eac-ptrace-regset-transition`); in the run `eac-ptrace-poke-20260930/run-20260930T133949334669Z/progress-finding.json`: POKEDATA (5) of a word whose low byte is 0xCC, CONT (7), wait4 with status 1407 (0x57f, SIGTRAP), GETREGSET, PEEKDATA (2), restoring POKEDATA, kill; then a 216-byte SETREGSET that moves RIP back by one byte (`probes/ptrace-remote-setregset-runtime-20261001/README.md:3-9`). The EAC module contains 21 static call sites to `ptrace` (`probes/eac-current-module-static-20260929/verified-ptrace-call-sites.json`); only the requests above are observed at runtime, the other sites are unknown. The size 216 is that of the x86-64 `user_regs_struct` (27 words): EAC asks for an x86 view, which Rosetta fills with the first 27 ARM registers (`probes/regset-architecture.md:9`).
 
-### 1.11 La relation traceur/tracee entre deux processus, en espace utilisateur pur
+### 1.11 The tracer/tracee relation between two processes, in pure user space
 
-LU (`src/proc_ptrace.c/h`, `probes/proc-ptrace-module.md`). Cette partie n'utilise aucun ptrace noyau.
+READ (`src/proc_ptrace.c/h`, `probes/proc-ptrace-module.md`). This part uses no kernel ptrace.
 
-- Au fork, le parent crée un fichier de métadonnées `mkstemp` non lié (`trace_shared_t`, `src/proc_ptrace.c:28-40`), mappé `MAP_SHARED` dans les deux processus, plus une paire de sockets Unix de notification. Ces descripteurs ne figurent jamais dans la table de FD invitée et ne vont qu'à l'enfant direct (`:321-389`, `src/fork_ipc.c:2014-2038`).
-- Exclusion mutuelle entre processus : verrou POSIX `fcntl(F_SETLKW)` sur le premier octet plus un mutex local par processus (`:117-131`). Le verrou se libère à la mort du propriétaire.
-- Le tracee s'arrête lui-même, sur son thread, à trois points : livraison de signal (`signal_deliver` vers `proc_trace_stop`, `src/syscall_signal.c:937-985`), entrée et sortie de syscall (`syscall_trace_boundary`, `src/syscall.c:1213-1235,1257,2496`), événement d'exec (`src/syscall_exec.c:746-757`). Il capture alors ses registres par le rappel `proc_trace_capture_regs` (34 mots, `src/syscall_proc.c:152-183`), les publie dans le fichier partagé avec un numéro de séquence d'arrêt (`src/proc_ptrace.c:620-691`) et attend la reprise par `poll` du socket avec un délai de 200 ms (`:698-715`).
-- Le traceur lit la séquence d'arrêt dans wait4 et waitid (`proc_trace_wait`, `:582-618`), contrôle par CONT, DETACH, SYSCALL (`proc_trace_control`, `:459-492`) et lit les registres capturés (`proc_trace_getregs`, `:533-563`). Seul le TID traceur exact peut contrôler (`:469-471`).
-- Mort d'un pair : EOF du socket de notification (`peer_closed`, `:193-206`) ; la mort du traceur détache et reprend le tracee avec le signal supprimé (`:735-755`).
+- At fork, the parent creates an unlinked `mkstemp` metadata file (`trace_shared_t`, `src/proc_ptrace.c:28-40`), mapped `MAP_SHARED` in both processes, plus a pair of Unix notification sockets. These descriptors never appear in the guest FD table and go only to the direct child (`:321-389`, `src/fork_ipc.c:2014-2038`).
+- Mutual exclusion between processes: POSIX lock `fcntl(F_SETLKW)` on the first byte plus a local mutex per process (`:117-131`). The lock is released at the death of the owner.
+- The tracee stops itself, on its thread, at three points: signal delivery (`signal_deliver` to `proc_trace_stop`, `src/syscall_signal.c:937-985`), syscall entry and exit (`syscall_trace_boundary`, `src/syscall.c:1213-1235,1257,2496`), exec event (`src/syscall_exec.c:746-757`). It then captures its registers through the `proc_trace_capture_regs` callback (34 words, `src/syscall_proc.c:152-183`), publishes them in the shared file with a stop sequence number (`src/proc_ptrace.c:620-691`) and waits for resumption by `poll` of the socket with a 200 ms timeout (`:698-715`).
+- The tracer reads the stop sequence in wait4 and waitid (`proc_trace_wait`, `:582-618`), controls through CONT, DETACH, SYSCALL (`proc_trace_control`, `:459-492`) and reads the captured registers (`proc_trace_getregs`, `:533-563`). Only the exact tracer TID can control (`:469-471`).
+- Death of a peer: EOF of the notification socket (`peer_closed`, `:193-206`); the death of the tracer detaches and resumes the tracee with the signal suppressed (`:735-755`).
 
-Limites (LUES, `probes/ptrace-runtime.md:49-55`, `proc-ptrace-module.md:9`) : pas d'ATTACH ni de SEIZE d'un non-enfant, pas d'accès mémoire distant (`process_vm_readv` répond ENOSYS), pas de PEEK ni POKE, pas d'écriture de registres, pas d'arrêts de groupe, pas de reparentage, pas de SIGCHLD asynchrone pour un traceur qui n'attend pas.
+Limits (READ, `probes/ptrace-runtime.md:49-55`, `proc-ptrace-module.md:9`): no ATTACH nor SEIZE of a non-child, no remote memory access (`process_vm_readv` answers ENOSYS), no PEEK nor POKE, no register writes, no group stops, no reparenting, no asynchronous SIGCHLD for a tracer that is not waiting.
 
-## 2. Table par fichier
+## 2. Table per file
 
-LOC mesurées par `wc -l`. Colonnes A, R, D : lignes à adapter ou garder (A), à réécrire sur le même principe (R), à abandonner (D), estimées par plages de lignes que j'ai lues (calcul : script Python dans l'historique de cette session, plages citées dans les verdicts). Total des 37 fichiers du tableau : 18 527 lignes, A 9 483, R 2 316, D 6 728.
+LOC measured by `wc -l`. Columns A, R, D: lines to adapt or keep (A), to rewrite on the same principle (R), to drop (D), estimated by line ranges that I read (calculation: Python script in this session's history, ranges cited in the verdicts). Total of the 37 files in the table: 18,527 lines, A 9,483, R 2,316, D 6,728.
 
-| Fichier | LOC | Sous-système | Couplage concret HVF, EL1, Rosetta | ABI invitée supposée | A | R | D | Verdict |
+| File | LOC | Subsystem | Concrete HVF, EL1, Rosetta coupling | Assumed guest ABI | A | R | D | Verdict |
 |---|---|---|---|---|---|---|---|---|
-| thread.c | 885 | table de threads, E/S hôte interruptibles, ptrace local | `hv_vcpu_t`, `hv_vcpus_exit` (283-296, 454-472), `hv_vcpu_destroy` (276), `sp_el1` (373-393), `HV_SYS_REG_DBGW*` (508-552), `vcpu_get_gpr` (607-616) | `linux_user_pt_regs_t` ARM64 | 406 | 45 | 434 | adapt (table, `host_io_waker`, join) ; drop (ptrace local 473-885) ; s'appuyer sur le ThreadManager de FEX |
-| thread.h | 226 | idem | `Hypervisor.h`, `hv_vcpu_exit_t`, `ptrace_*` | ARM64 | 109 | 27 | 90 | adapt |
-| syscall_proc.c | 2164 | PID, wait, boucle vCPU, sys_ptrace | `vcpu_run_loop` (1223-2164), HVC 0/2/4/5/7/9/10/11/12, `ESR_EL1`, `KBUF_VA_BASE`, `dump_rosetta_state` (242-351), surcharge `ID_AA64*` (1482-1540) | x0-x8, ESR, ARM64 | 619 | 409 | 1136 | adapt (PID, wait, table d'enfants) ; rewrite (`sys_ptrace`, capture) ; drop (boucle HVC) |
-| syscall_proc.h | 171 | idem | `Hypervisor.h`, `vcpu_run_loop` | ARM64 | 125 | 0 | 46 | adapt |
-| syscall_signal.c | 1255 | signaux | `hv_vcpu_get/set_reg`, `HV_SYS_REG_ELR_EL1`, `HV_REG_FPSR`, Q0-Q31 (858-899, 1023-1165, 1190-1250) | cadre arm64, FPSIMD, ESR, restaurateur vDSO | 958 | 297 | 0 | adapt (état, files, itimer, sigaction) ; rewrite (cadre, sigreturn) |
-| syscall_signal.h | 314 | idem | `Hypervisor.h` | `linux_sigcontext_t`, `linux_ucontext_t` ARM64 | 274 | 40 | 0 | adapt ; rewrite (structures 133-172) |
-| futex.c / .h | 905 / 42 | futex locale | aucun HVF ; `guest_ptr` (7 sites) | générique | 947 | 0 | 0 | adapt (mémoire invitée) ; étendre (section 4) |
-| fork_ipc.c / .h | 2642 / 28 | clone, fork par IPC | `posix_spawn` (1919), `hv_vcpu_create` (1167, 1454), TTBR0/1, SCTLR (1197), `guest_init_from_shm` (586), 109 références HVF | ARM64, `ipc_registers_t` | 0 | 330 | 2340 | drop (IPC 130-1255, 1561-2617) ; rewrite (clone thread 1256-1560, dispatcher) |
-| syscall_exec.c / .h | 764 / 24 | execve | `guest_reset` (373), `guest_build_page_tables` (569), `rosetta_prepare/finalize` (479, 636), `hv_vcpu_set_sys_reg` (697-713) | ARM64, Rosetta | 336 | 138 | 314 | adapt (lecture argv, shebang, CLOEXEC) ; drop (rebuild des tables de pages) ; rewrite (hook d'exec) |
-| syscall_poll.c / .h | 1002 / 52 | poll, select, epoll | aucun HVF ; `guest_*` (16 sites) | `epoll_event` 16 octets (583-588) | 863 | 191 | 0 | adapt ; rewrite (attente epoll, layout x86) |
-| syscall_net.c / .h | 1701 / 122 | sockets | aucun HVF ; `guest_*` (41 sites) ; `rosettad_is_socket` | `msghdr` LP64 identique x86-64 | 1823 | 0 | 0 | adapt |
-| syscall_inotify.c / .h | 667 / 44 | inotify sur kqueue vnode | aucun HVF ; `guest_*` (4 sites) | `inotify_event` identique | 711 | 0 | 0 | adapt |
-| syscall_fd.c / .h | 814 / 55 | eventfd, timerfd, signalfd | aucun HVF ; `guest_*` (8 sites) | identique | 432 | 437 | 0 | adapt ; rewrite (états partageables entre processus) |
-| proc_ptrace.c / .h | 807 / 115 | ptrace distant, espace utilisateur | `PROC_TRACE_REG_WORDS = 34` ARM64 (`:41`), rappel `proc_trace_capture_regs` | NT_PRSTATUS ARM64 | 922 | 0 | 0 | adapt (tampon de registres arch-neutre, version 5) |
-| proc_names.c / .h | 479 / 60 | registre familial des tâches | aucun | générique | 539 | 0 | 0 | adapt (tel quel pour l'essentiel) |
-| signal_notify.h | 10 | notification d'arrêt ptrace | aucun | générique | 10 | 0 | 0 | as-is |
-| rosetta.c / .h | 301 / 136 | Rosetta | tout (`TCR_EL1_VALUE`, VZ ioctl, rosettad) | ARM64 | 0 | 0 | 437 | drop |
-| gdb_stub.c / .h | 1732 / 78 | GDB RSP AArch64 | `HV_SYS_REG_DBG*`, XML AArch64 | ARM64 | 0 | 0 | 1810 | drop ; FEX a son GdbServer (`LinuxEmulation/GdbServer`, 1523 lignes) |
-| syscall_internal.h | 132 | rangs de verrous, FD | aucun | générique | 132 | 0 | 0 | as-is |
-| trace.c / .h | 209 / 68 | traces par catégorie | aucun (libc pure) | générique | 277 | 0 | 0 | as-is (déjà lié par les tests hôte) |
-| crash_report.c / .h | 195 / 37 | rapport de plantage | 11 références HVF | ARM64 | 0 | 232 | 0 | rewrite (facultatif) |
-| fault_dump.c / .h | 162 / 8 | diagnostic de faute | `mach_vm_read`, VMA, `hv_vcpu_t` | ARM64 | 0 | 170 | 0 | rewrite (facultatif) |
-| hv_util.h | 121 | macros HVF | `HV_CHECK`, SCTLR | ARM64 | 0 | 0 | 121 | drop |
-| syscall.c / .h (hors total) | 2512 / 645 | dispatch et constantes | x0-x5, x8, `hv_vcpu_set_reg(X0)` (2495), `SYS_*` arm64 (17-170) | ARM64 | n/a | n/a | n/a | le squelette de dispatch (1181-1303, 2463-2512) et environ 600 lignes de cas processus restent ; le reste appartient au coéquipier |
+| thread.c | 885 | thread table, interruptible host I/O, local ptrace | `hv_vcpu_t`, `hv_vcpus_exit` (283-296, 454-472), `hv_vcpu_destroy` (276), `sp_el1` (373-393), `HV_SYS_REG_DBGW*` (508-552), `vcpu_get_gpr` (607-616) | `linux_user_pt_regs_t` ARM64 | 406 | 45 | 434 | adapt (table, `host_io_waker`, join); drop (local ptrace 473-885); rely on FEX's ThreadManager |
+| thread.h | 226 | same | `Hypervisor.h`, `hv_vcpu_exit_t`, `ptrace_*` | ARM64 | 109 | 27 | 90 | adapt |
+| syscall_proc.c | 2164 | PID, wait, vCPU loop, sys_ptrace | `vcpu_run_loop` (1223-2164), HVC 0/2/4/5/7/9/10/11/12, `ESR_EL1`, `KBUF_VA_BASE`, `dump_rosetta_state` (242-351), `ID_AA64*` override (1482-1540) | x0-x8, ESR, ARM64 | 619 | 409 | 1136 | adapt (PID, wait, child table); rewrite (`sys_ptrace`, capture); drop (HVC loop) |
+| syscall_proc.h | 171 | same | `Hypervisor.h`, `vcpu_run_loop` | ARM64 | 125 | 0 | 46 | adapt |
+| syscall_signal.c | 1255 | signals | `hv_vcpu_get/set_reg`, `HV_SYS_REG_ELR_EL1`, `HV_REG_FPSR`, Q0-Q31 (858-899, 1023-1165, 1190-1250) | arm64 frame, FPSIMD, ESR, vDSO restorer | 958 | 297 | 0 | adapt (state, queues, itimer, sigaction); rewrite (frame, sigreturn) |
+| syscall_signal.h | 314 | same | `Hypervisor.h` | `linux_sigcontext_t`, `linux_ucontext_t` ARM64 | 274 | 40 | 0 | adapt; rewrite (structures 133-172) |
+| futex.c / .h | 905 / 42 | local futex | no HVF; `guest_ptr` (7 sites) | generic | 947 | 0 | 0 | adapt (guest memory); extend (section 4) |
+| fork_ipc.c / .h | 2642 / 28 | clone, fork through IPC | `posix_spawn` (1919), `hv_vcpu_create` (1167, 1454), TTBR0/1, SCTLR (1197), `guest_init_from_shm` (586), 109 HVF references | ARM64, `ipc_registers_t` | 0 | 330 | 2340 | drop (IPC 130-1255, 1561-2617); rewrite (clone thread 1256-1560, dispatcher) |
+| syscall_exec.c / .h | 764 / 24 | execve | `guest_reset` (373), `guest_build_page_tables` (569), `rosetta_prepare/finalize` (479, 636), `hv_vcpu_set_sys_reg` (697-713) | ARM64, Rosetta | 336 | 138 | 314 | adapt (argv reading, shebang, CLOEXEC); drop (page table rebuild); rewrite (exec hook) |
+| syscall_poll.c / .h | 1002 / 52 | poll, select, epoll | no HVF; `guest_*` (16 sites) | 16-byte `epoll_event` (583-588) | 863 | 191 | 0 | adapt; rewrite (epoll wait, x86 layout) |
+| syscall_net.c / .h | 1701 / 122 | sockets | no HVF; `guest_*` (41 sites); `rosettad_is_socket` | LP64 `msghdr` identical to x86-64 | 1823 | 0 | 0 | adapt |
+| syscall_inotify.c / .h | 667 / 44 | inotify over kqueue vnode | no HVF; `guest_*` (4 sites) | `inotify_event` identical | 711 | 0 | 0 | adapt |
+| syscall_fd.c / .h | 814 / 55 | eventfd, timerfd, signalfd | no HVF; `guest_*` (8 sites) | identical | 432 | 437 | 0 | adapt; rewrite (states shareable between processes) |
+| proc_ptrace.c / .h | 807 / 115 | remote ptrace, user space | `PROC_TRACE_REG_WORDS = 34` ARM64 (`:41`), callback `proc_trace_capture_regs` | NT_PRSTATUS ARM64 | 922 | 0 | 0 | adapt (arch-neutral register buffer, version 5) |
+| proc_names.c / .h | 479 / 60 | family task registry | none | generic | 539 | 0 | 0 | adapt (as is for the most part) |
+| signal_notify.h | 10 | ptrace stop notification | none | generic | 10 | 0 | 0 | as-is |
+| rosetta.c / .h | 301 / 136 | Rosetta | everything (`TCR_EL1_VALUE`, VZ ioctl, rosettad) | ARM64 | 0 | 0 | 437 | drop |
+| gdb_stub.c / .h | 1732 / 78 | GDB RSP AArch64 | `HV_SYS_REG_DBG*`, AArch64 XML | ARM64 | 0 | 0 | 1810 | drop; FEX has its GdbServer (`LinuxEmulation/GdbServer`, 1523 lines) |
+| syscall_internal.h | 132 | lock ranks, FD | none | generic | 132 | 0 | 0 | as-is |
+| trace.c / .h | 209 / 68 | traces per category | none (pure libc) | generic | 277 | 0 | 0 | as-is (already linked by the host tests) |
+| crash_report.c / .h | 195 / 37 | crash report | 11 HVF references | ARM64 | 0 | 232 | 0 | rewrite (optional) |
+| fault_dump.c / .h | 162 / 8 | fault diagnostic | `mach_vm_read`, VMA, `hv_vcpu_t` | ARM64 | 0 | 170 | 0 | rewrite (optional) |
+| hv_util.h | 121 | HVF macros | `HV_CHECK`, SCTLR | ARM64 | 0 | 0 | 121 | drop |
+| syscall.c / .h (outside total) | 2512 / 645 | dispatch and constants | x0-x5, x8, `hv_vcpu_set_reg(X0)` (2495), arm64 `SYS_*` (17-170) | ARM64 | n/a | n/a | n/a | the dispatch skeleton (1181-1303, 2463-2512) and about 600 lines of process cases stay; the rest belongs to the teammate |
 
-### 2.1 Couplage mesuré par fichier
+### 2.1 Coupling measured per file
 
-MESURÉ par `grep -c` sur HL/src : nombre de lignes qui touchent la mémoire invitée (`guest_read`, `guest_write`, `guest_ptr`, `guest_read_str`, `guest_ptr_avail`), HVF (`hv_vcpu`, `hv_vm`, `HV_REG`, `HV_SYS_REG`, `HV_CHECK`, `vcpu_get`, `vcpu_set`) et `guest_t`.
+MEASURED by `grep -c` over HL/src: number of lines that touch guest memory (`guest_read`, `guest_write`, `guest_ptr`, `guest_read_str`, `guest_ptr_avail`), HVF (`hv_vcpu`, `hv_vm`, `HV_REG`, `HV_SYS_REG`, `HV_CHECK`, `vcpu_get`, `vcpu_set`) and `guest_t`.
 
-| Fichier | accès mémoire invitée | références HVF | `guest_t` |
+| File | guest memory access | HVF references | `guest_t` |
 |---|---|---|---|
 | thread.c | 0 | 48 | 21 |
 | syscall_proc.c | 19 | 82 | 22 |
@@ -197,330 +197,330 @@ MESURÉ par `grep -c` sur HL/src : nombre de lignes qui touchent la mémoire inv
 | syscall_sys.c | 12 | 0 | 8 |
 | syscall_fs.c | 58 | 0 | 33 |
 
-### 2.2 Limites fixes dans le code (LUES)
+### 2.2 Fixed limits in the code (READ)
 
-`FD_TABLE_SIZE` 1024 (`src/syscall.h:601`) ; `MAX_THREADS` 64 (`src/thread.h:25`) ; `PROC_TABLE_SIZE` 64 enfants (`src/syscall_proc.h:92`) ; `FUTEX_BUCKETS` 64 ; `EVENTFD_MAX` 32, `TIMERFD_MAX` 32, `SIGNALFD_MAX` 16 (`src/syscall_fd.c`), `INOTIFY_MAX` 16 ; 64 verrous de noms abstraits AF_UNIX (`src/syscall_net.c:156`) ; 256 kevents par `epoll_pwait`. Je n'ai pas mesuré le nombre de threads de Rocket League sous Wine : 64 threads est une limite dure inconnue face à ce jeu.
+`FD_TABLE_SIZE` 1024 (`src/syscall.h:601`); `MAX_THREADS` 64 (`src/thread.h:25`); `PROC_TABLE_SIZE` 64 children (`src/syscall_proc.h:92`); `FUTEX_BUCKETS` 64; `EVENTFD_MAX` 32, `TIMERFD_MAX` 32, `SIGNALFD_MAX` 16 (`src/syscall_fd.c`), `INOTIFY_MAX` 16; 64 AF_UNIX abstract name locks (`src/syscall_net.c:156`); 256 kevents per `epoll_pwait`. I did not measure the number of threads of Rocket League under Wine: 64 threads is a hard limit of unknown fit for this game.
 
-## 3. Interface minimale entre un moteur CPU et l'émulation du noyau
+## 3. Minimal interface between a CPU engine and the kernel emulation
 
-### 3.1 Deux modes d'intégration
+### 3.1 Two integration modes
 
-Mode A (recommandé, INFÉRÉ). Garder le front-end x86-64 de FEX (`Source/Tools/LinuxEmulation/LinuxSyscalls`, environ 30 000 lignes, dont 406 enregistrements de syscall, 276 en passthrough pur) et remplacer le « noyau hôte » qu'il appelle. FEX appelle ce noyau de deux façons : par les 7 gabarits `SyscallPassthroughN<numéro arm64>` qui contiennent un `svc #0` en assembleur en ligne (`Syscalls/Passthrough.cpp:18-150`), et par 64 appels `::syscall(` plus quelques appels libc directs (`::poll` `Syscalls/FD.cpp:36`, `::select` et `::fcntl` `x64/FD.cpp:41-55`). Remplacer les 7 gabarits par un appel à une fonction `hlk_host_syscall(nr, a0..a5)` indexée par les numéros arm64 donne exactement le dispatch de HL. Les conversions x86-64 vers disposition hôte (par exemple `epoll_event_x86` packé vers l'`epoll_event` de 16 octets, `x64/EPoll.cpp:25-90`) restent faites par FEX. Les appels libc directs de FEX supposent des constantes Linux : ils doivent aussi passer par la couche (par exemple `RemapFromX86Flags` suppose les valeurs `O_*` d'un hôte Linux).
+Mode A (recommended, INFERRED). Keep FEX's x86-64 front end (`Source/Tools/LinuxEmulation/LinuxSyscalls`, about 30,000 lines, including 406 syscall registrations, 276 of them pure passthrough) and replace the "host kernel" it calls. FEX calls this kernel in two ways: through the 7 templates `SyscallPassthroughN<arm64 number>` that contain an inline assembly `svc #0` (`Syscalls/Passthrough.cpp:18-150`), and through 64 `::syscall(` calls plus a few direct libc calls (`::poll` `Syscalls/FD.cpp:36`, `::select` and `::fcntl` `x64/FD.cpp:41-55`). Replacing the 7 templates with a call to a function `hlk_host_syscall(nr, a0..a5)` indexed by the arm64 numbers gives exactly HL's dispatch. The conversions from x86-64 to host layout (for example packed `epoll_event_x86` to the 16-byte `epoll_event`, `x64/EPoll.cpp:25-90`) stay done by FEX. FEX's direct libc calls assume Linux constants: they also have to go through the layer (for example `RemapFromX86Flags` assumes the `O_*` values of a Linux host).
 
-Mode B. Garder le dispatch de HL tel quel, l'indexer par les numéros x86-64 et jeter la couche Linux de FEX. Il faut alors refaire dans HL la table x86-64 (environ 330 numéros dont ~100 historiques), toutes les structures x86 (`stat`, `epoll_event`, `sigaction`, cadres de signal), le vDSO x86-64 (FEX en a un, `VDSO_Emulation.cpp`, 906 lignes) et la vue ptrace. À éviter.
+Mode B. Keep HL's dispatch as is, index it by the x86-64 numbers and throw away FEX's Linux layer. One then has to redo in HL the x86-64 table (about 330 numbers of which ~100 are legacy), all the x86 structures (`stat`, `epoll_event`, `sigaction`, signal frames), the x86-64 vDSO (FEX has one, `VDSO_Emulation.cpp`, 906 lines) and the ptrace view. To avoid.
 
-Dans les deux modes, FEX traite lui-même quatre zones qui supposent un noyau Linux hôte (LU, source FEX intacte) : clone et fork (`Syscalls/Thread.cpp:179-399`, qui appelle `::syscall(SYSCALL_DEF(clone), ...)` à la ligne 258 et émule `vfork` par un fork suivi d'une attente, 284-299) ; les signaux (`SignalDelegator` garde les actions invitées, mais `kill`, `tkill`, `tgkill` sont des passthroughs vers le noyau hôte, `Passthrough.cpp:232,295,305`) ; exec (`x64/Thread.cpp:286-315` puis `Syscalls.cpp:199-440` : FEX relance l'hôte sur lui-même avec les arguments du chargeur, ce qui correspond naturellement à une ré-exécution du runtime sous Darwin) ; ptrace (`Syscalls/Info.cpp:96-113` : PEEKTEXT, PEEKDATA, POKETEXT, POKEDATA, ATTACH, DETACH en passthrough « pour que Wine lance le launcher Ubisoft », tout le reste renvoie EPERM). `prctl` envoie toutes les options sauf SECCOMP et GET_AUXV à la libc hôte (`Syscalls/Thread.cpp:479-516`), `personality` est mémorisé par thread (`Syscalls/Info.cpp:72`) et `seccomp` est émulé par un `SeccompEmulator` en espace utilisateur (`Info.cpp:93`). Ce sont ces zones que la couche processus de HL doit remplacer ; les écarts HL sur `personality` et `seccomp` sont donc sans objet en mode A.
+In both modes, FEX itself handles four areas that assume a Linux host kernel (READ, FEX source intact): clone and fork (`Syscalls/Thread.cpp:179-399`, which calls `::syscall(SYSCALL_DEF(clone), ...)` at line 258 and emulates `vfork` through a fork followed by a wait, 284-299); signals (`SignalDelegator` keeps the guest actions, but `kill`, `tkill`, `tgkill` are passthroughs to the host kernel, `Passthrough.cpp:232,295,305`); exec (`x64/Thread.cpp:286-315` then `Syscalls.cpp:199-440`: FEX relaunches the host on itself with the loader arguments, which naturally corresponds to a re-execution of the runtime under Darwin); ptrace (`Syscalls/Info.cpp:96-113`: PEEKTEXT, PEEKDATA, POKETEXT, POKEDATA, ATTACH, DETACH as passthrough "so that Wine launches the Ubisoft launcher", everything else returns EPERM). `prctl` sends all options except SECCOMP and GET_AUXV to the host libc (`Syscalls/Thread.cpp:479-516`), `personality` is remembered per thread (`Syscalls/Info.cpp:72`) and `seccomp` is emulated by a user-space `SeccompEmulator` (`Info.cpp:93`). These are the areas that HL's process layer has to replace; HL's gaps on `personality` and `seccomp` are therefore moot in mode A.
 
-### 3.2 Esquisse d'API C (frontière étroite)
+### 3.2 Sketch of a C API (narrow boundary)
 
-Principe : le moteur possède le CPU, la pile du thread hôte et le cadre de signal ; la couche noyau possède l'identité, les tables, les signaux en attente, les arrêts ptrace et les objets noyau. Sept points d'entrée suffisent.
+Principle: the engine owns the CPU, the host thread stack and the signal frame; the kernel layer owns identity, tables, pending signals, ptrace stops and kernel objects. Seven entry points are enough.
 
 ```c
-/* hlk.h : frontière entre un moteur CPU (hôte FEXCore) et la couche noyau Linux-sur-Darwin */
-typedef struct hlk_task hlk_task;          /* un thread invité : TID, masque, pile alternative, lien ptrace */
+/* hlk.h: boundary between a CPU engine (FEXCore host) and the Linux-on-Darwin kernel layer */
+typedef struct hlk_task hlk_task;          /* one guest thread: TID, mask, alternate stack, ptrace link */
 
-/* 1. mémoire invitée. Adresse invitée = adresse hôte (ou base + adresse, voir 3.3). Jamais de déréférencement direct dans les gestionnaires. */
-int     hlk_user_read (uint64_t gva, void *dst, size_t n);        /* 0 ou -EFAULT, sûr face aux fautes */
+/* 1. guest memory. Guest address = host address (or base + address, see 3.3). Never a direct dereference in the handlers. */
+int     hlk_user_read (uint64_t gva, void *dst, size_t n);        /* 0 or -EFAULT, fault-safe */
 int     hlk_user_write(uint64_t gva, const void *src, size_t n);
-int64_t hlk_user_strn (uint64_t gva, char *dst, size_t max);      /* longueur, -EFAULT ou -ENAMETOOLONG */
+int64_t hlk_user_strn (uint64_t gva, char *dst, size_t max);      /* length, -EFAULT or -ENAMETOOLONG */
 
-/* 2. entrée de syscall : appelée par le moteur à chaque SYSCALL invité, thread propriétaire */
+/* 2. syscall entry: called by the engine at each guest SYSCALL, owner thread */
 typedef struct { uint64_t nr, a[6]; } hlk_sysreq;                  /* RAX, RDI, RSI, RDX, R10, R8, R9 */
 typedef enum { HLK_RETURN, HLK_CONTEXT_REPLACED, HLK_EXIT_THREAD,
                HLK_EXIT_GROUP, HLK_RESTART } hlk_disp;
 hlk_disp hlk_syscall(hlk_task *t, const hlk_sysreq *rq, int64_t *rax);
-   /* RETURN: écrire rax. CONTEXT_REPLACED: exec ou sigreturn ont déjà posé le contexte par engine->set_regs.
-      RESTART: SA_RESTART, le moteur recule RIP de 2 et remet RAX = nr. */
+   /* RETURN: write rax. CONTEXT_REPLACED: exec or sigreturn have already set the context through engine->set_regs.
+      RESTART: SA_RESTART, the engine moves RIP back by 2 and sets RAX = nr again. */
 
-/* 3. signaux asynchrones : le moteur appelle hlk_signal_next aux points sûrs (retour de syscall, après kick, après faute) */
+/* 3. asynchronous signals: the engine calls hlk_signal_next at safe points (syscall return, after kick, after fault) */
 typedef struct { int signo; uint8_t info[128]; uint64_t handler, flags, restorer, new_mask;
                  uint64_t alt_sp, alt_size; int use_alt; } hlk_delivery;
-int  hlk_signal_next(hlk_task *t, hlk_delivery *d);               /* 1 livrer, 0 rien, -1 le processus meurt */
-void hlk_signal_returned(hlk_task *t, uint64_t mask, uint64_t sp);/* après le sigreturn du moteur */
+int  hlk_signal_next(hlk_task *t, hlk_delivery *d);               /* 1 deliver, 0 nothing, -1 the process dies */
+void hlk_signal_returned(hlk_task *t, uint64_t mask, uint64_t sp);/* after the engine's sigreturn */
 
-/* 4. fautes synchrones : le moteur traduit sa faute en (signo, si_code, adresse, err, trapno) */
+/* 4. synchronous faults: the engine translates its fault into (signo, si_code, address, err, trapno) */
 void hlk_fault(hlk_task *t, int signo, int si_code, uint64_t addr, uint64_t err, uint64_t trapno);
 
-/* 5. services du moteur appelés par la couche noyau (enregistrés une fois) */
+/* 5. engine services called by the kernel layer (registered once) */
 typedef struct hlk_engine_ops {
-  int  (*get_regs)(hlk_task*, hlk_x86_regs *r);      /* user_regs_struct, valable à un point sûr ou thread arrêté */
+  int  (*get_regs)(hlk_task*, hlk_x86_regs *r);      /* user_regs_struct, valid at a safe point or stopped thread */
   int  (*set_regs)(hlk_task*, const hlk_x86_regs *r);
   int  (*get_fp)(hlk_task*, void *xsave, size_t *n);  int (*set_fp)(hlk_task*, const void*, size_t);
-  void (*kick)(hlk_task*);                            /* atteindre un point sûr bientôt : pthread_kill sur le signal réservé */
+  void (*kick)(hlk_task*);                            /* reach a safe point soon: pthread_kill on the reserved signal */
   int  (*spawn)(hlk_task *child, const hlk_x86_regs *start, uint64_t fs_base);
-  void (*invalidate_code)(uint64_t start, uint64_t len); /* POKE, mprotect, écriture dans une page de code */
-  int  (*frame_build)(hlk_task*, const hlk_delivery*);   /* pousse rt_sigframe x86-64, règle RIP/RSP/RDI/RSI/RDX */
+  void (*invalidate_code)(uint64_t start, uint64_t len); /* POKE, mprotect, write to a code page */
+  int  (*frame_build)(hlk_task*, const hlk_delivery*);   /* pushes x86-64 rt_sigframe, sets RIP/RSP/RDI/RSI/RDX */
   int  (*frame_restore)(hlk_task*, uint64_t *mask, uint64_t *sp);
-  void (*reset_for_exec)(void);                          /* ou ré-exécution de l'hôte */
+  void (*reset_for_exec)(void);                          /* or re-execution of the host */
 } hlk_engine_ops;
 
-/* 6. fork : le moteur appelle fork() lui-même entre ces deux appels */
-int  hlk_fork_prepare(hlk_task *t, uint64_t clone_flags);  /* verrous, registre familial, kqueue à reconstruire */
-void hlk_fork_finish (hlk_task *t, pid_t host_child);      /* host_child == 0 dans l'enfant */
+/* 6. fork: the engine calls fork() itself between these two calls */
+int  hlk_fork_prepare(hlk_task *t, uint64_t clone_flags);  /* locks, family registry, kqueues to rebuild */
+void hlk_fork_finish (hlk_task *t, pid_t host_child);      /* host_child == 0 in the child */
 
 /* 7. exec */
 int  hlk_exec_prepare(hlk_task *t, const char *path, char *const argv[], char *const envp[], hlk_image *img);
-void hlk_exec_commit (hlk_task *t, const hlk_image *img); /* image installée : arrêt TRACEEXEC, remise à zéro des signaux */
+void hlk_exec_commit (hlk_task *t, const hlk_image *img); /* image installed: TRACEEXEC stop, signal reset */
 
-/* + arrêt ptrace (appelé par le moteur aux points d'arrêt) */
+/* + ptrace stop (called by the engine at stop points) */
 typedef enum { HLK_STOP_SYSCALL_ENTRY, HLK_STOP_SYSCALL_EXIT, HLK_STOP_SIGNAL, HLK_STOP_EXEC, HLK_STOP_FAULT } hlk_stop;
 int  hlk_ptrace_stop(hlk_task *t, hlk_stop kind, int signo, int *resume_signo);
 ```
 
-### 3.3 Règles de propriété et de verrous
+### 3.3 Ownership and lock rules
 
-- Seul le thread propriétaire appelle `hlk_syscall`, `hlk_signal_next` et `hlk_ptrace_stop`. Un thread arrêté pour ptrace a son état x86 dans la mémoire ordinaire du processus (`FEXCore::Core::CPUState`, `CoreState.h`, `gregs[16]`, `rip`, `xmm`, `flags[48]`) : un thread auxiliaire du même processus peut le lire sans le réveiller. La contrainte HVF « seul le vCPU propriétaire lit ses registres » (`src/thread.c:607-616`) disparaît.
-- Ordre des verrous à conserver (`src/syscall_internal.h:10-38`) : mmap (1), fd (3), signal (4), table de threads (5), pid (6), seaux de futex (7). Le moteur ne doit jamais tenir un verrou du noyau pendant qu'il exécute du code invité.
-- Mémoire invitée : garder les trois fonctions `hlk_user_*` comme seul accès. Avec l'identité elles font une copie protégée contre les fautes (FEX fournit `FaultSafeUserMemAccess` : `CopyFromUser` et `CopyToUser` en assembleur arm64 avec un PC de faute connu, `FaultSafeUserMemAccess.cpp:1-80`). Si un décalage de base invité devient nécessaire pour Wine (section 0), seule cette couche change, plus les pointeurs imbriqués dans les structures (`iovec`, `msghdr`, `sigaction`), pour lesquels HL a déjà des convertisseurs (`append_guest_iov`, `src/syscall_io.c:279-301`).
-- Signaux : un seul signal hôte réservé sert de « kick » (SIGUSR2 est déjà pris par les E/S hôte de HL, `src/thread.c:52`) ; FEX réserve ses propres signaux, il faut un plan d'allocation. Darwin n'a pas de signaux temps réel ni de `tgkill` ni de `rt_sigqueueinfo` : les signaux invités doivent rester des files logicielles (comme `src/syscall_signal.c:37-47`), le signal hôte ne servant qu'à interrompre.
-- Identité : PID et TID virtuels du compteur familial, pas des identifiants macOS. Le TID du thread principal doit égaler le PID (attente de Linux, que les identifiants Mach ne satisfont pas).
+- Only the owner thread calls `hlk_syscall`, `hlk_signal_next` and `hlk_ptrace_stop`. A thread stopped for ptrace has its x86 state in the ordinary memory of the process (`FEXCore::Core::CPUState`, `CoreState.h`, `gregs[16]`, `rip`, `xmm`, `flags[48]`): a helper thread of the same process can read it without waking it. The HVF constraint "only the owner vCPU reads its registers" (`src/thread.c:607-616`) disappears.
+- Lock order to keep (`src/syscall_internal.h:10-38`): mmap (1), fd (3), signal (4), thread table (5), pid (6), futex buckets (7). The engine must never hold a kernel lock while it executes guest code.
+- Guest memory: keep the three `hlk_user_*` functions as the only access. With identity they do a fault-protected copy (FEX provides `FaultSafeUserMemAccess`: `CopyFromUser` and `CopyToUser` in arm64 assembly with a known fault PC, `FaultSafeUserMemAccess.cpp:1-80`). If a guest base offset becomes necessary for Wine (section 0), only this layer changes, plus the pointers nested in structures (`iovec`, `msghdr`, `sigaction`), for which HL already has converters (`append_guest_iov`, `src/syscall_io.c:279-301`).
+- Signals: a single reserved host signal serves as "kick" (SIGUSR2 is already taken by HL's host I/O, `src/thread.c:52`); FEX reserves its own signals, an allocation plan is needed. Darwin has no real-time signals, no `tgkill` and no `rt_sigqueueinfo`: guest signals must stay software queues (like `src/syscall_signal.c:37-47`), the host signal serving only to interrupt.
+- Identity: virtual PID and TID from the family counter, not macOS identifiers. The main thread's TID must equal the PID (a Linux expectation, which Mach identifiers do not satisfy).
 
-### 3.4 Ce qui dépend d'ARM64 Linux (liste des conversions x86-64)
+### 3.4 What depends on ARM64 Linux (list of x86-64 conversions)
 
-1. Numéros et registres du syscall : `src/syscall.h:17-170`, `case SYS_*` dans `src/syscall.c:1277-2463` (182 lignes), lecture de x0-x5 et x8 (`src/syscall.c:1249-1255`), résultat dans X0 et abus de X8 comme drapeau TLBI du shim (2495-2507, sans objet en x86-64). x86-64 : RAX, RDI, RSI, RDX, R10, R8, R9 ; RCX reçoit le RIP suivant et R11 les RFLAGS.
-2. Ordre des arguments de `clone` : arm64 `(flags, stack, ptid, tls, ctid)` (`src/syscall.c:2227`, `src/fork_ipc.c:1290-1293`) ; x86-64 `(flags, stack, ptid, ctid, tls)`.
-3. Redémarrage de syscall : PC moins 4 (`src/syscall_signal.c:403,1037`) ; x86-64 : RIP moins 2 et RAX restauré depuis `orig_rax`, qui n'existe pas dans HL.
-4. Cadre de signal : `linux_rt_sigframe_t`, FPSIMD et ESR (`src/syscall_signal.h:133-172`, `.c:841-899,1021-1186,1190-1255`). x86-64 : `rt_sigframe` avec `pretcode` pris dans `sa_restorer` (pas de restaurateur vDSO), saut de la zone rouge de 128 octets, alignement de pile, `sigcontext` x86 (r8..r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags, cs/gs/fs, err, trapno, cr2), zone xsave avec magic `FP_XSTATE_MAGIC1`. FEX l'a écrit (`SignalDelegator/GuestFramesManagement.cpp`, 856 lignes).
-5. Traduction des fautes : décodage d'ESR_EL1, FSC, ACCERR/MAPERR (`src/syscall_proc.c:1767-1887`). x86-64 : #PF (code d'erreur, cr2), #UD (SIGILL), #DE (SIGFPE, `FPE_INTDIV`), `int3` (SIGTRAP avec `si_code = SI_KERNEL`, RIP après l'octet), pas à pas (`TRAP_TRACE`).
-6. Pointeur de thread : TPIDR_EL0 (`src/fork_ipc.c:1484-1489`). x86-64 : base FS posée par `CLONE_SETTLS` ou `arch_prctl(ARCH_SET_FS)` ; base GS pour le TEB de Wine.
-7. Vues ptrace : `linux_user_pt_regs_t` (34 mots, `src/syscall.h:215-220`), `linux_user_fpsimd_state_t`, `NT_ARM_HW_WATCH`, convention X7 aux arrêts syscall (`probes/regset-architecture.md:18`). x86-64 : `user_regs_struct` 27 mots, `user_fpregs_struct` 512 octets, `NT_X86_XSTATE`, registres de debug par PEEKUSER et POKEUSER (Wine server en dépend, `voile-wine/server/ptrace.c:643-721`), requêtes GETREGS, SETREGS, GETFPREGS, SETFPREGS, `PTRACE_ARCH_PRCTL`, et à l'arrêt de syscall : `rax = -ENOSYS`, `orig_rax` = numéro, `rcx` et `r11` selon la sémantique de `syscall`.
-8. `struct epoll_event` : 16 octets en arm64 (`src/syscall_poll.c:583-588`), 12 octets packés en x86-64.
-9. Valeurs de `O_*`, `struct stat`, `statfs`, `AT_*` et auxv (vfs et chargeur, coéquipier) : `O_DIRECTORY`, `O_NOFOLLOW`, `O_DIRECT`, `O_LARGEFILE` diffèrent (`CLAUDE.md` de HL, section « aarch64-linux Open Flag Values »).
-10. Syscalls x86-64 sans équivalent arm64 : une centaine d'appels historiques (`fork` 57, `vfork` 58, `pause` 34, `alarm` 37, `poll` 7, `select` 23, `dup2` 33, `pipe` 22, `epoll_create` 213, `epoll_wait` 232, `eventfd` 284, `signalfd` 282, `inotify_init` 253, `getpgrp` 111, `time` 201) et propres à x86 (`arch_prctl` 158, `modify_ldt` 154, `iopl`, `ioperm`). `fork` et `vfork` x86 passent par la même `ForkGuest` que dans FEX (`Syscalls/Thread.cpp:401-436`).
+1. Syscall numbers and registers: `src/syscall.h:17-170`, `case SYS_*` in `src/syscall.c:1277-2463` (182 lines), reading of x0-x5 and x8 (`src/syscall.c:1249-1255`), result in X0 and abuse of X8 as the shim's TLBI flag (2495-2507, moot in x86-64). x86-64: RAX, RDI, RSI, RDX, R10, R8, R9; RCX receives the next RIP and R11 the RFLAGS.
+2. Order of `clone` arguments: arm64 `(flags, stack, ptid, tls, ctid)` (`src/syscall.c:2227`, `src/fork_ipc.c:1290-1293`); x86-64 `(flags, stack, ptid, ctid, tls)`.
+3. Syscall restart: PC minus 4 (`src/syscall_signal.c:403,1037`); x86-64: RIP minus 2 and RAX restored from `orig_rax`, which does not exist in HL.
+4. Signal frame: `linux_rt_sigframe_t`, FPSIMD and ESR (`src/syscall_signal.h:133-172`, `.c:841-899,1021-1186,1190-1255`). x86-64: `rt_sigframe` with `pretcode` taken from `sa_restorer` (no vDSO restorer), skip of the 128-byte red zone, stack alignment, x86 `sigcontext` (r8..r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags, cs/gs/fs, err, trapno, cr2), xsave area with magic `FP_XSTATE_MAGIC1`. FEX has written it (`SignalDelegator/GuestFramesManagement.cpp`, 856 lines).
+5. Fault translation: decoding of ESR_EL1, FSC, ACCERR/MAPERR (`src/syscall_proc.c:1767-1887`). x86-64: #PF (error code, cr2), #UD (SIGILL), #DE (SIGFPE, `FPE_INTDIV`), `int3` (SIGTRAP with `si_code = SI_KERNEL`, RIP after the byte), single step (`TRAP_TRACE`).
+6. Thread pointer: TPIDR_EL0 (`src/fork_ipc.c:1484-1489`). x86-64: FS base set by `CLONE_SETTLS` or `arch_prctl(ARCH_SET_FS)`; GS base for Wine's TEB.
+7. ptrace views: `linux_user_pt_regs_t` (34 words, `src/syscall.h:215-220`), `linux_user_fpsimd_state_t`, `NT_ARM_HW_WATCH`, X7 convention at syscall stops (`probes/regset-architecture.md:18`). x86-64: `user_regs_struct` 27 words, `user_fpregs_struct` 512 bytes, `NT_X86_XSTATE`, debug registers through PEEKUSER and POKEUSER (Wine server depends on it, `voile-wine/server/ptrace.c:643-721`), requests GETREGS, SETREGS, GETFPREGS, SETFPREGS, `PTRACE_ARCH_PRCTL`, and at the syscall stop: `rax = -ENOSYS`, `orig_rax` = number, `rcx` and `r11` according to the semantics of `syscall`.
+8. `struct epoll_event`: 16 bytes in arm64 (`src/syscall_poll.c:583-588`), 12 bytes packed in x86-64.
+9. Values of `O_*`, `struct stat`, `statfs`, `AT_*` and auxv (vfs and loader, teammate): `O_DIRECTORY`, `O_NOFOLLOW`, `O_DIRECT`, `O_LARGEFILE` differ (HL's `CLAUDE.md`, section "aarch64-linux Open Flag Values").
+10. x86-64 syscalls without an arm64 equivalent: about a hundred legacy calls (`fork` 57, `vfork` 58, `pause` 34, `alarm` 37, `poll` 7, `select` 23, `dup2` 33, `pipe` 22, `epoll_create` 213, `epoll_wait` 232, `eventfd` 284, `signalfd` 282, `inotify_init` 253, `getpgrp` 111, `time` 201) and x86-specific ones (`arch_prctl` 158, `modify_ldt` 154, `iopl`, `ioperm`). x86 `fork` and `vfork` go through the same `ForkGuest` as in FEX (`Syscalls/Thread.cpp:401-436`).
 
-## 4. Écarts face à Wine et EAC
+## 4. Gaps against Wine and EAC
 
-Légende : présent (P), partiel (PA), absent (A). « Statut » concerne l'arbre HL en l'état.
+Legend: present (P), partial (PA), absent (A). "Status" concerns the HL tree as it stands.
 
-### 4.1 Ce que Wine et EAC utilisent réellement
+### 4.1 What Wine and EAC actually use
 
-MESURÉ par script sur 18 journaux `eac.log`/`control.log` de 8 répertoires d'essais EAC (`probes/eac-*`) : événements `unimplemented_syscall` du runtime privé, avec un budget de 5 par processus (champ `budget`) donc non exhaustifs. Numéros arm64 : 10 (`fgetxattr`, 304 événements, 7 runs, voir 8), 282 (`userfaultfd`, 120, 7 runs, ENOSYS légitime), 153 (`times`, 26, 7 runs). Le même run `eac-ptrace-poke-20260930` journalise 24 `sys_exit_group`, 13 `exec_shim_diagnostic`, 65 `wait4` : plusieurs dizaines de processus invités.
+MEASURED by script over 18 `eac.log`/`control.log` logs from 8 EAC trial directories (`probes/eac-*`): `unimplemented_syscall` events of the private runtime, with a budget of 5 per process (field `budget`) and therefore not exhaustive. arm64 numbers: 10 (`fgetxattr`, 304 events, 7 runs, see 8), 282 (`userfaultfd`, 120, 7 runs, legitimate ENOSYS), 153 (`times`, 26, 7 runs). The same run `eac-ptrace-poke-20260930` logs 24 `sys_exit_group`, 13 `exec_shim_diagnostic`, 65 `wait4`: several dozen guest processes.
 
-Wine (LU dans `voile-wine/server`, utilisé comme proxy du code serveur de Wine 10 Debian que les essais HyperLinux exécutaient ; identité des deux sources non vérifiée) : `send_thread_signal` envoie SIGUSR1 aux clients par `tkill(unix_pid, unix_tid, sig)` pour suspendre, interrompre et terminer des threads (`thread.c:961,1451,1468`, `ptrace.c:258-266`), SIGQUIT à la mort violente (`thread.c:1628`), et `kill(process->unix_pid, signal)` (`process.c:787`). La lecture et l'écriture mémoire inter-processus utilisent d'abord `process_vm_readv` et `process_vm_writev`, puis, si ENOSYS ou EPERM, ptrace ATTACH, waitpid(SIGSTOP, `__WALL`), PEEKDATA, POKEDATA, DETACH (`ptrace.c:182-300,336-416,474-492`). Les registres de debug passent par ATTACH, PEEKUSER, POKEUSER, DETACH (`ptrace.c:625-725`). Donc, avant EAC, Wine exige déjà le `tgkill` inter-processus et soit `process_vm_*`, soit ptrace sur des non-enfants.
+Wine (READ in `voile-wine/server`, used as a proxy for the server code of the Debian Wine 10 that the HyperLinux trials ran; identity of the two sources not checked): `send_thread_signal` sends SIGUSR1 to the clients through `tkill(unix_pid, unix_tid, sig)` to suspend, interrupt and terminate threads (`thread.c:961,1451,1468`, `ptrace.c:258-266`), SIGQUIT at violent death (`thread.c:1628`), and `kill(process->unix_pid, signal)` (`process.c:787`). Cross-process memory read and write first use `process_vm_readv` and `process_vm_writev`, then, if ENOSYS or EPERM, ptrace ATTACH, waitpid(SIGSTOP, `__WALL`), PEEKDATA, POKEDATA, DETACH (`ptrace.c:182-300,336-416,474-492`). Debug registers go through ATTACH, PEEKUSER, POKEUSER, DETACH (`ptrace.c:625-725`). So, before EAC, Wine already requires cross-process `tgkill` and either `process_vm_*` or ptrace on non-children.
 
 ### 4.2 ptrace
 
-| Requête | Valeur | Preuve d'usage | Statut distant HL | Remarque pour une vue x86 |
+| Request | Value | Evidence of use | HL remote status | Note for an x86 view |
 |---|---|---|---|---|
-| TRACEME | 0 | EAC (enfant 148) | P | lien créé au fork seulement |
-| PEEKTEXT, PEEKDATA | 1, 2 | EAC (PEEKDATA, run poke) ; Wine server (repli) | A (EINVAL) | agent coopératif ou tâche Mach du tracee |
-| PEEKUSER, POKEUSER | 3, 6 | Wine server (DR0-DR7) | A | `struct user` x86, offsets des registres de debug |
-| POKETEXT, POKEDATA | 4, 5 | EAC (octet 0xCC) ; Wine server (repli) | A | écriture dans une page RX, puis invalidation du cache de traduction |
+| TRACEME | 0 | EAC (child 148) | P | link created at fork only |
+| PEEKTEXT, PEEKDATA | 1, 2 | EAC (PEEKDATA, poke run); Wine server (fallback) | A (EINVAL) | cooperative agent or Mach task of the tracee |
+| PEEKUSER, POKEUSER | 3, 6 | Wine server (DR0-DR7) | A | x86 `struct user`, offsets of the debug registers |
+| POKETEXT, POKEDATA | 4, 5 | EAC (byte 0xCC); Wine server (fallback) | A | write into an RX page, then invalidation of the translation cache |
 | CONT | 7 | EAC | P | |
-| KILL | 8 | non observé (EAC utilise kill) | A | |
-| SINGLESTEP | 9 | non observé (défini dans `voile-wine/server/ptrace.c:64-65`, jamais appelé) | A | TF et `TRAP_TRACE` |
-| GETREGS, SETREGS | 12, 13 | non observé | A | requêtes x86 |
-| GETFPREGS, SETFPREGS | 14, 15 | non observé | A | 512 octets |
-| ATTACH | 16 | Wine server | A (non-enfant) | registre familial des processus |
-| DETACH | 17 | Wine server, EAC possible | P (enfant) | |
-| SYSCALL | 24 | EAC (146 fois) | P | arrêts aux frontières FEX |
-| SETOPTIONS | 0x4200 | EAC (0x11) | PA (masque 0x11 seul) | TRACECLONE, TRACEFORK, TRACEEXIT, EXITKILL absents |
+| KILL | 8 | not observed (EAC uses kill) | A | |
+| SINGLESTEP | 9 | not observed (defined in `voile-wine/server/ptrace.c:64-65`, never called) | A | TF and `TRAP_TRACE` |
+| GETREGS, SETREGS | 12, 13 | not observed | A | x86 requests |
+| GETFPREGS, SETFPREGS | 14, 15 | not observed | A | 512 bytes |
+| ATTACH | 16 | Wine server | A (non-child) | family process registry |
+| DETACH | 17 | Wine server, EAC possible | P (child) | |
+| SYSCALL | 24 | EAC (146 times) | P | stops at the FEX boundaries |
+| SETOPTIONS | 0x4200 | EAC (0x11) | PA (mask 0x11 only) | TRACECLONE, TRACEFORK, TRACEEXIT, EXITKILL missing |
 | GETEVENTMSG | 0x4201 | EAC possible | P | |
-| GETSIGINFO, SETSIGINFO | 0x4202, 0x4203 | non observé | A distant (local Rosetta seulement) | |
-| GETREGSET | 0x4204 | EAC (66 fois, 216 octets) | PA (272 octets ARM64) | 216 octets = `user_regs_struct` x86 |
-| SETREGSET | 0x4205 | EAC (RIP moins 1) | A dans l'arbre (candidat non qualifié, 74/76) | |
-| SEIZE, INTERRUPT | 0x4206, 0x4207 | non observé en distant | A distant | |
-| `PTRACE_GET_SYSCALL_INFO` | 0x420e | non observé | A | |
+| GETSIGINFO, SETSIGINFO | 0x4202, 0x4203 | not observed | A remote (local Rosetta only) | |
+| GETREGSET | 0x4204 | EAC (66 times, 216 bytes) | PA (272 ARM64 bytes) | 216 bytes = x86 `user_regs_struct` |
+| SETREGSET | 0x4205 | EAC (RIP minus 1) | A in the tree (unqualified candidate, 74/76) | |
+| SEIZE, INTERRUPT | 0x4206, 0x4207 | not observed remotely | A remote | |
+| `PTRACE_GET_SYSCALL_INFO` | 0x420e | not observed | A | |
 
-### 4.3 Drapeaux de clone et création de processus
+### 4.3 Clone flags and process creation
 
-| Élément | Statut | Détail |
+| Item | Status | Detail |
 |---|---|---|
-| `pthread_create` glibc (0x3d0f00 plus SETTLS, PARENT_SETTID, CHILD_CLEARTID) | P | `sys_clone_thread` |
-| `fork()` glibc (0x1200011) | PA | pas d'écriture de `ctid`, pas de SIGCHLD, pas de `SETTLS` |
-| `vfork`, `posix_spawn` (`CLONE_VM|CLONE_VFORK`) | A (chemin vm-clone) | INFÉRÉ cassé, non testé |
-| `CLONE_PTRACE`, `CLONE_UNTRACED`, `CLONE_PARENT`, `CLONE_PIDFD`, `CLONE_NEW*` | A | ignorés sans erreur |
-| `clone3` | A | ENOSYS, repli glibc |
-| Limite de threads | PA | 64 par processus |
+| glibc `pthread_create` (0x3d0f00 plus SETTLS, PARENT_SETTID, CHILD_CLEARTID) | P | `sys_clone_thread` |
+| glibc `fork()` (0x1200011) | PA | no write of `ctid`, no SIGCHLD, no `SETTLS` |
+| `vfork`, `posix_spawn` (`CLONE_VM|CLONE_VFORK`) | A (vm-clone path) | INFERRED broken, not tested |
+| `CLONE_PTRACE`, `CLONE_UNTRACED`, `CLONE_PARENT`, `CLONE_PIDFD`, `CLONE_NEW*` | A | ignored without error |
+| `clone3` | A | ENOSYS, glibc fallback |
+| Thread limit | PA | 64 per process |
 
-### 4.4 Signaux, kill, tgkill
+### 4.4 Signals, kill, tgkill
 
-| Élément | Statut | Détail |
+| Item | Status | Detail |
 |---|---|---|
-| `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`, `rt_sigpending`, `rt_sigreturn` | P | cadre ARM64 |
-| `rt_sigsuspend` | PA | renvoie EINTR sans dormir |
+| `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`, `rt_sigpending`, `rt_sigreturn` | P | ARM64 frame |
+| `rt_sigsuspend` | PA | returns EINTR without sleeping |
 | `rt_sigtimedwait`, `rt_sigqueueinfo` | A | |
-| `rt_tgsigqueueinfo` | PA | intra-processus |
-| `kill`, `tkill`, `tgkill` intra-processus | P | `SI_TKILL` honoré |
-| `kill` vers un enfant | PA | SIGKILL et SIGCONT seulement |
-| `kill`, `tgkill` vers un autre processus | A | requis par Wine server |
-| SIGCHLD à la mort d'un enfant | A | |
-| Signaux temps réel 32 à 64 | P | file de 32 |
-| `signalfd4` | PA | 16 emplacements, local |
-| ITIMER_REAL | P | émulé ; ITIMER_VIRTUAL et PROF non |
-| Attentes interrompues par un signal invité | PA | oui pour read et write, poll, select, epoll sans délai, wait4, futex ; non pour `nanosleep`, `clock_nanosleep`, `accept`, `connect`, `recv*`, `send*` (1.2) |
+| `rt_tgsigqueueinfo` | PA | intra-process |
+| intra-process `kill`, `tkill`, `tgkill` | P | `SI_TKILL` honored |
+| `kill` to a child | PA | SIGKILL and SIGCONT only |
+| `kill`, `tgkill` to another process | A | required by Wine server |
+| SIGCHLD at the death of a child | A | |
+| Real-time signals 32 to 64 | P | queue of 32 |
+| `signalfd4` | PA | 16 slots, local |
+| ITIMER_REAL | P | emulated; ITIMER_VIRTUAL and PROF not |
+| Waits interrupted by a guest signal | PA | yes for read and write, poll, select, epoll without timeout, wait4, futex; no for `nanosleep`, `clock_nanosleep`, `accept`, `connect`, `recv*`, `send*` (1.2) |
 
 ### 4.5 prctl, rlimits, personality, seccomp, io_uring, pidfd
 
-| Élément | Statut | Détail |
+| Item | Status | Detail |
 |---|---|---|
-| `prctl` SET_NAME, GET_NAME | P | registre des noms |
-| `prctl` SET_PDEATHSIG | PA | stub qui renvoie 0 |
+| `prctl` SET_NAME, GET_NAME | P | name registry |
+| `prctl` SET_PDEATHSIG | PA | stub that returns 0 |
 | `prctl` NO_NEW_PRIVS, DUMPABLE | PA | stubs (`src/syscall.c:1857-1882`) |
-| `prctl` SET_MEM_MODEL | PA | EINVAL, voulu pour Rosetta |
-| `prctl` SECCOMP, PTRACER (Yama), CHILD_SUBREAPER, TIMERSLACK, SYSCALL_USER_DISPATCH, CAPBSET | A | ENOSYS (Linux renvoie EINVAL pour une option inconnue) |
-| `getrlimit`, `setrlimit`, `prlimit64` | PA | ressources 0 à 9 vers les limites macOS ; `pid` ignoré ; 10 à 15 (LOCKS, SIGPENDING, MSGQUEUE, NICE, RTPRIO, RTTIME) renvoient EINVAL (`syscall_sys.c`) |
-| `personality` | A dans HL | émulé par FEX lui-même (`Info.cpp:72`) en mode A |
-| `seccomp` (syscall) et `prctl(PR_SET_SECCOMP)` | A dans HL | émulés par le `SeccompEmulator` de FEX (`Info.cpp:93`, `Thread.cpp:485-492`) en mode A |
-| `io_uring_*` | A | FEX répond aussi « unimplemented safe » (`Passthrough.cpp:360-362`) |
+| `prctl` SET_MEM_MODEL | PA | EINVAL, intended for Rosetta |
+| `prctl` SECCOMP, PTRACER (Yama), CHILD_SUBREAPER, TIMERSLACK, SYSCALL_USER_DISPATCH, CAPBSET | A | ENOSYS (Linux returns EINVAL for an unknown option) |
+| `getrlimit`, `setrlimit`, `prlimit64` | PA | resources 0 to 9 to the macOS limits; `pid` ignored; 10 to 15 (LOCKS, SIGPENDING, MSGQUEUE, NICE, RTPRIO, RTTIME) return EINVAL (`syscall_sys.c`) |
+| `personality` | A in HL | emulated by FEX itself (`Info.cpp:72`) in mode A |
+| `seccomp` (syscall) and `prctl(PR_SET_SECCOMP)` | A in HL | emulated by FEX's `SeccompEmulator` (`Info.cpp:93`, `Thread.cpp:485-492`) in mode A |
+| `io_uring_*` | A | FEX also answers "unimplemented safe" (`Passthrough.cpp:360-362`) |
 | `pidfd_open`, `pidfd_send_signal`, `pidfd_getfd` | A | |
-| `process_vm_readv`, `process_vm_writev` | A | première option de Wine server et d'EAC |
+| `process_vm_readv`, `process_vm_writev` | A | first option of Wine server and of EAC |
 | `unshare`, `setns`, namespaces | A | |
 | `sched_setscheduler`, `sched_getscheduler`, `sched_getparam`, `sched_get_priority_*` | A | `sched_setaffinity` PA (stub 0), `sched_getaffinity` P |
-| `getcpu`, `times`, `capget`, `capset`, `setgroups`, `getsid` | A | `times` observé dans les journaux EAC |
+| `getcpu`, `times`, `capget`, `capset`, `setgroups`, `getsid` | A | `times` observed in the EAC logs |
 
 ### 4.6 futex
 
-| Opération | Statut |
+| Operation | Status |
 |---|---|
-| WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAKE_OP | P (locale au processus) |
-| WAIT_BITSET, WAKE_BITSET | PA (horloge absolue traitée en temps réel) |
-| LOCK_PI, UNLOCK_PI, TRYLOCK_PI | PA (pas d'héritage de priorité, pas d'OWNER_DIED) |
+| WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAKE_OP | P (process-local) |
+| WAIT_BITSET, WAKE_BITSET | PA (absolute clock treated as real time) |
+| LOCK_PI, UNLOCK_PI, TRYLOCK_PI | PA (no priority inheritance, no OWNER_DIED) |
 | WAIT_REQUEUE_PI, CMP_REQUEUE_PI, LOCK_PI2 | A |
-| `FUTEX_PRIVATE_FLAG` | PA (ignoré ; tout est privé) |
-| futex partagé entre processus | A |
-| `set_robust_list` | PA (stub) ; `get_robust_list` A |
+| `FUTEX_PRIVATE_FLAG` | PA (ignored; everything is private) |
+| futex shared between processes | A |
+| `set_robust_list` | PA (stub); `get_robust_list` A |
 | `futex_waitv`, `futex_wake`, `futex_wait`, `futex_requeue` (449, 454-456) | A |
 
-Primitive Darwin candidate pour le partagé : `os_sync_wait_on_address` avec le drapeau « shared » (le coéquipier la qualifie dans `g1_futex`, non exécuté à ce jour).
+Candidate Darwin primitive for the shared case: `os_sync_wait_on_address` with the "shared" flag (the teammate is qualifying it in `g1_futex`, not executed to date).
 
-### 4.7 Polling et objets de notification
+### 4.7 Polling and notification objects
 
-| Élément | Statut | Détail |
+| Item | Status | Detail |
 |---|---|---|
 | `ppoll`, `pselect6` | P | |
 | epoll IN, OUT, ERR, HUP, RDHUP, ET, ONESHOT | P | kqueue |
 | epoll PRI, EXCLUSIVE, WAKEUP, `epoll_pwait2` | A | |
-| eventfd (compteur, sémaphore, nonblock) | PA | local, 32 max, pas partageable |
-| timerfd | PA | kqueue, `ABSTIME` ignoré, 32 max, non héritable |
+| eventfd (counter, semaphore, nonblock) | PA | local, 32 max, not shareable |
+| timerfd | PA | kqueue, `ABSTIME` ignored, 32 max, not inheritable |
 | signalfd | PA | local, 16 max |
-| inotify | PA | kqueue vnode, 16 instances, pas de cookie de renommage, noms de répertoire parfois absents, pas de récursion (`src/syscall_inotify.c:1-20`) |
+| inotify | PA | kqueue vnode, 16 instances, no rename cookie, directory names sometimes missing, no recursion (`src/syscall_inotify.c:1-20`) |
 
 ### 4.8 Sockets
 
-| Élément | Statut | Détail |
+| Item | Status | Detail |
 |---|---|---|
-| AF_UNIX flux et datagramme, `socketpair` | P | `SCM_RIGHTS` avec traduction fd invité vers hôte et disposition `cmsghdr` (`src/syscall_net.c:1296-1352,1564-1600`) |
-| AF_UNIX abstrait | PA | chemin dérivé par hachage FNV plus verrou `flock` (`:60-200`) |
-| AF_INET, AF_INET6, TCP, UDP | P | numéros d'option traduits (`src/syscall_net.h:36-62`) |
-| DNS | PA | simples sockets UDP et TCP vers le serveur de `resolv.conf` du vfs ; aucune résolution émulée |
-| `SOCK_SEQPACKET` | PA | simulé en `socketpair` flux pour rosettad seulement (`:538-570`) |
+| AF_UNIX stream and datagram, `socketpair` | P | `SCM_RIGHTS` with guest to host fd translation and `cmsghdr` layout (`src/syscall_net.c:1296-1352,1564-1600`) |
+| abstract AF_UNIX | PA | path derived by FNV hash plus `flock` lock (`:60-200`) |
+| AF_INET, AF_INET6, TCP, UDP | P | option numbers translated (`src/syscall_net.h:36-62`) |
+| DNS | PA | plain UDP and TCP sockets to the server from the vfs `resolv.conf`; no emulated resolution |
+| `SOCK_SEQPACKET` | PA | simulated as a stream `socketpair` for rosettad only (`:538-570`) |
 | `SO_PEERCRED`, `SCM_CREDENTIALS`, `SO_PASSCRED` | A | |
-| AF_NETLINK, AF_PACKET | A | « best effort passthrough » (`:40-48`) : les numéros Linux 16 et 17 désignent `AF_APPLETALK` et `AF_ROUTE` dans le SDK de macOS (`sys/socket.h:383-384`), il n'existe pas d'`AF_NETLINK` ; `getifaddrs` de glibc passe par netlink |
-| options de socket | PA | 17 options `SOL_SOCKET`, 4 options TCP, 3 options IP et IPv6 traduites (`src/syscall_net.h:36-62`) |
+| AF_NETLINK, AF_PACKET | A | "best effort passthrough" (`:40-48`): the Linux numbers 16 and 17 designate `AF_APPLETALK` and `AF_ROUTE` in the macOS SDK (`sys/socket.h:383-384`), there is no `AF_NETLINK`; glibc's `getifaddrs` goes through netlink |
+| socket options | PA | 17 `SOL_SOCKET` options, 4 TCP options, 3 IP and IPv6 options translated (`src/syscall_net.h:36-62`) |
 
-### 4.9 Couverture des syscalls en passthrough de FEX
+### 4.9 Coverage of FEX's passthrough syscalls
 
-INFÉRÉ par comparaison de noms (script : noms de `Passthrough.cpp` contre les `SYS_*` de `src/syscall.c` et `.h`) : sur 241 noms de passthrough, 128 sont couverts, 113 non couverts. Non couverts, les plus pertinents pour Wine et EAC : `capget`, `capset`, `futex_waitv`, `futex_wait`, `futex_wake`, `futex_requeue`, `get_robust_list`, `getcpu`, `getsid`, `mlock2`, `mlockall`, `pidfd_getfd`, `pidfd_open`, `pidfd_send_signal`, `process_vm_readv`, `process_vm_writev`, `rt_sigqueueinfo`, `sched_get_priority_max`, `sched_get_priority_min`, `sched_getparam`, `sched_getscheduler`, `sched_setscheduler`, `sched_rr_get_interval`, `setgroups`, `settimeofday`, `clock_settime`, `times`, `timer_create`, `timer_settime`, `timer_gettime`, `timer_delete`, `unshare`, `setns`, `msgget`, `msgsnd`, `msgrcv`, `msgctl`, `semget`, `semop`, `semtimedop`, `io_setup`, `io_submit`, `io_getevents`, `ioprio_set`, `ioprio_get`, `syncfs`, `sync_file_range`, `readahead`, `fanotify_init`. La liste complète est dans mon historique de commande ; le total dépend de la normalisation des noms (par exemple `fadvise64`).
+INFERRED by name comparison (script: names from `Passthrough.cpp` against the `SYS_*` of `src/syscall.c` and `.h`): out of 241 passthrough names, 128 are covered, 113 not covered. Not covered, the most relevant for Wine and EAC: `capget`, `capset`, `futex_waitv`, `futex_wait`, `futex_wake`, `futex_requeue`, `get_robust_list`, `getcpu`, `getsid`, `mlock2`, `mlockall`, `pidfd_getfd`, `pidfd_open`, `pidfd_send_signal`, `process_vm_readv`, `process_vm_writev`, `rt_sigqueueinfo`, `sched_get_priority_max`, `sched_get_priority_min`, `sched_getparam`, `sched_getscheduler`, `sched_setscheduler`, `sched_rr_get_interval`, `setgroups`, `settimeofday`, `clock_settime`, `times`, `timer_create`, `timer_settime`, `timer_gettime`, `timer_delete`, `unshare`, `setns`, `msgget`, `msgsnd`, `msgrcv`, `msgctl`, `semget`, `semop`, `semtimedop`, `io_setup`, `io_submit`, `io_getevents`, `ioprio_set`, `ioprio_get`, `syncfs`, `sync_file_range`, `readahead`, `fanotify_init`. The full list is in my command history; the total depends on name normalization (for example `fadvise64`).
 
-## 5. Infrastructure de test
+## 5. Test infrastructure
 
-### 5.1 Compiler
+### 5.1 Compile
 
-- Ce que fait le Makefile de HL : `HL_SRCS` (39 sources), CFLAGS `-O2 -std=c11 -Werror=vla -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wformat=2 -Wimplicit-fallthrough -Wundef -Wnull-dereference -Wno-unused-parameter` (`Makefile:74-77`), shim assemblé par `as -arch arm64` puis extrait en `shim_blob.h`, signature avec `entitlements.plist` (`Makefile:30,169`). Les tests invités demandent une chaîne `aarch64-unknown-linux-musl-` ou des binaires prébuilts (`GUEST_TEST_BINARIES`) fournis par `nix develop` ; `nix` n'est pas installé ici (`probes/ptrace-remote-setregset-runtime-20261001/README.md:29-30`).
-- Compilation seule dans la copie de travail, sans exécution : `bash EXP/tools/build-hl-scratch.sh`. MESURÉ : 39 objets, 0 échec, 0 avertissement, 0 erreur, lien réussi, 2,9 s (`logs/hl-compile.log` vide). Le binaire `_build/hl` n'est pas signé avec l'entitlement HVF et n'a pas été lancé.
+- What HL's Makefile does: `HL_SRCS` (39 sources), CFLAGS `-O2 -std=c11 -Werror=vla -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wformat=2 -Wimplicit-fallthrough -Wundef -Wnull-dereference -Wno-unused-parameter` (`Makefile:74-77`), shim assembled by `as -arch arm64` then extracted into `shim_blob.h`, signing with `entitlements.plist` (`Makefile:30,169`). The guest tests require an `aarch64-unknown-linux-musl-` toolchain or prebuilt binaries (`GUEST_TEST_BINARIES`) provided by `nix develop`; `nix` is not installed here (`probes/ptrace-remote-setregset-runtime-20261001/README.md:29-30`).
+- Compilation only in the working copy, without execution: `bash EXP/tools/build-hl-scratch.sh`. MEASURED: 39 objects, 0 failures, 0 warnings, 0 errors, link successful, 2.9 s (`logs/hl-compile.log` empty). The binary `_build/hl` is not signed with the HVF entitlement and was not launched.
 
-### 5.2 Tests purs hôte (sans HVF)
+### 5.2 Pure host tests (without HVF)
 
-Lancer : `bash EXP/tools/build-run-host-tests.sh` (2,7 s). MESURÉ, rejoué dans cette session (`logs/host-run-all-rerun.log`) :
+Run: `bash EXP/tools/build-run-host-tests.sh` (2.7 s). MEASURED, replayed in this session (`logs/host-run-all-rerun.log`):
 
-| Programme | Résultat | Lien avec la couche processus |
+| Program | Result | Link with the process layer |
 |---|---|---|
-| test-fd-object-lite | PASS, 13 lignes OK | objets fd |
-| test-vfs-unit | PASS, 16 lignes OK | vfs (coéquipier) |
-| test-app-open | PASS | sans rapport |
-| test-oss-abi | PASS | sans rapport |
-| test-fd-digest | PASS, 9 | sans rapport |
-| test-aot-format | PASS, 7 | Rosetta, sans rapport |
-| test-thread-vcpu-lifetime | PASS, 7, avec `scratch-hl/stub-trace.c` | `thread.c`, interruption et destruction de vCPU |
-| test-page-table-pool | PASS, 7 | mémoire (coéquipier) |
-| proc-ptrace-host (source `probes/proc-ptrace-host.c`, compilé par moi dans `EXP/scratch-hl/probe-bin`) | 79 PASS, 0 FAIL (`logs/host-test-proc-ptrace-host.log`) | `proc_ptrace.c` complet : 23 contrôles de base, options, syscalls, registres, arrêts concurrents |
-| kq_fork_scm (écrit par moi, `EXP/scratch-hl/probe-src/kq_fork_scm.c`) | voir 1.4 (`logs/host-test-kq-fork-scm.log`) | kqueue, fork, `SCM_RIGHTS` |
+| test-fd-object-lite | PASS, 13 OK lines | fd objects |
+| test-vfs-unit | PASS, 16 OK lines | vfs (teammate) |
+| test-app-open | PASS | unrelated |
+| test-oss-abi | PASS | unrelated |
+| test-fd-digest | PASS, 9 | unrelated |
+| test-aot-format | PASS, 7 | Rosetta, unrelated |
+| test-thread-vcpu-lifetime | PASS, 7, with `scratch-hl/stub-trace.c` | `thread.c`, interruption and destruction of vCPUs |
+| test-page-table-pool | PASS, 7 | memory (teammate) |
+| proc-ptrace-host (source `probes/proc-ptrace-host.c`, compiled by me in `EXP/scratch-hl/probe-bin`) | 79 PASS, 0 FAIL (`logs/host-test-proc-ptrace-host.log`) | full `proc_ptrace.c`: 23 checks of basics, options, syscalls, registers, concurrent stops |
+| kq_fork_scm (written by me, `EXP/scratch-hl/probe-src/kq_fork_scm.c`) | see 1.4 (`logs/host-test-kq-fork-scm.log`) | kqueue, fork, `SCM_RIGHTS` |
 
-Échec connu : avec le Makefile tel quel, `test-thread-vcpu-lifetime` ne se lie pas (`_proc_trace_tracer_exit` indéfini ; `thread.c:248` appelle `proc_trace_tracer_exit`, que la recette `test-host-units` ne lie pas, `Makefile:409`), voir `logs/host-build-test-thread-vcpu-lifetime-asis.log`. Le contournement est un stub dans le seul répertoire de travail. Non exécutés : les quatre tests audio (CoreAudio) et `test-diagnostics.sh` (demande un invité).
+Known failure: with the Makefile as is, `test-thread-vcpu-lifetime` does not link (`_proc_trace_tracer_exit` undefined; `thread.c:248` calls `proc_trace_tracer_exit`, which the `test-host-units` recipe does not link, `Makefile:409`), see `logs/host-build-test-thread-vcpu-lifetime-asis.log`. The workaround is a stub in the working directory only. Not executed: the four audio tests (CoreAudio) and `test-diagnostics.sh` (requires a guest).
 
-Les tests `test/test-*.c` (69 programmes, plus 6 `helper-*.c` et 15 scripts) sont des programmes invités : ils demandent `hl` signé et HVF, donc ils ne se lancent pas ici. Pour une couche FEX : 77 binaires x86-64 statiques musl sont déjà compilés dans `test-binaries/amd64/bin` (liste complète : `ls`), dont les tests de processus `test-fork`, `test-cow-fork`, `test-fork-exec`, `test-exec`, `test-pthread`, `test-thread`, `test-futex-pi`, `test-signal`, `test-signal-thread`, `test-signalfd`, `test-timerfd`, `test-eventfd`, `test-epoll`, `test-poll`, `test-poll-ready`, `test-poll-wakeup`, `test-socket`, `test-net`, `test-inotify`, `test-tgkill-target`, `test-sigpipe-survival`, `test-sigill`, `test-stress`. La matrice de référence (43 programmes choisis par architecture, `test-binaries/TEST-REPORT.md`) est pilotée par `run-unit-matrix.sh` et `bounded-hl.py` (15 s par invité, groupe de processus propre) ; remplacer l'argument `HL` par un exécutable `fexdarwin` suffit. Politique d'échecs attendus : `test/matrix-xfails.sh` (`test-signal` et `test-signal-thread` échouent sous Rosetta à cause de `SA_RESETHAND` ; ne s'appliquera pas à FEX).
+The tests `test/test-*.c` (69 programs, plus 6 `helper-*.c` and 15 scripts) are guest programs: they require a signed `hl` and HVF, so they do not run here. For a FEX layer: 77 static musl x86-64 binaries are already compiled in `test-binaries/amd64/bin` (full list: `ls`), including the process tests `test-fork`, `test-cow-fork`, `test-fork-exec`, `test-exec`, `test-pthread`, `test-thread`, `test-futex-pi`, `test-signal`, `test-signal-thread`, `test-signalfd`, `test-timerfd`, `test-eventfd`, `test-epoll`, `test-poll`, `test-poll-ready`, `test-poll-wakeup`, `test-socket`, `test-net`, `test-inotify`, `test-tgkill-target`, `test-sigpipe-survival`, `test-sigill`, `test-stress`. The reference matrix (43 programs chosen per architecture, `test-binaries/TEST-REPORT.md`) is driven by `run-unit-matrix.sh` and `bounded-hl.py` (15 s per guest, own process group); replacing the `HL` argument with a `fexdarwin` executable is enough. Expected-failure policy: `test/matrix-xfails.sh` (`test-signal` and `test-signal-thread` fail under Rosetta because of `SA_RESETHAND`; will not apply to FEX).
 
 ### 5.3 Oracles
 
-Aucun oracle Linux n'est exécutable ici sans VM. Oracles enregistrés réutilisables hors ligne : références Linux ARM64 et x64 sous OrbStack (`probes/ptrace-lifecycle/results`, 7/7, 13/13, 9/9, 40/40, 24/24 selon la fixture), références x86 natives sous QEMU TCG (`probes/ptrace-x86-full-context-control-20260929`, 272/272 ; `probes/ptrace-setregset-control-20261001/qemu-*`, 76/76 en cinq modes). Les sources des fixtures sont dans `probes/ptrace-*/`. Compilation locale d'invités x86-64 : ni `zig`, ni `x86_64-linux-gnu-gcc`, ni `ld.lld` ne sont dans le `PATH` (mesuré par `which`) et l'éditeur de liens d'Apple ne produit pas d'ELF, mais le venv partagé contient `ziglang 0.16.0` (`EXP/tools/venv`, lecture seule de ma part). MESURÉ : `"$PY" -m ziglang cc -target x86_64-linux-musl -static -O2 -I<hyper-linux/test> <test>.c -o <sortie> -lpthread` produit un ELF x86-64 statique pour 5 programmes sur 5 essayés (`test-fork`, `test-pthread`, `test-futex-pi`, `test-signal-thread`, `test-epoll`), sortie dans `EXP/scratch-hl/guest-x86_64/`, journaux `logs/host-build-guest-*.log`, sans Docker. Aucun de ces binaires n'a été exécuté (pas de runtime). Les 77 binaires prébuilts (conteneur Debian, `test-binaries/build-guests.sh`) restent la référence de comparaison avec la matrice existante. Les journaux d'oracle restent utilisables comme valeurs attendues.
+No Linux oracle can be executed here without a VM. Recorded oracles reusable offline: Linux ARM64 and x64 references under OrbStack (`probes/ptrace-lifecycle/results`, 7/7, 13/13, 9/9, 40/40, 24/24 depending on the fixture), native x86 references under QEMU TCG (`probes/ptrace-x86-full-context-control-20260929`, 272/272; `probes/ptrace-setregset-control-20261001/qemu-*`, 76/76 in five modes). The fixture sources are in `probes/ptrace-*/`. Local compilation of x86-64 guests: neither `zig`, nor `x86_64-linux-gnu-gcc`, nor `ld.lld` are in the `PATH` (measured by `which`) and Apple's linker does not produce ELF, but the shared venv contains `ziglang 0.16.0` (`EXP/tools/venv`, read-only on my part). MEASURED: `"$PY" -m ziglang cc -target x86_64-linux-musl -static -O2 -I<hyper-linux/test> <test>.c -o <output> -lpthread` produces a static x86-64 ELF for 5 programs out of 5 tried (`test-fork`, `test-pthread`, `test-futex-pi`, `test-signal-thread`, `test-epoll`), output in `EXP/scratch-hl/guest-x86_64/`, logs `logs/host-build-guest-*.log`, without Docker. None of these binaries was executed (no runtime). The 77 prebuilt binaries (Debian container, `test-binaries/build-guests.sh`) remain the comparison reference with the existing matrix. The oracle logs remain usable as expected values.
 
-## 6. Estimation en lignes de code et cinq risques
+## 6. Estimate in lines of code and five risks
 
-### 6.1 Lignes
+### 6.1 Lines
 
-INFÉRÉ, plus ou moins 30 %, calculé depuis les plages de lignes de la section 2 et la lecture des fichiers.
+INFERRED, to within about 30%, computed from the line ranges of section 2 and the reading of the files.
 
-| Poste | Lignes |
+| Item | Lines |
 |---|---|
-| À garder ou adapter mécaniquement (A) | 9 500 |
-| À réécrire sur le même principe (R) | 2 300 |
-| À abandonner (D) | 6 700 |
-| Neuf : colle fork, clone, exec sur FEX (fork natif, threads, ré-exécution hôte, émulation de vfork, réinitialisation du registre dans l'enfant) | 900 à 1 300 |
-| Neuf : signaux (boîte aux lettres inter-processus, SIGCHLD, `sigsuspend` bloquant, `rt_sigtimedwait`, `rt_sigqueueinfo`, pont de cadre x86) | 1 100 à 1 600 |
-| Neuf : wait et statut (registre des statuts de sortie Linux, `WIFSIGNALED`, groupes et sessions minimaux) | 400 à 700 |
-| Neuf : ptrace x86 (GETREGS/SETREGS/REGSET prstatus, fpregs, xstate, PEEK/POKE/USER, agent coopératif, invalidation, SINGLESTEP, KILL, ATTACH/SEIZE/INTERRUPT, événements CLONE/FORK/EXIT) | 2 200 à 3 200 |
-| Neuf : futex partagé, robust list, waitv, horloges | 500 à 900 |
-| Neuf : objets spéciaux partageables et sûrs au fork | 300 à 500 |
-| Neuf : syscalls manquants (sched_*, getcpu, times, capget, process_vm_*, pidfd_*, personality) | 600 à 1 000 |
-| Neuf : tests hôte des modules neufs | 1 200 à 2 000 |
-| Total neuf | 7 200 à 11 200 |
+| To keep or adapt mechanically (A) | 9,500 |
+| To rewrite on the same principle (R) | 2,300 |
+| To drop (D) | 6,700 |
+| New: fork, clone, exec glue on FEX (native fork, threads, host re-execution, vfork emulation, registry reset in the child) | 900 to 1,300 |
+| New: signals (cross-process mailbox, SIGCHLD, blocking `sigsuspend`, `rt_sigtimedwait`, `rt_sigqueueinfo`, x86 frame bridge) | 1,100 to 1,600 |
+| New: wait and status (registry of Linux exit statuses, `WIFSIGNALED`, minimal groups and sessions) | 400 to 700 |
+| New: x86 ptrace (GETREGS/SETREGS/REGSET prstatus, fpregs, xstate, PEEK/POKE/USER, cooperative agent, invalidation, SINGLESTEP, KILL, ATTACH/SEIZE/INTERRUPT, CLONE/FORK/EXIT events) | 2,200 to 3,200 |
+| New: shared futex, robust list, waitv, clocks | 500 to 900 |
+| New: special objects shareable and fork-safe | 300 to 500 |
+| New: missing syscalls (sched_*, getcpu, times, capget, process_vm_*, pidfd_*, personality) | 600 to 1,000 |
+| New: host tests of the new modules | 1,200 to 2,000 |
+| Total new | 7,200 to 11,200 |
 
-Ces chiffres supposent le mode A (section 3.1) et ne comptent pas le portage de la couche Linux de FEX sur Darwin (clone, signaux hôte, allocateur), qui relève du rapport FEXCore.
+These figures assume mode A (section 3.1) and do not count the port of FEX's Linux layer to Darwin (clone, host signals, allocator), which belongs to the FEXCore report.
 
-### 6.2 Les cinq risques les plus lourds
+### 6.2 The five heaviest risks
 
-1. ptrace x86 coopératif entre deux processus, avec cohérence du cache de traduction (EAC). Le seul risque qui dépend d'une relation ptrace noyau : EAC appelle le ptrace du monde invité, et macOS n'offre pas de relation équivalente (le `ptrace(2)` de Darwin ne voit que l'état arm64 hôte, et `task_for_pid` demande une autorisation que la consigne interdit de déclencher). Il faut donc l'émulation décrite en 6.3. Points durs : reconstruire un contexte x86 exact à des arrêts qui se trouvent dans du code JIT ou dans un gestionnaire (`ReconstructCompactedEFLAGS`, `RestoreRIPFromHostPC` dans `Context.h`) ; la sémantique x86 de RCX, R11 et `orig_rax` aux arrêts syscall (mesurée sur Rosetta : `probes/ptrace-x86-feasibility-20260929.md:13,47-51`) ; l'invalidation du cache de traduction du tracee après un POKE (échec constaté avec Rosetta : traduction périmée après restauration de l'octet, 74/76, `probes/ptrace-remote-setregset-runtime-20261001/README.md:32-44`) ; l'accès mémoire du tracee depuis un autre processus.
-2. Livraison asynchrone des signaux invités sur Darwin. Pas de signaux temps réel, pas de `tgkill`, pas de `rt_sigqueueinfo`, un seul signal hôte réservé disponible pour interrompre du code JIT à un point exact. Wine server suspend, interrompt et termine des threads avec SIGUSR1 inter-processus, glibc utilise des signaux temps réel pour l'annulation et `setxid`. Il faut des files logicielles, une boîte aux lettres inter-processus, et des attentes (`futex`, `poll`, `read`, `accept`, `wait4`) toutes interruptibles avec la bonne sémantique d'EINTR et de redémarrage. Ne dépend pas d'un ptrace noyau.
-3. Synchronisation partagée entre processus : futex sur sections partagées, eventfd d'esync, wait et SIGCHLD. HL n'a rien de partagé (futex, compteurs d'eventfd, tables d'enfants). Candidat : `os_sync_wait_on_address` en mode partagé, à qualifier. Ne dépend pas d'un ptrace noyau.
-4. fork, exec et vfork sur un processus qui contient un JIT vivant. Verrous détenus par des threads absents (MESURÉ par le coéquipier : mutex, `os_unfair_lock` et stdio restent verrouillés dans l'enfant et bloquent un petit-enfant, `evidence/darwin-process/f1_fork_mt.log`), kqueue non hérités (MESURÉ ici), registre familial à faire survivre à un exec hôte, sémantique de `CLONE_VM|CLONE_VFORK` qu'un fork ne reproduit pas (l'erreur d'exec que glibc renvoie au parent par la pile partagée ne lui parviendrait jamais ; FEX a la même limite, `Syscalls/Thread.cpp:293-294`). Ne dépend pas d'un ptrace noyau.
-5. Fidélité de Linux dans polling et sockets, et limites dures. kqueue au lieu d'epoll (EXCLUSIVE, PRI), `epoll_event` packé, AF_NETLINK absent, `SO_PEERCRED` absent, 64 threads, 1024 fd, objets spéciaux limités à 16 ou 32, `SIGCHLD` absent. Chacun est petit, la somme décide si Wine démarre. Ne dépend pas d'un ptrace noyau.
+1. Cooperative x86 ptrace between two processes, with translation cache coherence (EAC). The only risk that depends on a kernel ptrace relation: EAC calls the ptrace of the guest world, and macOS offers no equivalent relation (Darwin's `ptrace(2)` sees only the host arm64 state, and `task_for_pid` requires an authorization that the instructions forbid triggering). The emulation described in 6.3 is therefore needed. Hard points: rebuilding an exact x86 context at stops that are in JIT code or in a handler (`ReconstructCompactedEFLAGS`, `RestoreRIPFromHostPC` in `Context.h`); the x86 semantics of RCX, R11 and `orig_rax` at syscall stops (measured on Rosetta: `probes/ptrace-x86-feasibility-20260929.md:13,47-51`); the invalidation of the tracee's translation cache after a POKE (failure seen with Rosetta: stale translation after the byte was restored, 74/76, `probes/ptrace-remote-setregset-runtime-20261001/README.md:32-44`); access to the tracee's memory from another process.
+2. Asynchronous delivery of guest signals on Darwin. No real-time signals, no `tgkill`, no `rt_sigqueueinfo`, a single reserved host signal available to interrupt JIT code at an exact point. Wine server suspends, interrupts and terminates threads with cross-process SIGUSR1, glibc uses real-time signals for cancellation and `setxid`. Software queues are needed, a cross-process mailbox, and waits (`futex`, `poll`, `read`, `accept`, `wait4`) all interruptible with the right EINTR and restart semantics. Does not depend on a kernel ptrace.
+3. Synchronization shared between processes: futex on shared sections, esync eventfds, wait and SIGCHLD. HL has nothing shared (futex, eventfd counters, child tables). Candidate: `os_sync_wait_on_address` in shared mode, to qualify. Does not depend on a kernel ptrace.
+4. fork, exec and vfork on a process that contains a live JIT. Locks held by absent threads (MEASURED by the teammate: mutex, `os_unfair_lock` and stdio stay locked in the child and block a grandchild, `evidence/darwin-process/f1_fork_mt.log`), kqueues not inherited (MEASURED here), family registry to keep alive across a host exec, semantics of `CLONE_VM|CLONE_VFORK` that a fork does not reproduce (the exec error that glibc returns to the parent through the shared stack would never reach it; FEX has the same limit, `Syscalls/Thread.cpp:293-294`). Does not depend on a kernel ptrace.
+5. Linux fidelity in polling and sockets, and hard limits. kqueue instead of epoll (EXCLUSIVE, PRI), packed `epoll_event`, AF_NETLINK missing, `SO_PEERCRED` missing, 64 threads, 1024 fds, special objects limited to 16 or 32, `SIGCHLD` missing. Each one is small, the sum decides whether Wine starts. Does not depend on a kernel ptrace.
 
-### 6.3 Émulation en espace utilisateur de la relation traceur/tracee entre deux processus du runtime
+### 6.3 User-space emulation of the tracer/tracee relation between two processes of the runtime
 
-Principe repris de HL (déjà testé hôte : 79/79) et adapté à FEX.
+Principle taken from HL (already tested on the host: 79/79) and adapted to FEX.
 
-1. À la création d'un enfant par `fork`, le parent crée un fichier d'état non lié, de taille fixe, mappé `MAP_SHARED`, et une paire de sockets Unix. L'enfant en hérite, personne d'autre (`proc_trace_create`, `proc_trace_import`). Un registre familial par TID (comme `proc_names.c`) permet à un tiers de retrouver une relation ; il faudra l'étendre pour ATTACH et SEIZE d'un non-enfant (nouveau : rendez-vous par socket nommé dans un répertoire de famille).
-2. Exclusion mutuelle : verrou d'octet `fcntl` plus mutex local. Il se libère à la mort du propriétaire ; MESURÉ par le test hôte.
-3. TRACEME, SETOPTIONS, CONT, DETACH, SYSCALL, GETEVENTMSG sont des écritures dans ce fichier. Le traceur ne touche jamais au tracee directement.
-4. Arrêt : le tracee atteint un point sûr de FEX (retour de `HandleSyscall` entrée ou sortie, livraison d'un signal par le `SignalDelegator`, faute SIGTRAP d'un `int3`, fin d'exec). Il reconstruit son contexte x86 depuis `CpuStateFrame` et, aux points asynchrones, depuis le contexte hôte du gestionnaire de signal. Il publie dans le fichier : numéro de séquence d'arrêt, type, signal, `user_regs_struct` (27 mots), et au besoin les fpregs. Il notifie le socket puis attend la reprise (`poll`), sans verrou tenu.
-5. Le traceur attend par wait4 ou waitid : le statut `(événement << 16) | (signal << 8) | 0x7f` est reconstruit depuis la séquence (`proc_trace_wait`).
-6. GETREGSET, GETREGS, GETFPREGS sont des lectures du fichier. SETREGSET, SETREGS, POKEUSER sont des commandes : le traceur écrit la commande dans le fichier avec la séquence d'arrêt visée et notifie ; le tracee, ou un thread auxiliaire du même processus, exécute et publie le résultat, comme le candidat SETREGSET de HL qui vérifie la séquence pour rejeter les écritures périmées.
-7. PEEK et POKE : le tracee (ou son thread auxiliaire) fait la lecture ou l'écriture dans son espace d'adressage, avec `vm_protect` temporaire pour une page RX, puis appelle l'invalidation de code du moteur (FEX : `InvalidateGuestCodeRange` / `InvalidateThreadCachedCodeRange` de `Context.h`) avant de répondre. Ce choix évite à la fois `task_for_pid` et l'incohérence du cache. Alternative à qualifier par le coéquipier (série H) : obtenir le port de tâche du tracee par un message Mach envoyé par le tracee lui-même, sans autorisation `task_for_pid`.
-8. Mort d'un pair : EOF du socket (`peer_closed`), détachement avec signal supprimé, comme sur Linux (références `probes/ptrace-lifecycle`).
+1. When a child is created by `fork`, the parent creates an unlinked fixed-size state file, mapped `MAP_SHARED`, and a pair of Unix sockets. The child inherits them, nobody else (`proc_trace_create`, `proc_trace_import`). A family registry by TID (like `proc_names.c`) lets a third party find a relation; it will have to be extended for ATTACH and SEIZE of a non-child (new: rendezvous through a named socket in a family directory).
+2. Mutual exclusion: `fcntl` byte lock plus local mutex. It is released at the death of the owner; MEASURED by the host test.
+3. TRACEME, SETOPTIONS, CONT, DETACH, SYSCALL, GETEVENTMSG are writes into this file. The tracer never touches the tracee directly.
+4. Stop: the tracee reaches a FEX safe point (return of `HandleSyscall` entry or exit, delivery of a signal by the `SignalDelegator`, SIGTRAP fault of an `int3`, end of exec). It rebuilds its x86 context from `CpuStateFrame` and, at asynchronous points, from the host context of the signal handler. It publishes in the file: stop sequence number, type, signal, `user_regs_struct` (27 words), and the fpregs if needed. It notifies the socket then waits for resumption (`poll`), without holding a lock.
+5. The tracer waits through wait4 or waitid: the status `(event << 16) | (signal << 8) | 0x7f` is rebuilt from the sequence (`proc_trace_wait`).
+6. GETREGSET, GETREGS, GETFPREGS are reads of the file. SETREGSET, SETREGS, POKEUSER are commands: the tracer writes the command into the file with the targeted stop sequence and notifies; the tracee, or a helper thread of the same process, executes and publishes the result, like HL's SETREGSET candidate which checks the sequence to reject stale writes.
+7. PEEK and POKE: the tracee (or its helper thread) does the read or write in its address space, with a temporary `vm_protect` for an RX page, then calls the engine's code invalidation (FEX: `InvalidateGuestCodeRange` / `InvalidateThreadCachedCodeRange` from `Context.h`) before answering. This choice avoids both `task_for_pid` and cache incoherence. Alternative to qualify by the teammate (series H): obtain the tracee's task port through a Mach message sent by the tracee itself, without `task_for_pid` authorization.
+8. Death of a peer: EOF of the socket (`peer_closed`), detach with signal suppressed, as on Linux (references `probes/ptrace-lifecycle`).
 
-Ce que ce schéma ne donne pas gratuitement : l'arrêt d'un thread qui s'exécute (PTRACE_INTERRUPT, SIGSTOP envoyé par le traceur) demande le « kick » du risque 2 ; l'arrêt de groupe ; le reparentage.
+What this scheme does not give for free: stopping a running thread (PTRACE_INTERRUPT, SIGSTOP sent by the tracer) requires the "kick" of risk 2; group stop; reparenting.
 
-## 7. Pourquoi les correctifs privés existent
+## 7. Why the private fixes exist
 
-LU (diff, commentaires des hunks, `STATUS.md`, `probes/ptrace-*.md`). Lignes changées = insertions plus suppressions de `git diff --stat`.
+READ (diff, hunk comments, `STATUS.md`, `probes/ptrace-*.md`). Lines changed = insertions plus deletions from `git diff --stat`.
 
-| Sous-système | Fichiers (lignes changées) | Pourquoi |
+| Subsystem | Files (lines changed) | Why |
 |---|---|---|
-| Threads | `thread.c/h` (392 plus 47) | Interrompre les E/S hôte bloquantes par un signal privé pour que `tgkill` ne soit pas perdu (`src/thread.c:47-140`) ; pile EL1 relogée (le shim passe en haut de la mémoire pour laisser la zone basse à Wine) ; arrêt ptrace avec siginfo, points de surveillance, FP, interruption explicite ; sémantique `WNOWAIT` et `waitid` ; nettoyage du traceur et des noms à la sortie |
-| Processus | `syscall_proc.c/h` (991 plus 31) | Allocateur de PID familial, registre des noms, `wait4` et `waitid` réécrits (arrêts, continuation, `WNOWAIT`, redémarrage `SA_RESTART`, minuterie pendant l'attente), `sys_ptrace` distant, capture de registres avec provenance (`proc_regset_capture_context`) |
-| Signaux | `syscall_signal.c/h` (444 plus 16) | Signaux dirigés par thread, `siginfo` complet, redémarrage `SA_RESTART` par arguments sauvegardés, arrêt ptrace avant la disposition, sémantique de fork (en attente effacés), SIGCHLD d'arrêt ptrace |
-| Dispatch | `syscall.c/h` (608 plus 21) | Points d'arrêt ptrace ENTRY et EXIT (`syscall_trace_boundary`), liste des appels redémarrables, `tkill`/`tgkill` avec `SI_TKILL` (glibc `setxid`, musl annulation), `rt_tgsigqueueinfo` (Rosetta renvoie ses fautes), plus la mémoire (coéquipier) |
-| Fork | `fork_ipc.c` (457) | IPC version 18 : liens ptrace avec ACK, allocateur de PID, noms, états reopen, reconstruction d'epoll, vues de fichiers, SHM, vDSO |
-| Exec | `syscall_exec.c` (70) | Shebang avec argv intact, résolution VFS, vDSO mappé, événement TRACEEXEC |
-| Réseau | `syscall_net.c` (123) | Tampons invités dispersés sur plusieurs mappings hôtes, introduits par les vues de fichiers partagées |
-| Nouveaux modules | `proc_ptrace.c/h`, `proc_names.c/h`, `signal_notify.h`, `fault_dump.c/h` | Besoins EAC : `/proc/<pid>` d'un autre processus, relation ptrace entre processus, notification SIGCHLD d'arrêt, diagnostic de faute |
-| Démarrage | `hl.c` (60), `shim.S` (22), `guest.c` (562), `vdso.c`, `stack.c` | Shim déplacé en haut de la mémoire invitée pour que Wine puisse mapper la zone basse (« Wine's DOS area », commentaire de `src/vdso.c:279`), vDSO mappé explicitement |
-| GDB | `gdb_stub.c/h` (7) | `gdb_stub_owns_debug_regs` : GDB possède les registres de debug, ptrace n'y touche pas |
+| Threads | `thread.c/h` (392 plus 47) | Interrupt blocking host I/O with a private signal so that `tgkill` is not lost (`src/thread.c:47-140`); EL1 stack relocated (the shim moves to the top of memory to leave the low area to Wine); ptrace stop with siginfo, watchpoints, FP, explicit interruption; `WNOWAIT` and `waitid` semantics; cleanup of the tracer and names at exit |
+| Processes | `syscall_proc.c/h` (991 plus 31) | Family PID allocator, name registry, `wait4` and `waitid` rewritten (stops, continuation, `WNOWAIT`, `SA_RESTART` restart, timer during the wait), remote `sys_ptrace`, register capture with provenance (`proc_regset_capture_context`) |
+| Signals | `syscall_signal.c/h` (444 plus 16) | Per-thread directed signals, full `siginfo`, `SA_RESTART` restart through saved arguments, ptrace stop before the disposition, fork semantics (pending cleared), ptrace stop SIGCHLD |
+| Dispatch | `syscall.c/h` (608 plus 21) | ptrace ENTRY and EXIT stop points (`syscall_trace_boundary`), list of restartable calls, `tkill`/`tgkill` with `SI_TKILL` (glibc `setxid`, musl cancellation), `rt_tgsigqueueinfo` (Rosetta sends back its faults), plus memory (teammate) |
+| Fork | `fork_ipc.c` (457) | IPC version 18: ptrace links with ACK, PID allocator, names, reopen states, epoll rebuild, file views, SHM, vDSO |
+| Exec | `syscall_exec.c` (70) | Shebang with intact argv, VFS resolution, vDSO mapped, TRACEEXEC event |
+| Network | `syscall_net.c` (123) | Guest buffers scattered over several host mappings, introduced by the shared file views |
+| New modules | `proc_ptrace.c/h`, `proc_names.c/h`, `signal_notify.h`, `fault_dump.c/h` | EAC needs: `/proc/<pid>` of another process, ptrace relation between processes, stop SIGCHLD notification, fault diagnostic |
+| Startup | `hl.c` (60), `shim.S` (22), `guest.c` (562), `vdso.c`, `stack.c` | Shim moved to the top of guest memory so that Wine can map the low area ("Wine's DOS area", comment in `src/vdso.c:279`), vDSO mapped explicitly |
+| GDB | `gdb_stub.c/h` (7) | `gdb_stub_owns_debug_regs`: GDB owns the debug registers, ptrace does not touch them |
 
-## 8. Constats annexes
+## 8. Side findings
 
-- `SYS_fgetxattr` vaut 16 et `SYS_fremovexattr` 18 dans `src/syscall.h:166,169` ; les numéros arm64 sont 10 et 16 (`Arm64/SyscallsEnum.h:22,28` dans FEX). Effet : l'appel 10 n'est pas implémenté (304 événements dans les journaux EAC) et l'appel 16 (fremovexattr) serait traité comme fgetxattr. Le dispatch utilise ces constantes (`src/syscall.c:2328-2339`).
-- La recette `test-host-units` du Makefile ne lie pas `test-thread-vcpu-lifetime` sur la copie de travail (5.2).
-- `CLAUDE.md` de HL est en retard sur le code : il décrit `sys_ptrace` comme limité à Rosetta et les futex PI comme non implémentés, alors que `futex.c` les implémente et que `proc_ptrace.c` existe.
-- `FUTEX_WAIT_BITSET` traite toujours l'horloge comme temps réel (1.8).
-- `fork` ne propage pas `CLONE_CHILD_SETTID` (1.3).
+- `SYS_fgetxattr` is 16 and `SYS_fremovexattr` 18 in `src/syscall.h:166,169`; the arm64 numbers are 10 and 16 (`Arm64/SyscallsEnum.h:22,28` in FEX). Effect: call 10 is not implemented (304 events in the EAC logs) and call 16 (fremovexattr) would be handled as fgetxattr. The dispatch uses these constants (`src/syscall.c:2328-2339`).
+- The Makefile's `test-host-units` recipe does not link `test-thread-vcpu-lifetime` on the working copy (5.2).
+- HL's `CLAUDE.md` lags behind the code: it describes `sys_ptrace` as limited to Rosetta and PI futexes as not implemented, whereas `futex.c` implements them and `proc_ptrace.c` exists.
+- `FUTEX_WAIT_BITSET` always treats the clock as real time (1.8).
+- `fork` does not propagate `CLONE_CHILD_SETTID` (1.3).
 
-## 9. Inconnues et mesures non faites
+## 9. Unknowns and measurements not done
 
-- Aucune exécution d'invité : tous les comportements de HL cités viennent du code, de journaux existants ou de tests hôte. Les points INFÉRÉS (échec de `clone` avec un timerfd ouvert, vfork, WIFSIGNALED, TID en cache de glibc) n'ont pas été exécutés.
-- Je n'ai pas lu en entier `syscall_io.c`, `syscall_fs.c`, `syscall_time.c`, `guest.c`, `vdso.c`, `proc_emulation.c`, `stack.c`, `shim.S`. Mes comptes de couplage portent sur leurs lignes `grep`, pas sur leur lecture.
-- Je n'ai pas mesuré le nombre de threads de Rocket League sous Wine ; la limite de 64 est donc un risque non quantifié.
-- Le comportement de FEX aux arrêts de syscall (RCX, R11, RFLAGS, `orig_rax`) n'est pas vérifié ; il relève du coéquipier FEX (témoin (h)).
-- Je n'ai pas qualifié `os_sync_wait_on_address` en mode partagé, ni l'échange de port de tâche Mach entre processus coopérants ; ils figurent dans les séries G et H du coéquipier Darwin.
-- Les 21 sites d'appel ptrace d'EAC ne sont pas tous associés à une requête : l'ensemble des requêtes nécessaires peut dépasser la liste observée.
+- No guest execution: all the HL behaviors cited come from the code, from existing logs or from host tests. The INFERRED points (`clone` failure with an open timerfd, vfork, WIFSIGNALED, glibc cached TID) were not executed.
+- I did not read in full `syscall_io.c`, `syscall_fs.c`, `syscall_time.c`, `guest.c`, `vdso.c`, `proc_emulation.c`, `stack.c`, `shim.S`. My coupling counts are based on their `grep` lines, not on reading them.
+- I did not measure the number of threads of Rocket League under Wine; the limit of 64 is therefore an unquantified risk.
+- FEX's behavior at syscall stops (RCX, R11, RFLAGS, `orig_rax`) is not checked; it belongs to the FEX teammate (witness (h)).
+- I did not qualify `os_sync_wait_on_address` in shared mode, nor the exchange of Mach task ports between cooperating processes; they are in the G and H series of the Darwin teammate.
+- The 21 EAC ptrace call sites are not all associated with a request: the set of requests needed may exceed the observed list.

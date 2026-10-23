@@ -1,671 +1,671 @@
-# Performances du moteur Linux et couches à simplifier, 3 octobre 2026
+# Linux engine performance and layers to simplify, October 3, 2026
 
-Ce document mesure où passe le temps dans une image, dans la latence d'entrée et au démarrage de Rocket League sur le
-moteur Linux. Il chiffre ensuite chaque couche de traduction qu'on pourrait retirer ou simplifier. C'est une analyse :
-rien n'est décidé, et les correctifs proposés en fin de document ne sont pas écrits.
+This document measures where the time goes in a frame, in the input latency and at the startup of Rocket League on the
+Linux engine. It then puts a figure on each translation layer that could be removed or simplified. It is an analysis:
+nothing is decided, and the fixes proposed at the end of the document are not written.
 
-Machine : Apple M5 Max, macOS 27.0.1, écran jusqu'à 240 Hz. Runtime Voile `v26.3.0-8` (Obelisk `a853ad2`), avec
-`fexdarwin-run` et wsd remplacés par les versions instrumentées décrites plus bas. Le jeu est limité à 60 i/s.
+Machine: Apple M5 Max, macOS 27.0.1, display up to 240 Hz. Voile runtime `v26.3.0-8` (Obelisk `a853ad2`), with
+`fexdarwin-run` and wsd replaced by the instrumented versions described below. The game is capped at 60 fps.
 
-## Résumé
+## Summary
 
-- **À 60 i/s, aucune pièce n'est saturée.** En Free Play, le fil qui présente les images attend 15,5 ms sur 16,7 ms.
-  Le GPU est occupé à 27 %. Le serveur de rendu utilise 39 % d'un cœur. Le jeu lui-même en utilise 88 %, dont une
-  bonne part en attente active.
-- **Le jeu fait 660 000 appels système par seconde en Free Play** (480 000 au menu). Plus de la moitié viennent
-  d'une attente active (`SwitchToThread`), que Wine traduit en `getrusage` + `sched_yield` + `getrusage`. Viennent
-  ensuite environ 26 000 requêtes par seconde à wineserver, à environ 11 µs l'aller-retour.
-- **Un appel à wineserver coûte 150 à 280 fois plus cher qu'avec le Wine macOS de Voile.** Ce n'est pas FEX : sans
-  ntsync, chaque attente et chaque `SetEvent` font un aller-retour avec wineserver. Pour le calcul pur, memcpy et la
-  lecture de fichiers, le moteur va aussi vite que Rosetta.
-- **Le démarrage (31,6 s mesurés, 27,7 s sans profil) ne dépend pas du JIT.** La compilation FEX prend moins de
-  0,1 s sur tout le lancement : un cache de code sur disque ne gagnerait presque rien. `InitOnlineSubsystem`
-  (14,8 s) sature le fil principal avec une avalanche d'appels sur les fichiers. Wine relit tout un dossier à chaque
-  fichier introuvable, parce que LKD ne dit pas que le volume est insensible à la casse. Un fichier introuvable coûte
-  10,5 ms dans un dossier de 20 000 fichiers, contre 17 µs sous le Wine macOS.
-- **Latence d'entrée.** Au menu, 58 ms jusqu'à l'envoi de l'image qui réagit (médiane). En Free Play, 33 ms. Il faut
-  ajouter 15,6 ms jusqu'à l'affichage, alors que l'écran se rafraîchit toutes les 4,2 à 8,3 ms. Le pilote, lui,
-  transmet une touche en 0,05 ms.
-- **Ordre proposé** (détails à la fin) :
-  1. dire à Wine que les dossiers sont insensibles à la casse (gros gain au démarrage, petit chantier) ;
-  2. vérifier l'anomalie d'epoll de wineserver (jusqu'à un cœur de temps système) ;
-  3. alléger `NtYieldExecution` ;
-  4. compter les requêtes de wineserver par type, puis décider de ntsync dans LKD ;
-  5. raccourcir le chemin de présentation de wsd.
+- **At 60 fps, no part is saturated.** In Free Play, the thread that presents the frames waits 15.5 ms out of 16.7 ms.
+  The GPU is 27% busy. The render server uses 39% of a core. The game itself uses 88%, a good part of it
+  busy-waiting.
+- **The game makes 660,000 system calls per second in Free Play** (480,000 in the menu). More than half come
+  from a busy-wait (`SwitchToThread`), which Wine translates into `getrusage` + `sched_yield` + `getrusage`. Next come
+  about 26,000 requests per second to wineserver, at about 11 µs per round trip.
+- **A call to wineserver costs 150 to 280 times more than with Voile's macOS Wine.** It is not FEX: without
+  ntsync, each wait and each `SetEvent` make a round trip with wineserver. For pure computation, memcpy and
+  file reads, the engine goes as fast as Rosetta.
+- **The startup (31.6 s measured, 27.7 s without profile) does not depend on the JIT.** FEX compilation takes less than
+  0.1 s over the whole launch: an on-disk code cache would gain almost nothing. `InitOnlineSubsystem`
+  (14.8 s) saturates the main thread with an avalanche of file calls. Wine rereads a whole folder for each
+  file not found, because LKD does not say that the volume is case-insensitive. A file not found costs
+  10.5 ms in a folder of 20,000 files, against 17 µs under the macOS Wine.
+- **Input latency.** In the menu, 58 ms until the frame that reacts is sent (median). In Free Play, 33 ms. Add
+  15.6 ms until display, while the screen refreshes every 4.2 to 8.3 ms. The driver, for its part,
+  passes a key on in 0.05 ms.
+- **Proposed order** (details at the end):
+  1. tell Wine that the folders are case-insensitive (big gain at startup, small job);
+  2. check the wineserver epoll anomaly (up to one core of system time);
+  3. lighten `NtYieldExecution`;
+  4. count the wineserver requests by type, then decide on ntsync in LKD;
+  5. shorten wsd's presentation path.
 
-  D3D11 dans le même processus, un wineserver natif, les parties Unix natives et le cache de code FEX ne se justifient
-  pas d'après ces mesures.
+  In-process D3D11, a native wineserver, the native Unix parts and the FEX code cache are not justified
+  by these measurements.
 
-## Outils de mesure (ajoutés pour ce rapport)
+## Measurement tools (added for this report)
 
-- **`FEXDARWIN_PROFILE=1`** (fexdarwin, `HitchLog.cpp`). Toutes les 10 s, ainsi qu'à la fin d'un processus et à un
-  `exec`, chaque processus invité écrit :
-  - son CPU utilisateur et système ;
-  - ses appels système : nombre, et temps passé dans LKD (ce temps inclut les attentes bloquantes) ;
-  - le temps de JIT de FEX, les fautes SMC et les invalidations ;
-  - pour chaque thread, le CPU, nommé d'après le `comm` invité (les noms Windows des threads, par exemple
-    `RenderingThread`) ;
-  - les 12 appels système qui ont pris le plus de temps.
+- **`FEXDARWIN_PROFILE=1`** (fexdarwin, `HitchLog.cpp`). Every 10 s, as well as at the end of a process and at an
+  `exec`, each guest process writes:
+  - its user and system CPU;
+  - its system calls: count, and time spent in LKD (this time includes the blocking waits);
+  - the FEX JIT time, the SMC faults and the invalidations;
+  - for each thread, the CPU, named after the guest `comm` (the Windows names of the threads, for example
+    `RenderingThread`);
+  - the 12 system calls that took the most time.
 
-  Coût : deux lectures d'horloge par appel système. Avec le profil, le démarrage est passé de 27,7 à 31,6 s.
-- **`tools/dev/engine-top.c`**. Il donne le CPU de chaque thread de wsd, de `virgl_render_server` et des
-  `fexdarwin-run`, ainsi que l'occupation du GPU (`Device Utilization %` de l'IOAccelerator). Il lit ces chiffres par
-  `proc_pidinfo` et IOKit, sans suspendre de thread, à la différence de `sample`.
-- **Sonde de latence de wsd.** La première entrée de test (`wsdctl tap`) l'active maintenant, alors qu'il fallait
-  avant `WSD_LATENCY_PROBE` dans l'environnement de wsd, que le lanceur d'Obelisk ne transmet pas.
-- **`tests/bench/winbench.c`**. Coût par appel des traversées d'un jeu Windows : horloge, `SwitchToThread`, attente et
-  signal d'événement, création d'objet, section critique, lecture de fichier, aller-retour entre deux threads, calcul,
-  memcpy. `winbench N TEST` lance un seul test, pour que le profil ne voie que ses appels.
-- **`tests/bench/missbench.c`**. Coût d'un `GetFileAttributesW` sur un fichier absent, et sur un fichier présent mais
-  écrit avec une autre casse.
+  Cost: two clock reads per system call. With the profile, the startup went from 27.7 to 31.6 s.
+- **`tools/dev/engine-top.c`**. It gives the CPU of each thread of wsd, of `virgl_render_server` and of the
+  `fexdarwin-run`, as well as the GPU occupancy (`Device Utilization %` of the IOAccelerator). It reads these figures through
+  `proc_pidinfo` and IOKit, without suspending any thread, unlike `sample`.
+- **wsd latency probe.** The first test input (`wsdctl tap`) now enables it, whereas before it took
+  `WSD_LATENCY_PROBE` in wsd's environment, which the Obelisk launcher does not pass on.
+- **`tests/bench/winbench.c`**. Per-call cost of the crossings of a Windows game: clock, `SwitchToThread`, event wait and
+  signal, object creation, critical section, file read, round trip between two threads, computation,
+  memcpy. `winbench N TEST` runs a single test, so that the profile sees only its calls.
+- **`tests/bench/missbench.c`**. Cost of a `GetFileAttributesW` on an absent file, and on a file that is present but
+  written with a different case.
 
-Session mesurée : lancement depuis Obelisk, puis menu (20 flèches haut/bas envoyées par `wsdctl`), puis Free Play
-(environ 60 s de jeu, puis 8 bascules de caméra balle par la touche Espace), retour au menu et sortie par le menu.
-Aucune partie en ligne. Journaux : dossier `session1` de l'espace de travail de la session (non versionné).
+Measured session: launch from Obelisk, then menu (20 up/down arrows sent by `wsdctl`), then Free Play
+(about 60 s of play, then 8 ball camera toggles with the Space key), back to the menu and exit through the menu.
+No online match. Logs: `session1` folder of the session workspace (not versioned).
 
-## Une image (60 i/s, budget de 16,7 ms)
+## One frame (60 fps, 16.7 ms budget)
 
-| Pièce | Free Play | Menu | Remarque |
+| Part | Free Play | Menu | Remark |
 |---|---|---|---|
-| Jeu, `RenderingThread` | 45 % d'un cœur (7,5 ms par image) | 21 % | 314 000 appels système/s en Free Play |
-| Jeu, fil principal | 30 % (5,1 ms) | 21 % | 318 000 appels système/s |
-| Jeu, autres fils | 13 % (2,2 ms) | 8 % | |
-| wineserver | 12 % (1,9 ms) | 28 % (anomalie, voir plus bas) | 94 000 appels système/s en Free Play |
-| Serveur de rendu, décodeur Neptune (`npt-ring-1`) | 25 % (4,2 ms) | 13 % | appels DXMT inclus |
-| Serveur de rendu, `dxmt-encode-thread` | 6 % (1,0 ms) | 4 % | |
-| Serveur de rendu, autres fils | 8 % (1,3 ms) | 5 % | |
-| wsd | environ 3 % | 3 % | |
-| GPU | 27 % | 26 % | occupation moyenne |
-| Attente de la fence avant présentation | 0,5 ms (médiane) | | `fence wait` de nptunix |
-| Attente de cadence (`NPT_WSD_PACING=after`) | 13 à 16,5 ms | 15 à 16 ms | marge inutilisée |
+| Game, `RenderingThread` | 45% of a core (7.5 ms per frame) | 21% | 314,000 system calls/s in Free Play |
+| Game, main thread | 30% (5.1 ms) | 21% | 318,000 system calls/s |
+| Game, other threads | 13% (2.2 ms) | 8% | |
+| wineserver | 12% (1.9 ms) | 28% (anomaly, see below) | 94,000 system calls/s in Free Play |
+| Render server, Neptune decoder (`npt-ring-1`) | 25% (4.2 ms) | 13% | DXMT calls included |
+| Render server, `dxmt-encode-thread` | 6% (1.0 ms) | 4% | |
+| Render server, other threads | 8% (1.3 ms) | 5% | |
+| wsd | about 3% | 3% | |
+| GPU | 27% | 26% | average occupancy |
+| Fence wait before presentation | 0.5 ms (median) | | nptunix `fence wait` |
+| Pacing wait (`NPT_WSD_PACING=after`) | 13 to 16.5 ms | 15 to 16 ms | unused margin |
 
-Le temps des fils du jeu comprend l'attente active. Le jeu fait environ 118 000 `SwitchToThread` par seconde en
-Free Play, soit environ 2 000 par image. Chacun coûte trois appels système, environ 1,6 µs au total : l'attente active
-prend donc environ 0,2 cœur, soit 3 ms de CPU par image sur les deux fils principaux.
+The time of the game threads includes the busy-wait. The game makes about 118,000 `SwitchToThread` per second in
+Free Play, that is about 2,000 per frame. Each costs three system calls, about 1.6 µs in total: the busy-wait
+therefore takes about 0.2 core, that is 3 ms of CPU per frame on the two main threads.
 
-Les appels système du jeu en Free Play, par seconde :
+The game's system calls in Free Play, per second:
 
-| Appel | Nombre/s | Origine |
+| Call | Count/s | Origin |
 |---|---|---|
-| `getrusage` | 237 000 | `NtYieldExecution` de Wine (deux par `SwitchToThread`) |
-| `clock_gettime` | 142 000 | `QueryPerformanceCounter` (150 ns l'appel en tout) |
-| `sched_yield` | 118 000 | `NtYieldExecution` |
-| `rt_sigprocmask` | 77 000 | deux par requête à wineserver |
-| `read` | 42 000 | réponses de wineserver, socket wsd, etc. |
-| `write` + `writev` | 39 000 | requêtes à wineserver, présentations, son |
-| `futex` | 1 500 | |
+| `getrusage` | 237,000 | Wine's `NtYieldExecution` (two per `SwitchToThread`) |
+| `clock_gettime` | 142,000 | `QueryPerformanceCounter` (150 ns per call in total) |
+| `sched_yield` | 118,000 | `NtYieldExecution` |
+| `rt_sigprocmask` | 77,000 | two per request to wineserver |
+| `read` | 42,000 | wineserver replies, wsd socket, etc. |
+| `write` + `writev` | 39,000 | requests to wineserver, presentations, sound |
+| `futex` | 1,500 | |
 
-wineserver lit environ 26 000 requêtes par seconde en Free Play (7 700 au menu), dont presque toutes viennent du jeu.
-Avec environ 11 µs de latence par appel, cela fait jusqu'à 0,3 s de fil bloqué par seconde, réparties entre les fils
-du jeu. Le type de ces requêtes n'est pas encore mesuré (voir « Mesures suivantes »).
+wineserver reads about 26,000 requests per second in Free Play (7,700 in the menu), almost all of which come from the game.
+With about 11 µs of latency per call, this makes up to 0.3 s of blocked thread per second, spread across the threads
+of the game. The type of these requests is not measured yet (see "Next measurements").
 
-La cadence tient : sur 14 820 présentations, l'intervalle est de 16,6 à 16,7 ms. Il y a eu 23 images tenues plus de
-50 ms (surtout aux chargements), et 17 « frame back » en environ 4 minutes.
+The pacing holds: over 14,820 presentations, the interval is 16.6 to 16.7 ms. There were 23 frames held more than
+50 ms (mostly during loads), and 17 "frame back" in about 4 minutes.
 
-## Latence d'entrée
+## Input latency
 
-Méthode. `wsdctl tap` envoie une touche à wsd, qui la date. La sonde compare ensuite chaque image reçue à celle
-d'avant l'entrée, et date la première qui change nettement. Le pilote `wineobelisk.drv` date de son côté la lecture
-de l'évènement et son envoi à Wine (`WINE_OBELISK_LATENCY=1`).
+Method. `wsdctl tap` sends a key to wsd, which timestamps it. The probe then compares each received frame with the one
+from before the input, and timestamps the first one that changes clearly. The `wineobelisk.drv` driver timestamps on its side the read
+of the event and its sending to Wine (`WINE_OBELISK_LATENCY=1`).
 
-| Étape | Menu | Free Play |
+| Step | Menu | Free Play |
 |---|---|---|
-| wsd → lecture par le pilote → envoi à Wine | 0,05 ms | 0,05 ms (90e centile 3,5 ms) |
-| Entrée → soumission de l'image qui réagit (jeu, rendu, GPU, fence) | 58 ms en médiane (de 21 à 101 ms, 20 essais) | 33 ms en médiane (de 27 à 48 ms, 8 essais) |
-| Soumission → affichage (`presentedTime`) | 15,6 ms (médiane) | 15,6 ms |
-| **Total** | **environ 73 ms** | **environ 49 ms** |
+| wsd → read by the driver → sending to Wine | 0.05 ms | 0.05 ms (90th percentile 3.5 ms) |
+| Input → submission of the frame that reacts (game, render, GPU, fence) | 58 ms median (from 21 to 101 ms, 20 attempts) | 33 ms median (from 27 to 48 ms, 8 attempts) |
+| Submission → display (`presentedTime`) | 15.6 ms (median) | 15.6 ms |
+| **Total** | **about 73 ms** | **about 49 ms** |
 
-Les chiffres du menu sont moins sûrs : le surlignage du menu s'anime en fondu, et la sonde le détecte un peu tard. En
-Free Play, la bascule de caméra change toute l'image, ce qui donne une mesure nette.
+The menu figures are less certain: the menu highlight animates with a fade, and the probe detects it a bit late. In
+Free Play, the camera toggle changes the whole frame, which gives a clear measurement.
 
-Pour les vraies touches du joueur, 3,1 ms en médiane séparent l'heure de l'évènement macOS (le matériel) de sa
-lecture par le pilote. C'est le trajet de macOS jusqu'à l'application, avant wsd.
+For the player's real keys, 3.1 ms median separate the time of the macOS event (the hardware) from its
+read by the driver. It is the path from macOS to the application, before wsd.
 
-De l'entrée à la soumission, il faut environ deux images en Free Play : le fil de jeu lit l'entrée, puis le fil de
-rendu dessine une image plus tard. Ce délai est celui du moteur du jeu, pas celui de notre chaîne.
+From input to submission, it takes about two frames in Free Play: the game thread reads the input, then the render
+thread draws a frame later. This delay is the game engine's, not our chain's.
 
-La soumission → affichage, en revanche, est à nous. Une image attend :
-- le prochain tick du display link de wsd ;
-- le dessin dans le drawable ;
-- puis le compositeur de macOS, puisque la fenêtre est en mode fenêtré.
+Submission → display, on the other hand, is ours. A frame waits for:
+- the next tick of wsd's display link;
+- the drawing into the drawable;
+- then the macOS compositor, since the window is in windowed mode.
 
-Au total, cela fait 15,6 ms, alors que les intervalles affichés tombent sur des multiples de 4,17 ms. On peut sans
-doute gagner 4 à 10 ms ici, à mesurer plus finement (voir la couche « Présentation »).
+In total, this makes 15.6 ms, while the displayed intervals fall on multiples of 4.17 ms. We can no
+doubt gain 4 to 10 ms here, to be measured more finely (see the "Presentation" layer).
 
-## Démarrage
+## Startup
 
-| Étape (`Launch.log`) | Sans profil (17:22) | Avec profil (20:49) | Ce qui se passe (profil) |
+| Step (`Launch.log`) | Without profile (17:22) | With profile (20:49) | What happens (profile) |
 |---|---|---|---|
-| `PreInit` | 2,3 s | 2,6 s | |
-| `LoadScriptPackages` | 9,9 s | 10,5 s | le fil principal tourne en attente active ; deux autres fils chargent, sans saturer |
-| `InitOnlineSubsystem` | 12,4 s | 14,8 s | le fil principal sature un cœur sur les appels de fichiers |
-| Autres étapes | 3,1 s | 3,7 s | |
-| **Total** | **27,7 s** | **31,6 s** | |
+| `PreInit` | 2.3 s | 2.6 s | |
+| `LoadScriptPackages` | 9.9 s | 10.5 s | the main thread spins in a busy-wait; two other threads load, without saturating |
+| `InitOnlineSubsystem` | 12.4 s | 14.8 s | the main thread saturates a core on file calls |
+| Other steps | 3.1 s | 3.7 s | |
+| **Total** | **27.7 s** | **31.6 s** | |
 
-Détail du profil, par tranche de 10 s, pour le processus du jeu :
-- **De 0 à 10 s.** Le fil principal prend 8,7 s de CPU pour 6,5 millions d'appels système : 4,2 millions de
-  `getrusage` et 2,1 millions de `sched_yield`. C'est l'attente active d'un chargement qui tourne sur d'autres fils :
-  le fil 117 prend 3,6 s de CPU, et `AsyncIOSystem` 1,7 s avec 957 000 appels système. Ce qui borne cette phase n'est
-  pas établi, puisqu'aucun fil n'y est saturé (voir « Mesures suivantes »).
-- **De 10 à 30 s.** Le fil principal prend 8,3 puis 10,2 s de CPU, dont plus de la moitié en temps système. Sur les
-  20 s, il fait :
-  - 592 000 `newfstatat` ;
-  - 304 000 `openat` ;
-  - 304 000 `getdents64` ;
-  - 255 000 `getxattr` ;
-  - 240 000 `close` ;
-  - 120 000 `fstat` ;
-  - 75 000 `fstatfs`.
+Profile detail, per 10 s slice, for the game process:
+- **From 0 to 10 s.** The main thread takes 8.7 s of CPU for 6.5 million system calls: 4.2 million
+  `getrusage` and 2.1 million `sched_yield`. It is the busy-wait of a load that runs on other threads:
+  thread 117 takes 3.6 s of CPU, and `AsyncIOSystem` 1.7 s with 957,000 system calls. What bounds this phase is
+  not established, since no thread is saturated in it (see "Next measurements").
+- **From 10 to 30 s.** The main thread takes 8.3 then 10.2 s of CPU, more than half of it in system time. Over the
+  20 s, it makes:
+  - 592,000 `newfstatat`;
+  - 304,000 `openat`;
+  - 304,000 `getdents64`;
+  - 255,000 `getxattr`;
+  - 240,000 `close`;
+  - 120,000 `fstat`;
+  - 75,000 `fstatfs`.
 
-  C'est la recherche insensible à la casse de Wine sous Linux (`lookup_unix_name`, `dlls/ntdll/unix/file.c`). Quand
-  un nom n'existe pas tel quel, Wine appelle `get_dir_case_sensitivity` : il ouvre le dossier et demande
-  `EXT2_IOC_GETFLAGS`. Si le drapeau `EXT4_CASEFOLD_FL` n'est pas là, il relit tout le dossier. LKD ne connaît pas cet
-  ioctl, alors que le volume APFS de l'hôte est réellement insensible à la casse.
-- **Le JIT de FEX** a pris 27, 14 puis 5 ms sur ces trois tranches, soit moins de 0,1 s sur tout le démarrage. Un
-  échantillonnage de wineboot (hors jeu) confirme : les fonctions de compilation de FEX y sont presque absentes, et les
-  fils attendent dans le noyau ou dans des appels de fichiers.
+  It is Wine's case-insensitive lookup under Linux (`lookup_unix_name`, `dlls/ntdll/unix/file.c`). When
+  a name does not exist as is, Wine calls `get_dir_case_sensitivity`: it opens the folder and requests
+  `EXT2_IOC_GETFLAGS`. If the `EXT4_CASEFOLD_FL` flag is not there, it rereads the whole folder. LKD does not know this
+  ioctl, while the host's APFS volume is really case-insensitive.
+- **The FEX JIT** took 27, 14 then 5 ms over these three slices, that is less than 0.1 s over the whole startup. A
+  sampling of wineboot (outside the game) confirms: the FEX compilation functions are almost absent from it, and the
+  threads wait in the kernel or in file calls.
 
-Coût d'une recherche de fichier (`missbench`, 200 à 2 000 appels de `GetFileAttributesW`) :
+Cost of a file lookup (`missbench`, 200 to 2,000 calls of `GetFileAttributesW`):
 
-| Cas | Moteur Linux | Wine macOS de Voile |
+| Case | Linux engine | Voile's macOS Wine |
 |---|---|---|
-| Fichier absent, dossier de 20 fichiers | 139 µs | 17 µs |
-| Fichier absent, dossier de 20 000 fichiers | 10 518 µs | 17 µs |
-| Fichier présent, autre casse | 50 µs | 9 µs |
+| Absent file, folder of 20 files | 139 µs | 17 µs |
+| Absent file, folder of 20,000 files | 10,518 µs | 17 µs |
+| Present file, different case | 50 µs | 9 µs |
 
-## Coûts unitaires (`winbench`)
+## Unit costs (`winbench`)
 
-Même programme sur le moteur Linux et sous le Wine macOS de Voile (x86-64 sous Rosetta), dans un préfixe de test.
+Same program on the Linux engine and under Voile's macOS Wine (x86-64 under Rosetta), in a test prefix.
 
-| Appel | Moteur Linux | Wine macOS, msync (réglage d'Obelisk) | Wine macOS sans msync |
+| Call | Linux engine | macOS Wine, msync (Obelisk setting) | macOS Wine without msync |
 |---|---|---|---|
 | `QueryPerformanceCounter` | 150 ns | 48 ns | 48 ns |
-| `SwitchToThread` | 1 256 ns | 226 ns | 230 ns |
-| `WaitForSingleObject(ev, 0)` | 11 839 ns | 66 ns | 8 423 ns |
-| `SetEvent` | 10 681 ns | 39 ns | 7 928 ns |
-| `CreateEvent` + `CloseHandle` | 20 946 ns | 18 862 ns | 17 156 ns |
-| Section critique, sans contention | 3,7 ns | 3,4 ns | 3,3 ns |
-| `SetFilePointer` + `ReadFile` de 4 Kio | 957 ns | 1 027 ns | 1 013 ns |
-| Aller-retour d'évènement entre deux fils | 34 715 ns | 5 851 ns | 19 650 ns |
-| Boucle de calcul (par itération) | 1,2 ns | 1,2 ns | 1,2 ns |
-| memcpy de 1 Mio | 16,3 µs | 18,5 µs | 18,5 µs |
+| `SwitchToThread` | 1,256 ns | 226 ns | 230 ns |
+| `WaitForSingleObject(ev, 0)` | 11,839 ns | 66 ns | 8,423 ns |
+| `SetEvent` | 10,681 ns | 39 ns | 7,928 ns |
+| `CreateEvent` + `CloseHandle` | 20,946 ns | 18,862 ns | 17,156 ns |
+| Critical section, uncontended | 3.7 ns | 3.4 ns | 3.3 ns |
+| `SetFilePointer` + `ReadFile` of 4 KiB | 957 ns | 1,027 ns | 1,013 ns |
+| Event round trip between two threads | 34,715 ns | 5,851 ns | 19,650 ns |
+| Computation loop (per iteration) | 1.2 ns | 1.2 ns | 1.2 ns |
+| memcpy of 1 MiB | 16.3 µs | 18.5 µs | 18.5 µs |
 
-Une requête à wineserver se décompose ainsi d'après le profil :
-- côté client, quatre appels système : `rt_sigprocmask` deux fois, `write` de la requête, `read` de la réponse ;
-- côté serveur, environ cinq : `epoll_pwait2`, `read`, `write`, `gettimeofday`, `clock_gettime` ;
-- au total, environ 16 µs de CPU répartis entre les deux processus.
+A request to wineserver breaks down as follows according to the profile:
+- on the client side, four system calls: `rt_sigprocmask` twice, `write` of the request, `read` of the reply;
+- on the server side, about five: `epoll_pwait2`, `read`, `write`, `gettimeofday`, `clock_gettime`;
+- in total, about 16 µs of CPU spread between the two processes.
 
-Un appel système LKD de base coûte environ 0,15 µs (`clock_gettime`). Les appels qui touchent le noyau Darwin coûtent
-1 à 2 µs (`write` sur un tube, `sched_yield`).
+A basic LKD system call costs about 0.15 µs (`clock_gettime`). The calls that touch the Darwin kernel cost
+1 to 2 µs (`write` on a pipe, `sched_yield`).
 
-## Les couches, une par une
+## The layers, one by one
 
-| Couche | Ce qu'elle coûte (mesuré) | Pour la retirer ou la simplifier | Risque | Gain attendu |
+| Layer | What it costs (measured) | To remove or simplify it | Risk | Expected gain |
 |---|---|---|---|---|
-| **Recherche insensible à la casse (Wine sous Linux sur APFS)** | Fil principal saturé pendant `InitOnlineSubsystem` (environ 1,9 million d'appels de fichiers en 20 s). 10,5 ms par fichier absent dans un grand dossier. | LKD répond à `FS_IOC_GETFLAGS` (`EXT2_IOC_GETFLAGS`) sur un dossier avec `EXT4_CASEFOLD_FL` quand le volume hôte est insensible à la casse (`pathconf(_PC_CASE_SENSITIVE)`). Pas de changement de Wine. | Faible : c'est une description exacte du volume. Un volume APFS sensible à la casse continue de répondre « sensible ». | Estimé de −8 à −12 s ; mesuré **−4,2 s** (27,7 → 23,5 s, voir « Après le correctif de casse »). |
-| **Attente active `NtYieldExecution`** | 118 000 yields/s en Free Play, chacun = 3 appels système (environ 1,6 µs), soit environ 0,2 cœur. Au démarrage, le fil principal y passe 8,7 s de CPU sur les 10 premières secondes. `thread_rusage` de LKD renvoie toujours 0 changement de contexte, donc `SwitchToThread` répond toujours FALSE (« pas de yield »). | Sous LKD : un `NtYieldExecution` sans `getrusage` dans voile-wine, ou bien un `getrusage(RUSAGE_THREAD)` qui renvoie un vrai compteur. Rendre `sched_yield` de LKD aussi bon marché que celui de Darwin (1,26 µs contre 0,23 µs). | Faible, mais la valeur de retour de `SwitchToThread` change le comportement des boucles d'attente du jeu. À vérifier. | De −2 à −3 appels système par yield. Environ 0,1 à 0,2 cœur en jeu ; moins de chauffe sur un portable. Peu d'effet sur la cadence, puisque ce temps est de l'attente. |
-| **wineserver : temps système dans `epoll_pwait2`** | Par tranches de 10 s au menu, wineserver prend jusqu'à 10,5 s de CPU (8 s en système), pour le même nombre d'appels que dans les tranches calmes (0,9 s). Ce temps est caché dans `epoll_pwait2`. | Compter les tours de la boucle `do_wait` de `lkd/src/net/epoll.c` (kqueue lisible alors que `ep_collect` ne rend rien). Corriger si c'est bien une boucle de réveil. | Faible | Jusqu'à un cœur au menu. Peut-être aussi de la latence de wineserver. |
-| **ntsync dans LKD (`/dev/ntsync`)** | Attente ou signal = environ 11 µs et un aller-retour avec wineserver. Aller-retour entre deux fils : 35 µs (contre 5,9 µs avec msync sous macOS). Environ 26 000 requêtes/s en Free Play, de types inconnus. | Un périphérique `/dev/ntsync` dans LKD. Wine et wineserver sont déjà compilés avec ntsync (`HAVE_LINUX_NTSYNC_H`). Les objets doivent être partagés entre processus hôtes : état en mémoire partagée, fds passés par SCM_RIGHTS, WAIT_ALL atomique par instance du périphérique, attentes interruptibles par les signaux LKD. | Moyen. Le point délicat est le multiprocessus, et il ne doit rien changer à ce que voit EAC. | Si la plupart des requêtes sont des waits, des sets et des resets : environ 10 µs par appel. Jusqu'à 0,2 à 0,3 s de fil bloqué par seconde en moins, et une partie des 12 à 28 % de CPU de wineserver. À décider après le comptage des requêtes. |
-| **Présentation (wsd)** | 15,6 ms entre soumission et affichage, sur un écran de 120/240 Hz. | D'abord dater chaque étape dans wsd : tick du display link, encodage, `presentedTime`. Pistes : présenter dès la fin de la fence sans attendre le tick, n'utiliser que 2 drawables, et vérifier si le plein écran natif (sans compositeur) est possible pour une fenêtre plein écran. | Faible à moyen (cadence, image en arrière) | Estimé de 4 à 10 ms de latence. |
-| **D3D11 dans le même processus (thunk FEX vers DXMT)** | Le serveur de rendu prend 6,5 ms de CPU par image (décodage et appels DXMT). Ce coût serait déplacé, pas supprimé. Le passage entre processus coûte surtout l'attente de fence (0,5 ms en médiane) et les réveils de l'anneau. | `SetThunkHandler` et des stubs `0F 3F` dans fexdarwin (aucun gestionnaire n'est installé aujourd'hui : un `0F 3F` planterait le JIT). Il faudrait aussi charger le décodeur Neptune, DXMT et Metal dans chaque `fexdarwin-run`, et les rendre sûrs vis-à-vis des forks. La version la moins chère garde l'anneau Neptune et remplace seulement le transport vtest. | Élevé : Metal dans un processus qui fait des forks hôtes, plantage commun avec le jeu, et 813 commandes générées dont le générateur n'est pas versionné. | Faible à 60 i/s : moins d'une milliseconde de latence par image. Utile seulement si un jour le serveur de rendu sature (cadence au-delà de 60 i/s). |
-| **Parties Unix natives (`nptunix`, `wineobelisk`) par thunk** | Non isolé dans le profil, mais petit. Le pilote transmet une touche en 0,05 ms. Les tempêtes SMC de `nptunix` sont réglées depuis le relinkage en pages de 16 Kio. | Les mêmes thunks que ci-dessus. | Moyen | Faible. |
-| **wineserver natif arm64** | 12 % d'un cœur en Free Play, 28 % au menu (anomalie comprise), soit environ 5 µs de serveur par requête. | Porter wineserver sur Darwin en gardant la sémantique des fds et de la mémoire partagée de LKD vue par les invités. Gros chantier. | Élevé | Faible une fois ntsync en place, qui supprime la plupart des requêtes. Ne se justifie pas. |
-| **Cache de code FEX sur disque** | JIT de moins de 0,1 s sur tout un démarrage, et environ 0,5 ms/s en jeu. | Le `DiskCache` de FEX existe, désactivé par défaut. Pour Darwin, il lit la mémoire invitée sans `G2H` (`DiskCache.cpp:566-578`, `Core.cpp:1029`). | Moyen | Presque nul. À abandonner. |
-| **Assertions de FEXCore** (`-DENABLE_ASSERTIONS=ON` dans `fexdarwin/scripts/build.sh`) | Le passage `IRValidation` tourne à chaque compilation. Le JIT est négligeable, donc le coût aussi. | `OFF` en Release. | Faible, mais on perd des contrôles. | Négligeable. |
-| **D3DMetal à la place de DXMT** | Déjà écarté : x86-64 seulement, code fermé, pont depuis l'invité nécessaire (`graphics-display-audio.md` §1.1, §1.4). | | | |
+| **Case-insensitive lookup (Wine under Linux on APFS)** | Main thread saturated during `InitOnlineSubsystem` (about 1.9 million file calls in 20 s). 10.5 ms per absent file in a large folder. | LKD answers `FS_IOC_GETFLAGS` (`EXT2_IOC_GETFLAGS`) on a folder with `EXT4_CASEFOLD_FL` when the host volume is case-insensitive (`pathconf(_PC_CASE_SENSITIVE)`). No change to Wine. | Low: it is an exact description of the volume. A case-sensitive APFS volume keeps answering "sensitive". | Estimated from −8 to −12 s; measured **−4.2 s** (27.7 → 23.5 s, see "After the case fix"). |
+| **`NtYieldExecution` busy-wait** | 118,000 yields/s in Free Play, each = 3 system calls (about 1.6 µs), that is about 0.2 core. At startup, the main thread spends 8.7 s of CPU in it over the first 10 seconds. LKD's `thread_rusage` always returns 0 context switches, so `SwitchToThread` always answers FALSE ("no yield"). | Under LKD: a `NtYieldExecution` without `getrusage` in voile-wine, or else a `getrusage(RUSAGE_THREAD)` that returns a real counter. Make LKD's `sched_yield` as cheap as Darwin's (1.26 µs against 0.23 µs). | Low, but the return value of `SwitchToThread` changes the behavior of the game's wait loops. To be checked. | From −2 to −3 system calls per yield. About 0.1 to 0.2 core in game; less heat on a laptop. Little effect on the pacing, since this time is waiting. |
+| **wineserver: system time in `epoll_pwait2`** | Per 10 s slices in the menu, wineserver takes up to 10.5 s of CPU (8 s in system), for the same number of calls as in the quiet slices (0.9 s). This time is hidden in `epoll_pwait2`. | Count the turns of the `do_wait` loop of `lkd/src/net/epoll.c` (kqueue readable while `ep_collect` returns nothing). Fix if it is indeed a wakeup loop. | Low | Up to one core in the menu. Maybe also some wineserver latency. |
+| **ntsync in LKD (`/dev/ntsync`)** | Wait or signal = about 11 µs and a round trip with wineserver. Round trip between two threads: 35 µs (against 5.9 µs with msync under macOS). About 26,000 requests/s in Free Play, of unknown types. | A `/dev/ntsync` device in LKD. Wine and wineserver are already compiled with ntsync (`HAVE_LINUX_NTSYNC_H`). The objects must be shared between host processes: state in shared memory, fds passed through SCM_RIGHTS, atomic WAIT_ALL per device instance, waits interruptible by LKD signals. | Medium. The tricky point is multiprocess, and it must change nothing in what EAC sees. | If most requests are waits, sets and resets: about 10 µs per call. Up to 0.2 to 0.3 s less of blocked thread per second, and part of the 12 to 28% of wineserver CPU. To be decided after the request count. |
+| **Presentation (wsd)** | 15.6 ms between submission and display, on a 120/240 Hz screen. | First timestamp each step in wsd: display link tick, encoding, `presentedTime`. Leads: present as soon as the fence ends without waiting for the tick, use only 2 drawables, and check whether native fullscreen (without compositor) is possible for a fullscreen window. | Low to medium (pacing, frame behind) | Estimated 4 to 10 ms of latency. |
+| **In-process D3D11 (FEX thunk to DXMT)** | The render server takes 6.5 ms of CPU per frame (decoding and DXMT calls). This cost would be moved, not removed. The crossing between processes costs mostly the fence wait (0.5 ms median) and the ring wakeups. | `SetThunkHandler` and `0F 3F` stubs in fexdarwin (no handler is installed today: a `0F 3F` would crash the JIT). The Neptune decoder, DXMT and Metal would also have to be loaded in each `fexdarwin-run`, and made fork-safe. The cheapest version keeps the Neptune ring and replaces only the vtest transport. | High: Metal in a process that does host forks, crash shared with the game, and 813 generated commands whose generator is not versioned. | Low at 60 fps: less than a millisecond of latency per frame. Useful only if one day the render server saturates (pacing beyond 60 fps). |
+| **Native Unix parts (`nptunix`, `wineobelisk`) through thunks** | Not isolated in the profile, but small. The driver passes a key on in 0.05 ms. The SMC storms of `nptunix` are solved since the relink in 16 KiB pages. | The same thunks as above. | Medium | Low. |
+| **Native arm64 wineserver** | 12% of a core in Free Play, 28% in the menu (anomaly included), that is about 5 µs of server per request. | Port wineserver to Darwin while keeping the semantics of LKD's fds and shared memory as seen by the guests. Big job. | High | Low once ntsync is in place, which removes most requests. Not justified. |
+| **On-disk FEX code cache** | JIT of less than 0.1 s over a whole startup, and about 0.5 ms/s in game. | FEX's `DiskCache` exists, disabled by default. For Darwin, it reads guest memory without `G2H` (`DiskCache.cpp:566-578`, `Core.cpp:1029`). | Medium | Almost zero. To be abandoned. |
+| **FEXCore assertions** (`-DENABLE_ASSERTIONS=ON` in `fexdarwin/scripts/build.sh`) | The `IRValidation` pass runs at each compilation. The JIT is negligible, so the cost too. | `OFF` in Release. | Low, but checks are lost. | Negligible. |
+| **D3DMetal instead of DXMT** | Already ruled out: x86-64 only, closed code, bridge from the guest needed (`graphics-display-audio.md` §1.1, §1.4). | | | |
 
-## Ordre proposé
+## Proposed order
 
-1. **Indiquer la casse à Wine** (LKD, `FS_IOC_GETFLAGS`). Petit, sans risque, et c'est le seul gain chiffré en
-   secondes. On mesure avant et après avec `Launch.log` (`Startup_*`) et `missbench`.
-2. **Vérifier l'anomalie d'epoll de wineserver** : un compteur dans `do_wait`, puis un correctif s'il s'agit d'une
-   boucle de réveil.
-3. **Alléger `NtYieldExecution` sous LKD**, en vérifiant ce que change la valeur de retour de `SwitchToThread`.
-4. **Compter les requêtes de wineserver par type** (compteur par code de requête dans le wineserver de voile-wine,
-   affiché toutes les 10 s), puis décider de ntsync dans LKD.
-5. **Dater le chemin de présentation de wsd**, puis le raccourcir.
+1. **Tell Wine about the case** (LKD, `FS_IOC_GETFLAGS`). Small, risk-free, and it is the only gain counted in
+   seconds. Measure before and after with `Launch.log` (`Startup_*`) and `missbench`.
+2. **Check the wineserver epoll anomaly**: a counter in `do_wait`, then a fix if it is a
+   wakeup loop.
+3. **Lighten `NtYieldExecution` under LKD**, checking what the return value of `SwitchToThread` changes.
+4. **Count the wineserver requests by type** (counter per request code in voile-wine's wineserver,
+   displayed every 10 s), then decide on ntsync in LKD.
+5. **Timestamp wsd's presentation path**, then shorten it.
 
-Les thunks, le wineserver natif et le cache de code ne se justifient pas avec ces mesures. On les réexaminera si le
-jeu dépasse 60 i/s et que le serveur de rendu devient la limite.
+The thunks, the native wineserver and the code cache are not justified by these measurements. We will reexamine them if the
+game goes beyond 60 fps and the render server becomes the limit.
 
-## Après le correctif de casse (21:19)
+## After the case fix (21:19)
 
-Correctifs : LKD `ad12111` (`FS_IOC_GETFLAGS` répond casefold pour un dossier d'un volume insensible à la casse) et
-voile-wine `87a1c39b` (sur un tel dossier, un nom 8.3 absent ne fait plus relire le dossier). Le lancement se fait
-depuis Obelisk, sans profil, comme la mesure de référence de 17:22.
+Fixes: LKD `ad12111` (`FS_IOC_GETFLAGS` answers casefold for a folder of a case-insensitive volume) and
+voile-wine `87a1c39b` (on such a folder, an absent 8.3 name no longer makes the folder be reread). The launch is done
+from Obelisk, without profile, like the reference measurement of 17:22.
 
-| Étape | Avant (17:22) | Après (21:19) |
+| Step | Before (17:22) | After (21:19) |
 |---|---|---|
-| `LoadScriptPackages` | 9,9 s | 9,5 s |
-| `InitOnlineSubsystem` | 12,4 s | 8,7 s |
-| **Total jusqu'au menu** | **27,7 s** | **23,5 s** |
+| `LoadScriptPackages` | 9.9 s | 9.5 s |
+| `InitOnlineSubsystem` | 12.4 s | 8.7 s |
+| **Total until the menu** | **27.7 s** | **23.5 s** |
 
-`missbench` (fichier absent, dossier de 20 000 fichiers) : nom long 10,5 ms → 86 µs, nom 8.3 11,3 ms → 77 µs. Le
-coût ne dépend plus de la taille du dossier.
+`missbench` (absent file, folder of 20,000 files): long name 10.5 ms → 86 µs, 8.3 name 11.3 ms → 77 µs. The
+cost no longer depends on the folder size.
 
-Le gain est de 4,2 s, deux fois moins que l'estimation (8 à 12 s). Les relectures de dossiers n'expliquaient donc pas
-tout le temps passé dans `InitOnlineSubsystem`.
+The gain is 4.2 s, half the estimate (8 to 12 s). The folder rereads therefore did not explain
+all the time spent in `InitOnlineSubsystem`.
 
-Le coût d'une recherche reste de 50 à 90 µs, contre 9 à 17 µs sous le Wine macOS. Ce reste vient des appels de chemin
-de LKD :
-- `newfstatat` : 8 µs ;
-- `openat` : 15 µs ;
-- `getxattr` : 17 µs.
+The cost of a lookup stays at 50 to 90 µs, against 9 to 17 µs under the macOS Wine. This remainder comes from LKD's path
+calls:
+- `newfstatat`: 8 µs;
+- `openat`: 15 µs;
+- `getxattr`: 17 µs.
 
-En natif, chacun coûte 1 à 3 µs, et une recherche Wine en fait 5 à 7. C'est une piste à profiler, avec le reste
-d'`InitOnlineSubsystem` (8,7 s).
+Natively, each costs 1 to 3 µs, and a Wine lookup makes 5 to 7 of them. It is a lead to profile, with the rest
+of `InitOnlineSubsystem` (8.7 s).
 
-## `LoadScriptPackages` et `InitOnlineSubsystem` en détail (21:30)
+## `LoadScriptPackages` and `InitOnlineSubsystem` in detail (21:30)
 
-Profil toutes les 2 s (`FEXDARWIN_PROFILE_MS=2000`), avec, pour chaque thread, les appels système qui lui ont pris le
-plus de temps. Ce lancement a pris 23,7 s, avec le correctif de casse : la mesure perturbe peu. `LoadScriptPackages`
-couvre de 21:30:30,4 à 21:30:40,2, et `InitOnlineSubsystem` de 21:30:41,8 à 21:30:50,6.
+Profile every 2 s (`FEXDARWIN_PROFILE_MS=2000`), with, for each thread, the system calls that took it the
+most time. This launch took 23.7 s, with the case fix: the measurement disturbs little. `LoadScriptPackages`
+covers from 21:30:30.4 to 21:30:40.2, and `InitOnlineSubsystem` from 21:30:41.8 to 21:30:50.6.
 
-| Tranche | Durée | Ce qui la limite |
+| Slice | Duration | What limits it |
 |---|---|---|
-| 30,4–31,6 | 1,2 s | fil principal : appels de fichiers (24 000 `getxattr`, 15 000 `newfstatat` en 2 s) |
-| 31,6–35,7 | 4,1 s | chargement asynchrone. `AsyncIOSystem` passe 95 % de son temps bloqué dans `read`, en attente des réponses de wineserver (environ 45 000 `read` et autant d'écritures par seconde, pour 4 500 vraies lectures de fichier, `pread64`). Le fil 117 fait 4 500 `mmap` et 4 500 `mprotect` par seconde (30 µs le `mmap`). wineserver traite environ 50 000 requêtes/s, à 37 % d'un cœur. Le fil principal attend en tournant (900 000 `sched_yield` en 2 s). |
-| 35,7–37,9 | 2,2 s | fil principal : calcul pur (100 % d'un cœur, presque sans appels système) |
-| 37,9–40,2 | 2,3 s | fil principal : appels de fichiers (75 000 `getxattr`, 67 000 `newfstatat`, 9 600 `openat` en 2 s) |
-| `InitOnlineSubsystem`, 41,8–50,6 | 8,8 s | fil principal à 100 %, environ 20 000 fichiers absents par seconde. Chaque seconde : 68 000 `newfstatat` (9 µs), 20 000 `openat` (18 µs), 20 000 `ioctl` de casse, 20 000 `close`. |
+| 30.4–31.6 | 1.2 s | main thread: file calls (24,000 `getxattr`, 15,000 `newfstatat` in 2 s) |
+| 31.6–35.7 | 4.1 s | asynchronous loading. `AsyncIOSystem` spends 95% of its time blocked in `read`, waiting for wineserver replies (about 45,000 `read` and as many writes per second, for 4,500 real file reads, `pread64`). Thread 117 makes 4,500 `mmap` and 4,500 `mprotect` per second (30 µs per `mmap`). wineserver handles about 50,000 requests/s, at 37% of a core. The main thread waits by spinning (900,000 `sched_yield` in 2 s). |
+| 35.7–37.9 | 2.2 s | main thread: pure computation (100% of a core, almost without system calls) |
+| 37.9–40.2 | 2.3 s | main thread: file calls (75,000 `getxattr`, 67,000 `newfstatat`, 9,600 `openat` in 2 s) |
+| `InitOnlineSubsystem`, 41.8–50.6 | 8.8 s | main thread at 100%, about 20,000 absent files per second. Each second: 68,000 `newfstatat` (9 µs), 20,000 `openat` (18 µs), 20,000 case `ioctl`, 20,000 `close`. |
 
-Deux causes se partagent donc environ 15 s des 23,7 s :
+Two causes therefore share about 15 s of the 23.7 s:
 
-- **Le coût des appels de chemin dans LKD (environ 10 s).** `fs_resolve` (`lkd/src/fs/vfs.c`) parcourt le chemin
-  composant par composant, et `lookup` fait un `lstat` hôte sur le chemin complet de chaque préfixe. Un chemin de
-  12 composants coûte donc 12 `lstat`, chacun sur un chemin long.
+- **The cost of path calls in LKD (about 10 s).** `fs_resolve` (`lkd/src/fs/vfs.c`) walks the path
+  component by component, and `lookup` does a host `lstat` on the full path of each prefix. A path of
+  12 components therefore costs 12 `lstat`, each on a long path.
 
-  Un échantillonnage de `missbench` (pas du jeu) le confirme : `lstat` fait 60 % des échantillons actifs,
-  `open` 17 %, `readlink` 7 %.
+  A sampling of `missbench` (not of the game) confirms it: `lstat` makes 60% of the active samples,
+  `open` 17%, `readlink` 7%.
 
-  Piste : tenter d'abord le reste du chemin en un seul `fstatat(..., AT_SYMLINK_NOFOLLOW_ANY)`. macOS fait alors
-  échouer l'appel dès qu'un composant est un lien symbolique, et on ne revient à la marche composant par composant
-  que dans ce cas, par exemple pour le lien `dosdevices/c:` de Wine. Pour un nom absent, on vérifie le parent de la
-  même façon. Il n'y a ni cache ni invalidation, donc la sémantique ne change pas.
+  Lead: first try the rest of the path in a single `fstatat(..., AT_SYMLINK_NOFOLLOW_ANY)`. macOS then makes
+  the call fail as soon as a component is a symbolic link, and we go back to the component-by-component walk
+  only in that case, for example for Wine's `dosdevices/c:` link. For an absent name, the parent is checked the
+  same way. There is no cache nor invalidation, so the semantics do not change.
 
-  Estimation : `newfstatat` de 9 à 3 µs environ, `openat` de 18 à 6 µs. Cela ferait environ −4 s sur
-  `InitOnlineSubsystem` et −1,5 s sur `LoadScriptPackages`, à vérifier avec `missbench`.
-- **Les allers-retours avec wineserver pendant le chargement asynchrone (environ 4 s).** Il faut savoir quelles
-  requêtes sont en cause (compteur par type de requête) avant de choisir entre ntsync dans LKD et un chemin d'E/S
-  asynchrones plus direct.
+  Estimate: `newfstatat` from 9 to about 3 µs, `openat` from 18 to 6 µs. This would make about −4 s on
+  `InitOnlineSubsystem` and −1.5 s on `LoadScriptPackages`, to be checked with `missbench`.
+- **The round trips with wineserver during the asynchronous loading (about 4 s).** We need to know which
+  requests are involved (counter per request type) before choosing between ntsync in LKD and a more direct
+  asynchronous I/O path.
 
-Le reste est du calcul (2,2 s, au niveau de Rosetta d'après `winbench`), plus `PreInit` (2,3 s) et les autres
-étapes.
+The rest is computation (2.2 s, at Rosetta level according to `winbench`), plus `PreInit` (2.3 s) and the other
+steps.
 
-## Après les correctifs de fichiers (21:56)
+## After the file fixes (21:56)
 
-Correctifs : LKD `daa6775` (dossiers ouverts en `O_SEARCH`, 1,6 µs au lieu de 7,3 µs sur macOS), LKD `fcf56ae`
-(`getxattr` consulte d'abord `listxattr`, 1 µs au lieu de 5,6 µs pour un attribut absent), voile-wine `c803a925`
-(une seule vérification de casse par recherche, au lieu de deux avec la recherche `nom?` des points d'analyse).
+Fixes: LKD `daa6775` (folders opened with `O_SEARCH`, 1.6 µs instead of 7.3 µs on macOS), LKD `fcf56ae`
+(`getxattr` first consults `listxattr`, 1 µs instead of 5.6 µs for an absent attribute), voile-wine `c803a925`
+(a single case check per lookup, instead of two with the `name?` lookup for reparse points).
 
-| Mesure | 17:22 | 21:19 (casse) | 21:56 |
+| Measurement | 17:22 | 21:19 (case) | 21:56 |
 |---|---|---|---|
-| `PreInit` | 2,3 s | 2,6 s | 1,6 s |
-| `LoadScriptPackages` | 9,9 s | 9,5 s | 8,7 s |
-| `InitOnlineSubsystem` | 12,4 s | 8,7 s | 6,3 s |
-| **Total jusqu'au menu (`Launch.log`)** | **27,7 s** | **23,5 s** | **19,2 s** |
-| Icône du Dock → fenêtre du jeu | | environ 17,8 s | environ 14,9 s |
-| Icône du Dock → menu | | environ 27,5 s | environ 22,2 s |
+| `PreInit` | 2.3 s | 2.6 s | 1.6 s |
+| `LoadScriptPackages` | 9.9 s | 9.5 s | 8.7 s |
+| `InitOnlineSubsystem` | 12.4 s | 8.7 s | 6.3 s |
+| **Total until the menu (`Launch.log`)** | **27.7 s** | **23.5 s** | **19.2 s** |
+| Dock icon → game window | | about 17.8 s | about 14.9 s |
+| Dock icon → menu | | about 27.5 s | about 22.2 s |
 
-Bancs d'essai (`missbench`, `enumbench`) :
-- fichier absent : 87–101 µs → 57–64 µs ;
-- entrée de dossier listée : 24,2 µs → 7,4 µs (Wine macOS : 4,4 µs).
+Benchmarks (`missbench`, `enumbench`):
+- absent file: 87–101 µs → 57–64 µs;
+- listed folder entry: 24.2 µs → 7.4 µs (macOS Wine: 4.4 µs).
 
-Ce que le jeu cherche en vain (échantillon d'un chemin sur 200, `FEXDARWIN_PROFILE_MISSES`) : environ 240 000 fois
-les mêmes fichiers de localisation (`TAGame.INT`, `ProductSlots.INT`…), dans des dossiers de surcharge qui
-n'existent pas :
-- `Documents/My Games/Rocket League/Engine/Localization/INT` ;
-- `…/ProjectX/Localization/INT` ;
-- `Engine/Localization` dans le dossier du jeu.
+What the game looks for in vain (sample of one path out of 200, `FEXDARWIN_PROFILE_MISSES`): about 240,000 times
+the same localization files (`TAGame.INT`, `ProductSlots.INT`…), in override folders that
+do not exist:
+- `Documents/My Games/Rocket League/Engine/Localization/INT`;
+- `…/ProjectX/Localization/INT`;
+- `Engine/Localization` in the game folder.
 
-Un essai écarté : résoudre en un seul `fstatat(AT_SYMLINK_NOFOLLOW_ANY)` les dossiers d'un chemin sans lien
-symbolique. Le gain n'était que de 0 à 9 %, parce que les chemins de Wine passent par `dosdevices/c:` ou
-`dosdevices/z:` puis par un changement de montage. Le test `deep_paths` est resté.
+A rejected trial: resolving in a single `fstatat(AT_SYMLINK_NOFOLLOW_ANY)` the folders of a path without symbolic
+link. The gain was only 0 to 9%, because Wine's paths go through `dosdevices/c:` or
+`dosdevices/z:` then through a mount change. The `deep_paths` test stayed.
 
-Ce qui reste avant la fenêtre :
-- le chargement asynchrone, limité par les allers-retours avec wineserver (environ 4 s, à compter par type de
-  requête) ;
-- le calcul pur du jeu (environ 2,2 s) ;
-- le démarrage de Wine et d'EAC (environ 3 s).
+What remains before the window:
+- the asynchronous loading, limited by the round trips with wineserver (about 4 s, to be counted per request
+  type);
+- the game's pure computation (about 2.2 s);
+- the startup of Wine and EAC (about 3 s).
 
-## Requêtes à wineserver par type, et Free Play sans limite (22:03 à 22:18)
+## Requests to wineserver by type, and uncapped Free Play (22:03 to 22:18)
 
-Compteur de requêtes de wineserver (voile-wine, branche `wineserver-request-stats`, `WINESERVER_REQUEST_STATS`)
-et cadence débridée côté moteur (`NPT_WSD_PACING=off`, `NPT_PRESENT_QUEUE=0`), puis limite d'i/s du jeu au maximum.
+wineserver request counter (voile-wine, branch `wineserver-request-stats`, `WINESERVER_REQUEST_STATS`)
+and unthrottled pacing on the engine side (`NPT_WSD_PACING=off`, `NPT_PRESENT_QUEUE=0`), then the game's fps limit at the maximum.
 
-| Phase | Requêtes par seconde | Remarque |
+| Phase | Requests per second | Remark |
 |---|---|---|
-| Chargement asynchrone (avant la fenêtre) | environ 45 000 : `event_op` 17 000, `close_handle` et `create_event` 8 000 chacune, `select` 6 000, `add_fd_completion` 5 000 | environ 6 allers-retours par lecture de fichier, tous sur le fil `AsyncIOSystem` |
-| Fermeture du jeu (15,7 s entre « AK Audio shut down » et « Object subsystem closed ») | environ 55 000 : `select` et `event_op` à parts égales | le fil principal réveille le fil de rendu environ 26 000 fois par seconde |
-| Free Play limité à 60 i/s | `event_op` environ 19 000, `select` environ 16 000 | |
-| Free Play débridé (environ 130 i/s) | `event_op` environ 41 000, `select` environ 8 000, `create_event` et `close_handle` environ 2 500 chacune | |
+| Asynchronous loading (before the window) | about 45,000: `event_op` 17,000, `close_handle` and `create_event` 8,000 each, `select` 6,000, `add_fd_completion` 5,000 | about 6 round trips per file read, all on the `AsyncIOSystem` thread |
+| Game shutdown (15.7 s between "AK Audio shut down" and "Object subsystem closed") | about 55,000: `select` and `event_op` in equal parts | the main thread wakes the render thread about 26,000 times per second |
+| Free Play capped at 60 fps | `event_op` about 19,000, `select` about 16,000 | |
+| Uncapped Free Play (about 130 fps) | `event_op` about 41,000, `select` about 8,000, `create_event` and `close_handle` about 2,500 each | |
 
-Free Play débridé : environ 130 i/s (6 à 9 ms par image).
-- Fil de rendu : 82 % d'un cœur, dont environ 20 % en attente active.
-- Fil principal : 56 % de son temps bloqué dans des allers-retours avec wineserver (environ 33 000 par seconde,
-  environ 250 par image).
-- Serveur de rendu : décodeur à 52 %. GPU à 43 %.
+Uncapped Free Play: about 130 fps (6 to 9 ms per frame).
+- Render thread: 82% of a core, about 20% of it busy-waiting.
+- Main thread: 56% of its time blocked in round trips with wineserver (about 33,000 per second,
+  about 250 per frame).
+- Render server: decoder at 52%. GPU at 43%.
 
-ntsync dans LKD rendrait les `event_op` et les `select` locaux. C'est la piste qui sert à la fois au chargement, à la
-fermeture et à la cadence au-delà de 60 i/s.
+ntsync in LKD would make the `event_op` and the `select` local. It is the lead that serves at once the loading, the
+shutdown and the pacing beyond 60 fps.
 
-**Incident EAC.** Avec ce wineserver instrumenté et son compteur actif, le montage du module EAC dans le jeu (« Wine
-module mapping ») a pris 1,4 s puis 2,4 s, au lieu de 0,5 s sur tous les autres lancements de la journée. Au second
-lancement, le jeu a démarré avant la fin du montage et s'est lancé sans EAC (`bAntiCheatEnabled=(False)`). Avec le
-wineserver d'origine, tout est revenu : 0,5 s et EAC actif.
+**EAC incident.** With this instrumented wineserver and its counter active, the mapping of the EAC module in the game ("Wine
+module mapping") took 1.4 s then 2.4 s, instead of 0.5 s on all the other launches of the day. At the second
+launch, the game started before the end of the mapping and launched without EAC (`bAntiCheatEnabled=(False)`). With the
+original wineserver, everything came back: 0.5 s and EAC active.
 
-La cause n'est pas comprise. Ce compteur reste donc hors de `main`, et ne doit plus servir pendant un lancement
-protégé avant d'avoir été compris.
+The cause is not understood. This counter therefore stays out of `main`, and must no longer be used during a protected
+launch before it has been understood.
 
-Cet incident montre aussi une course : le jeu peut démarrer avant la fin du montage d'EAC quand celui-ci est lent.
+This incident also shows a race: the game can start before the end of the EAC mapping when the mapping is slow.
 
-## ntsync dans LKD (23:00)
+## ntsync in LKD (23:00)
 
-`/dev/ntsync` dans LKD (`f90924f`, `lkd/docs/status/ntsync.md`). Wine 11 l'utilise sans changement : les attentes et
-les signaux d'événements, de mutex et de sémaphores restent dans le processus.
+`/dev/ntsync` in LKD (`f90924f`, `lkd/docs/status/ntsync.md`). Wine 11 uses it without change: the waits and
+the signals of events, mutexes and semaphores stay in the process.
 
-| Mesure | Sans ntsync | Avec ntsync |
+| Measurement | Without ntsync | With ntsync |
 |---|---|---|
-| `WaitForSingleObject(0)` (`winbench`) | 11,8 µs | 0,35 µs |
-| `SetEvent` | 10,7 µs | 0,16 µs |
-| Aller-retour d'événement entre deux fils | 34,7 µs | 8,7 µs |
-| Rocket League, jusqu'au menu (sans profil) | 19,1 à 19,2 s | 18,6 s |
-| Rocket League, « Quitter » → fin du processus | 17,6 à 18,1 s | 10,8 à 11,2 s |
-| Free Play débridé | environ 130 i/s | environ 150 i/s |
-| EAC (montage du module, `bAntiCheatEnabled`) | 0,5 s, True | 0,5 s, True |
+| `WaitForSingleObject(0)` (`winbench`) | 11.8 µs | 0.35 µs |
+| `SetEvent` | 10.7 µs | 0.16 µs |
+| Event round trip between two threads | 34.7 µs | 8.7 µs |
+| Rocket League, until the menu (without profile) | 19.1 to 19.2 s | 18.6 s |
+| Rocket League, "Quit" → end of the process | 17.6 to 18.1 s | 10.8 to 11.2 s |
+| Uncapped Free Play | about 130 fps | about 150 fps |
+| EAC (module mapping, `bAntiCheatEnabled`) | 0.5 s, True | 0.5 s, True |
 
-En Free Play débridé avec ntsync :
-- le fil principal n'attend plus wineserver ; il attend le fil de rendu (attentes ntsync) ;
-- le fil de rendu est la limite (88 % d'un cœur, dont environ 20 % dans l'attente active de `NtYieldExecution`).
+In uncapped Free Play with ntsync:
+- the main thread no longer waits for wineserver; it waits for the render thread (ntsync waits);
+- the render thread is the limit (88% of a core, about 20% of it in the busy-wait of `NtYieldExecution`).
 
-Frame back en Free Play à 60 i/s : 4,5/min (20:52, sans ntsync, profil actif), 23/min (23:05, avec ntsync),
-39/min (23:11, sans ntsync, `LKD_NTSYNC=0`, même binaire). Ils varient beaucoup d'une session à l'autre, et ntsync
-n'en est pas la cause. Leur cause connue reste à corriger : le signal « GPU terminé » de la copie de présentation
-arrive avant que le contenu soit en place.
+Frame back in Free Play at 60 fps: 4.5/min (20:52, without ntsync, profile active), 23/min (23:05, with ntsync),
+39/min (23:11, without ntsync, `LKD_NTSYNC=0`, same binary). They vary a lot from one session to another, and ntsync
+is not their cause. Their known cause remains to be fixed: the "GPU done" signal of the presentation copy
+arrives before the content is in place.
 
-## Frame back : cause et correctif (4 octobre, 00:05)
+## Frame back: cause and fix (October 4, 00:05)
 
-À chaque `Present`, le pilote invité Neptune arme un événement à usage unique. Cet événement est lié à la fence
-signalée après la copie dans l'image du swapchain. Son enregistrement (REGISTER) passait par le flux de commandes du
-renderer, alors que l'armement (ARM) et le `SetEventOnCompletion` passent par le ring de méthodes. Quand l'hôte
-décodait le REGISTER en dernier :
-- le proxy créé par l'ARM n'avait que la référence de l'armement ;
-- la fence de présentation relâchait cette référence en s'appariant ;
-- l'événement DXMT se fermait avant que le GPU le signale ;
-- la fermeture de son pipe (`POLLHUP` sans jeton) retirait la fence avant la copie.
+At each `Present`, the Neptune guest driver arms a single-use event. This event is tied to the fence
+signaled after the copy into the swapchain image. Its registration (REGISTER) went through the command stream of the
+renderer, while the arming (ARM) and the `SetEventOnCompletion` go through the method ring. When the host
+decoded the REGISTER last:
+- the proxy created by the ARM had only the reference of the arming;
+- the presentation fence released this reference when pairing;
+- the DXMT event closed before the GPU signaled it;
+- the closing of its pipe (`POLLHUP` without token) removed the fence before the copy.
 
-wsd montrait alors l'image avec son contenu de 2 ou 3 présentations plus tôt.
+wsd then showed the frame with its content from 2 or 3 presentations earlier.
 
-Ce qui l'a montré :
-- **La sonde de wsd** : au moment de l'encodage comme après le GPU, la mémoire contient encore les anciens pixels.
-  La copie n'avait donc pas eu lieu ; ce n'était pas un cache GPU.
-- **Le serveur de rendu instrumenté** : 189 fences retirées sur une fd morte en 71 s, toutes des jetons de swapchain.
-  Le proxy enregistré pour le jeton à ce moment n'avait jamais créé de pipe : c'était un second proxy, créé par le
-  REGISTER arrivé en retard.
+What showed it:
+- **The wsd probe**: at encoding time as well as after the GPU, the memory still contains the old pixels.
+  The copy therefore had not happened; it was not a GPU cache.
+- **The instrumented render server**: 189 fences removed on a dead fd in 71 s, all swapchain tokens.
+  The proxy registered for the token at that moment had never created a pipe: it was a second proxy, created by the
+  REGISTER that arrived late.
 
-Correctif : Neptune `22d94ed`. Le REGISTER et le RELEASE de ces jetons passent par le ring de méthodes, comme les
-événements Win32 de `npt_event_arm`.
+Fix: Neptune `22d94ed`. The REGISTER and the RELEASE of these tokens go through the method ring, like the
+Win32 events of `npt_event_arm`.
 
-| Free Play à 60 i/s | Avant (23:58) | Après (00:04) |
+| Free Play at 60 fps | Before (23:58) | After (00:04) |
 |---|---|---|
-| Fences retirées sur une fd morte | 189 en 71 s | 0 en 2 min |
-| Frame back vus par wsd | 45 en environ 65 s (39/min) | 2 en 2 min |
+| Fences removed on a dead fd | 189 in 71 s | 0 in 2 min |
+| Frame back seen by wsd | 45 in about 65 s (39/min) | 2 in 2 min |
 
-Les 2 restants tombent la même seconde, pendant des images tenues 50 à 70 ms au chargement. La sonde de wsd note
-maintenant aussi ce que contient la mémoire à l'encodage et après le GPU.
+The 2 remaining ones fall in the same second, during frames held 50 to 70 ms at loading. The wsd probe now also notes
+what the memory contains at encoding and after the GPU.
 
-## Présentation de wsd et `NtYieldExecution` : mesurés, laissés tels quels (4 octobre, 00:30)
+## wsd presentation and `NtYieldExecution`: measured, left as is (October 4, 00:30)
 
-### Où passent les 15,6 ms entre soumission et affichage
+### Where the 15.6 ms between submission and display go
 
-Pour cette mesure, wsd datait chaque image :
-- réception ;
-- tick du display link, avec son `timestamp` et son `targetTimestamp` ;
-- `nextDrawable` et commit ;
-- début et fin du GPU ;
+For this measurement, wsd timestamped each frame:
+- reception;
+- display link tick, with its `timestamp` and its `targetTimestamp`;
+- `nextDrawable` and commit;
+- GPU start and end;
 - `presentedTime`.
 
-Toutes les 120 images, il écrivait les médianes. Cette datation n'est pas restée dans wsd. Conditions :
-- Free Play à 60 i/s, cadence `after` ;
-- écran externe à 240 Hz (ASUS XG27AQWMG, un rafraîchissement toutes les 4,17 ms) ;
-- les mêmes binaires que dans « Frame back ».
+Every 120 frames, it wrote the medians. This timestamping did not stay in wsd. Conditions:
+- Free Play at 60 fps, `after` pacing;
+- external display at 240 Hz (ASUS XG27AQWMG, one refresh every 4.17 ms);
+- the same binaries as in "Frame back".
 
-| Segment (médianes par lot de 120 images) | Free Play |
+| Segment (medians per batch of 120 frames) | Free Play |
 |---|---|
-| Envoi nptunix → wsd | 0,02 ms |
-| Attente du tick | 3,7 à 4,0 ms |
-| Retard du tick sur le vsync | 0,3 à 1,2 ms |
-| `nextDrawable` + encodage | 0,1 ms |
-| Commit → début du GPU | 0,55 ms |
-| GPU (copie dans le drawable) | 0,05 ms |
-| Fin du GPU → affichage | 10,8 à 11,5 ms |
-| **Soumission → affichage** | **15,6 à 16,0 ms** (11,9 ms quand la phase est favorable) |
+| nptunix → wsd sending | 0.02 ms |
+| Wait for the tick | 3.7 to 4.0 ms |
+| Tick delay over the vsync | 0.3 to 1.2 ms |
+| `nextDrawable` + encoding | 0.1 ms |
+| Commit → GPU start | 0.55 ms |
+| GPU (copy into the drawable) | 0.05 ms |
+| GPU end → display | 10.8 to 11.5 ms |
+| **Submission → display** | **15.6 to 16.0 ms** (11.9 ms when the phase is favorable) |
 
-- **La composition coûte deux rafraîchissements.** 97 % des images s'affichent 3 rafraîchissements (12,5 ms) après le
-  vsync de leur tick, environ 1 % un plus tôt et environ 1 % un plus tard. Le GPU a pourtant fini 1,5 ms après ce
-  vsync. Le reste est la composition de macOS : la fenêtre a deux couches, celle de la fenêtre et celle du jeu
-  par-dessus.
-- **L'image attend presque un rafraîchissement entier avant d'être encodée.** Le jeu se cale sur l'évènement
-  « affichée » et renvoie son image juste après un tick. Quand l'image arrive juste avant un tick, l'attente tombe à
-  0,3 ou 0,5 ms, et le total à 11,9 ms.
-- **Sonde, 8 essais :** de l'entrée à la soumission, 40,5 ms en médiane (de 27,4 à 42,6 ms). Le total est donc
-  d'environ 56 ms.
-- nptunix attend 15,8 ms par `Present`. Aucun frame back pendant la mesure.
+- **Composition costs two refreshes.** 97% of the frames are displayed 3 refreshes (12.5 ms) after the
+  vsync of their tick, about 1% one earlier and about 1% one later. Yet the GPU finished 1.5 ms after this
+  vsync. The rest is the macOS composition: the window has two layers, the window's and the game's
+  on top.
+- **The frame waits almost a whole refresh before being encoded.** The game locks onto the
+  "displayed" event and sends its frame right after a tick. When the frame arrives right before a tick, the wait drops to
+  0.3 or 0.5 ms, and the total to 11.9 ms.
+- **Probe, 8 attempts:** from input to submission, 40.5 ms median (from 27.4 to 42.6 ms). The total is therefore
+  about 56 ms.
+- nptunix waits 15.8 ms per `Present`. No frame back during the measurement.
 
-Pistes chiffrées, non faites : l'utilisateur a jugé le gain trop faible.
+Leads with figures, not done: the user judged the gain too small.
 
-| Piste | Gain attendu à 240 Hz |
+| Lead | Expected gain at 240 Hz |
 |---|---|
-| Présenter dès l'arrivée quand aucune image du plan n'attend l'affichage, au lieu d'attendre le tick | De 0 à 4 ms, selon l'heure limite du compositeur, inconnue |
-| Affichage direct sans compositeur (une seule couche plein écran) | Jusqu'à 2 rafraîchissements (8,3 ms) si macOS l'accepte, ce qui n'est pas établi |
-| 2 drawables au lieu de 3 | Rien : avec la cadence `after`, une seule image est en vol |
+| Present on arrival when no frame of the plane is waiting for display, instead of waiting for the tick | From 0 to 4 ms, depending on the compositor's deadline, unknown |
+| Direct display without compositor (a single fullscreen layer) | Up to 2 refreshes (8.3 ms) if macOS accepts it, which is not established |
+| 2 drawables instead of 3 | Nothing: with `after` pacing, a single frame is in flight |
 
-Sur un écran à 120 Hz, ces durées devraient doubler, mais ce n'est pas mesuré. L'estimation de 4 à 10 ms du tableau
-des couches supposait un tel écran.
+On a 120 Hz display, these durations should double, but this is not measured. The 4 to 10 ms estimate of the layers
+table assumed such a display.
 
-### `NtYieldExecution` : pas de changement
+### `NtYieldExecution`: no change
 
-- **Le jeu ignore la valeur de retour.** `RocketLeague.exe` appelle `SwitchToThread` depuis environ 70 endroits.
-  - La plupart sont des verrous en attente active : `lock cmpxchg` sur un octet, puis `pause` 1, 2, 4, 8 et 16 fois,
-    puis `SwitchToThread` à chaque nouvel essai.
-  - Les autres sont des boucles sur un drapeau global.
-  - Après chaque appel, `eax` est remis à zéro ou rechargé : la valeur de retour n'est jamais lue.
-- **Un yield moins cher n'économiserait pas de CPU.** Un fil dans ces boucles tourne jusqu'à ce que le verrou se
-  libère, quel que soit le coût d'un tour. Un yield moins cher donne plus de tours, pas moins de CPU. L'estimation
-  « environ 0,1 à 0,2 cœur » du tableau des couches était donc fausse : on gagnerait 2 appels système par yield, et
-  une reprise de verrou plus rapide de moins d'une microseconde.
-- **Décision de l'utilisateur : on ne touche à rien.** D'autres jeux peuvent lire la valeur de retour de
-  `SwitchToThread`. `thread_rusage` de LKD continue de renvoyer 0 changement de contexte, donc `SwitchToThread`
-  répond toujours FALSE sous le moteur.
+- **The game ignores the return value.** `RocketLeague.exe` calls `SwitchToThread` from about 70 places.
+  - Most are busy-waiting locks: `lock cmpxchg` on a byte, then `pause` 1, 2, 4, 8 and 16 times,
+    then `SwitchToThread` at each new attempt.
+  - The others are loops on a global flag.
+  - After each call, `eax` is reset to zero or reloaded: the return value is never read.
+- **A cheaper yield would not save CPU.** A thread in these loops spins until the lock is
+  released, whatever the cost of a turn. A cheaper yield gives more turns, not less CPU. The estimate
+  "about 0.1 to 0.2 core" of the layers table was therefore wrong: we would gain 2 system calls per yield, and
+  a lock reacquisition faster by less than a microsecond.
+- **User decision: we touch nothing.** Other games may read the return value of
+  `SwitchToThread`. LKD's `thread_rusage` keeps returning 0 context switches, so `SwitchToThread`
+  always answers FALSE under the engine.
 
-### Mesures retirées
+### Measurements removed
 
-À la demande de l'utilisateur, aucune mesure ne tourne plus à chaque image dans wsd. Le détecteur de frame back
-(copie GPU de 64 pixels et deux lectures CPU de 64 pixels par image) est retiré : le correctif de Neptune `22d94ed`
-a supprimé ce qu'il cherchait. Pour s'en servir à nouveau, il faut reprendre wsd à `ff71f31`. La sonde de latence
-reste, car elle ne fait rien tant qu'aucune entrée `wsdctl` ne l'active.
+At the user's request, no measurement runs at each frame in wsd anymore. The frame back detector
+(GPU copy of 64 pixels and two CPU reads of 64 pixels per frame) is removed: the Neptune fix `22d94ed`
+removed what it was looking for. To use it again, wsd must be taken back to `ff71f31`. The latency probe
+stays, because it does nothing as long as no `wsdctl` input enables it.
 
-## Release Voile v26.3.0-9 (4 octobre, 02:00)
+## Voile release v26.3.0-9 (October 4, 02:00)
 
-Contenu, pour le moteur Linux :
-- ntsync ;
-- les correctifs de fichiers ;
-- le correctif des frame backs ;
-- wsd sans son détecteur ;
-- FEXCore sans ses assertions (`e20b270`).
+Content, for the Linux engine:
+- ntsync;
+- the file fixes;
+- the frame back fix;
+- wsd without its detector;
+- FEXCore without its assertions (`e20b270`).
 
-voile-lkd et Neptune sont maintenant des sous-modules de Voile, comme voile-wine. `build-linux.sh` les compile ; les
-archives `lkd-*` et `neptune-*` ne servent plus.
+voile-lkd and Neptune are now submodules of Voile, like voile-wine. `build-linux.sh` compiles them; the
+`lkd-*` and `neptune-*` archives are no longer used.
 
-| Mesure | v26.3.0-9 |
+| Measurement | v26.3.0-9 |
 |---|---|
-| Archive | 400 Mo (406,5 Mo pour la -8) |
-| Rocket League, EAC | `bAntiCheatEnabled=(True)` sur tous les lancements qui ont atteint le jeu |
-| Programmes témoins x86-64, FEX sans assertions | mêmes codes de sortie qu'avec assertions (21 sur 21) |
+| Archive | 400 MB (406.5 MB for the -8) |
+| Rocket League, EAC | `bAntiCheatEnabled=(True)` on all the launches that reached the game |
+| x86-64 witness programs, FEX without assertions | same exit codes as with assertions (21 out of 21) |
 
-**Retrait des tables de symboles : essayé, puis abandonné.** Voile retirait déjà les infos de débogage ; il a
-essayé d'enlever aussi les tables de symboles :
-- PE : `--strip-all` ;
-- Mach-O : `strip -x` pour les bibliothèques, `strip` pour les programmes ;
-- ELF : `--strip-all`.
+**Removal of the symbol tables: tried, then abandoned.** Voile already removed the debug info; it
+tried to also remove the symbol tables:
+- PE: `--strip-all`;
+- Mach-O: `strip -x` for the libraries, `strip` for the programs;
+- ELF: `--strip-all`.
 
-Le gain était de 32 Mo. À la demande de l'utilisateur, Voile est revenu à `strip -S` et `--strip-debug`, comme pour
-la -8. Pendant les essais, deux incidents :
-- **Premier lancement après l'installation** (moteur sans symboles), donc avec mise à jour du préfixe par
-  wineboot :
-  - Rocket League s'est arrêté au démarrage sur des données corrompues (`Bad name index 359464960/2678:
-    Core.upk`) ;
-  - puis le lanceur d'EAC a planté (liste au pointeur `0xffffffffffffd8f0`).
-- **Lancement avec mise à jour du préfixe forcée** (`.update-timestamp`), même moteur : écran noir. Deux fils du
-  jeu tournaient à 99 %, et une section critique était bloquée depuis plus de 60 s.
+The gain was 32 MB. At the user's request, Voile went back to `strip -S` and `--strip-debug`, as for
+the -8. During the trials, two incidents:
+- **First launch after the installation** (engine without symbols), therefore with a prefix update by
+  wineboot:
+  - Rocket League stopped at startup on corrupted data (`Bad name index 359464960/2678:
+    Core.upk`);
+  - then the EAC launcher crashed (list at pointer `0xffffffffffffd8f0`).
+- **Launch with forced prefix update** (`.update-timestamp`), same engine: black screen. Two threads of the
+  game were running at 99%, and a critical section had been blocked for more than 60 s.
 
-Les lancements suivants ont tous marché, sans les symboles comme avec : un moteur avec assertions, le moteur sans
-assertions non élagué, puis élagué, puis le paquet final. La cause n'est pas trouvée. Les deux incidents tombent sur
-une mise à jour du préfixe, quand beaucoup de processus Windows démarrent ensemble ; ntsync est une piste.
+The following launches all worked, without the symbols as with them: an engine with assertions, the engine without
+assertions unstripped, then stripped, then the final package. The cause is not found. Both incidents fall on
+a prefix update, when many Windows processes start together; ntsync is a lead.
 
-Ce qu'il faut faire au prochain incident :
-- avoir `FEXDARWIN_DUMP_DIR` dans `engine/fexdarwin.env` ;
-- toucher `dump-request` pendant le blocage ;
-- pour reproduire, forcer la mise à jour (`printf '1\n' > <prefix>/.update-timestamp`).
+What to do at the next incident:
+- have `FEXDARWIN_DUMP_DIR` in `engine/fexdarwin.env`;
+- touch `dump-request` during the hang;
+- to reproduce, force the update (`printf '1\n' > <prefix>/.update-timestamp`).
 
-**Bug de wsd sur deux écrans.** Le `HELLO` de wsd donne la taille de `NSScreen.mainScreen`, l'écran de la fenêtre
-active. Avec l'écran du MacBook allumé, Rocket League a reçu 3024x1964 alors que sa fenêtre était sur l'écran à
-2560x1440, et son image dépassait. Corrigé dans `6a197ac` : wsd donne l'écran de la barre des menus, qui est
-déjà l'origine de ses coordonnées. Vérifié avec Obelisk sur l'écran du MacBook : le jeu reçoit 2560x1440.
+**wsd bug on two displays.** wsd's `HELLO` gives the size of `NSScreen.mainScreen`, the display of the active
+window. With the MacBook display on, Rocket League received 3024x1964 while its window was on the
+2560x1440 display, and its frame overflowed. Fixed in `6a197ac`: wsd gives the display of the menu bar, which is
+already the origin of its coordinates. Checked with Obelisk on the MacBook display: the game receives 2560x1440.
 
-## Mesures suivantes
+## Next measurements
 
-- **Appels système par thread et par type.** Le profil donne les totaux par thread et les types par processus, mais
-  pas les deux ensemble. C'est nécessaire pour savoir quel fil fait les requêtes à wineserver et ce qui borne
+- **System calls per thread and per type.** The profile gives the totals per thread and the types per process, but
+  not both together. It is needed to know which thread makes the requests to wineserver and what bounds
   `LoadScriptPackages`.
-- **Requêtes de wineserver par type** (point 4 ci-dessus).
-- **Temps d'image sans limite** (`NPT_WSD_PACING=off`, limite d'i/s du jeu au maximum), pour connaître la vraie marge
-  et la pièce qui sature en premier.
+- **wineserver requests by type** (point 4 above).
+- **Uncapped frame time** (`NPT_WSD_PACING=off`, the game's fps limit at the maximum), to know the real margin
+  and the part that saturates first.
 
-## Reproduire
+## Reproduce
 
-- Profil : `FEXDARWIN_PROFILE=1` (et `FEXDARWIN_HITCH_LOG=1`, au choix) dans `engine/fexdarwin.env` ; ajouter
-  `guest WINE_OBELISK_LATENCY=1` pour les heures du pilote. Les lignes vont dans `~/Library/Logs/Obelisk/Epic/wine-<jeu>.log`.
-- Fils natifs et GPU : `clang -O2 -o engine-top tools/dev/engine-top.c -framework IOKit -framework CoreFoundation`,
-  puis `engine-top 5`.
-- Latence : au menu, `wsdctl $TMPDIR/obelisk-engine-<pid>/wsd.sock tap 56` (Maj, active la sonde), puis
-  `tap 125`/`tap 126`. En Free Play, `tap 49` (caméra balle). Lignes `wsd: probe:` dans le journal.
-- Bancs d'essai : compiler avec `x86_64-w64-mingw32-clang -O2` (llvm-mingw de Voile). Les lancer par
-  `crates/game-runtime/src/linux_engine/launch.sh` d'Obelisk, sous `run-with-timeout.sh`, puis vérifier
+- Profile: `FEXDARWIN_PROFILE=1` (and `FEXDARWIN_HITCH_LOG=1`, optionally) in `engine/fexdarwin.env`; add
+  `guest WINE_OBELISK_LATENCY=1` for the driver timestamps. The lines go to `~/Library/Logs/Obelisk/Epic/wine-<game>.log`.
+- Native threads and GPU: `clang -O2 -o engine-top tools/dev/engine-top.c -framework IOKit -framework CoreFoundation`,
+  then `engine-top 5`.
+- Latency: in the menu, `wsdctl $TMPDIR/obelisk-engine-<pid>/wsd.sock tap 56` (Shift, enables the probe), then
+  `tap 125`/`tap 126`. In Free Play, `tap 49` (ball camera). `wsd: probe:` lines in the log.
+- Benchmarks: compile with `x86_64-w64-mingw32-clang -O2` (Voile's llvm-mingw). Run them through Obelisk's
+  `crates/game-runtime/src/linux_engine/launch.sh`, under `run-with-timeout.sh`, then check
   `pgrep -x fexdarwin-run`.
 
-## Cadence sur l'écran du MacBook et wineserver qui tourne à vide (7 octobre)
+## Pacing on the MacBook display and wineserver spinning idle (October 7)
 
-Machine : la même, mais sur l'écran intégré (ProMotion, 120 Hz), sur secteur. Runtime Voile `v26.3.0-11`. Scène :
-Free Play, Forbidden Temple, caméra balle, voiture à l'arrêt, fenêtre 2560x1408, VSync décochée. Les lancements se
-font depuis Obelisk, piloté par l'accessibilité, et le jeu est conduit au clavier et à la souris par `wsdctl`.
+Machine: the same, but on the built-in display (ProMotion, 120 Hz), on mains power. Voile runtime `v26.3.0-11`. Scene:
+Free Play, Forbidden Temple, ball camera, car stopped, window 2560x1408, VSync unchecked. The launches are
+done from Obelisk, driven through accessibility, and the game is driven with keyboard and mouse by `wsdctl`.
 
-### Mesures
+### Measurements
 
-| Mesure | v26.3.0-11 | Cadence `latch` | `latch` + correctif epoll |
+| Measurement | v26.3.0-11 | `latch` pacing | `latch` + epoll fix |
 |---|---|---|---|
-| Images affichées, Free Play | 30,5 i/s | 120 i/s | 120 i/s |
-| Images affichées, menu | 33 i/s | 120 i/s | 120 i/s |
-| Entrée → image qui réagit soumise (12 essais) | 62 à 98 ms, médiane 77 | 18 à 30 ms, médiane 20 | 17,5 à 23,6 ms, médiane 21 |
-| Soumission → affichage | 33 ms | 32 ms | 32 ms |
-| CPU du moteur (engine-top), Free Play | 0,55 cœur | 2,22 cœurs | 1,46 cœur |
-| wineserver | | 78 % d'un cœur | 8 % d'un cœur |
-| Free Play débridé (cadence `off`, `UncappedFramerate=True`) | | 184 à 196 i/s, 3,0 cœurs | 185 à 210 i/s, 2,4 cœurs |
-| Démarrage (`EULA sync response`) | 20,5 s | | 20,7 s |
-| EAC (`bAntiCheatEnabled`) | True | True | True à chaque lancement |
+| Frames displayed, Free Play | 30.5 fps | 120 fps | 120 fps |
+| Frames displayed, menu | 33 fps | 120 fps | 120 fps |
+| Input → reacting frame submitted (12 attempts) | 62 to 98 ms, median 77 | 18 to 30 ms, median 20 | 17.5 to 23.6 ms, median 21 |
+| Submission → display | 33 ms | 32 ms | 32 ms |
+| Engine CPU (engine-top), Free Play | 0.55 core | 2.22 cores | 1.46 cores |
+| wineserver | | 78% of a core | 8% of a core |
+| Uncapped Free Play (`off` pacing, `UncappedFramerate=True`) | | 184 to 196 fps, 3.0 cores | 185 to 210 fps, 2.4 cores |
+| Startup (`EULA sync response`) | 20.5 s | | 20.7 s |
+| EAC (`bAntiCheatEnabled`) | True | True | True at each launch |
 
-### Cadence : attendre la prise de l'image, plus son affichage
+### Pacing: wait for the frame to be latched, plus its display
 
-Avec la cadence `after`, nptunix attendait l'évènement `EV_PRESENTED` de chaque image, donc la composition de macOS
-(3 à 4 rafraîchissements sur l'écran intégré, 25 à 33 ms) faisait partie de chaque image. Sur un écran à 120 Hz, le
-jeu plafonnait à 30 i/s. Les intervalles affichés tombaient sur 25 et 33,3 ms, des multiples du tick de 8,33 ms : le
-display link tournait bien à 120 Hz.
+With the `after` pacing, nptunix waited for the `EV_PRESENTED` event of each frame, so the macOS composition
+(3 to 4 refreshes on the built-in display, 25 to 33 ms) was part of each frame. On a 120 Hz display, the
+game capped at 30 fps. The displayed intervals fell on 25 and 33.3 ms, multiples of the 8.33 ms tick: the
+display link was indeed running at 120 Hz.
 
-La nouvelle cadence `latch` (par défaut) attend `EV_RELEASE` de l'image envoyée, reconnue par son numéro de série :
-wsd l'a copiée dans un drawable à un tick, ou l'a remplacée. Le jeu reste calé sur la fréquence de l'écran avec une
-seule image en file, et la composition se superpose aux images suivantes. `after`, `before` et `off` restent
-disponibles par `NPT_WSD_PACING`.
+The new `latch` pacing (default) waits for `EV_RELEASE` of the sent frame, recognized by its serial number:
+wsd copied it into a drawable at a tick, or replaced it. The game stays locked to the display's refresh rate with a
+single frame queued, and the composition overlaps the following frames. `after`, `before` and `off` remain
+available through `NPT_WSD_PACING`.
 
-Vérifié : VSync activée puis désactivée, passage en sans bordure puis retour en fenêtré, fenêtre minimisée (environ
-16 i/s, attentes bornées à 100 ms) puis restaurée (retour à 118 i/s en quelques secondes).
+Checked: VSync enabled then disabled, switch to borderless then back to windowed, window minimized (about
+16 fps, waits bounded to 100 ms) then restored (back to 118 fps in a few seconds).
 
-Essai écarté : demander au display link la fréquence maximale de l'écran (`preferredFrameRateRange`). Aucun effet,
-le display link tournait déjà à 120 Hz.
+Rejected trial: asking the display link for the display's maximum refresh rate (`preferredFrameRateRange`). No effect,
+the display link was already running at 120 Hz.
 
-### epoll de LKD : un filtre qui ne surveille que la fermeture tournait en boucle
+### LKD epoll: a filter that watches only for closing spun in a loop
 
-C'est l'anomalie d'epoll de wineserver notée le 3 octobre. Un compteur dans `do_wait` a montré environ 300 000 tours
-à vide par seconde, toujours sur une socket. wineserver met `events` à 0 sur une socket de client qu'il ne veut pas
-lire tout de suite. LKD enregistrait quand même un filtre kqueue de lecture, déclenché par niveau, pour voir la
-fermeture. Tant que la socket gardait des données non lues, kqueue la signalait à chaque attente, `ep_collect` ne
-trouvait rien de demandé, et `epoll_wait` repartait aussitôt.
+It is the wineserver epoll anomaly noted on October 3. A counter in `do_wait` showed about 300,000 idle turns
+per second, always on a socket. wineserver sets `events` to 0 on a client socket that it does not want to
+read right away. LKD still registered a level-triggered kqueue read filter, to see the
+closing. As long as the socket kept unread data, kqueue reported it at each wait, `ep_collect` found
+nothing requested, and `epoll_wait` started again immediately.
 
-Correctif : quand l'élément ne demande ni `EPOLLIN` ni `EPOLLRDNORM` (`events` à 0, ou `EPOLLRDHUP` seul), le filtre
-de lecture est déclenché par front (`EV_CLEAR`). Il réveille une fois par nouvelle donnée ou à la fermeture. Quand le
-mode du filtre change, LKD le retire puis le remet. Test `hangup_only_watch_does_not_spin` dans `test_net_epoll` :
-il échoue avant le correctif (le temps CPU de l'attente) et passe après. Les six suites réseau passent.
+Fix: when the item requests neither `EPOLLIN` nor `EPOLLRDNORM` (`events` at 0, or `EPOLLRDHUP` alone), the read
+filter is edge-triggered (`EV_CLEAR`). It wakes once per new data or at closing. When the
+filter mode changes, LKD removes it then puts it back. Test `hangup_only_watch_does_not_spin` in `test_net_epoll`:
+it fails before the fix (the CPU time of the wait) and passes after. The six network suites pass.
 
-Deux constats sans rapport avec ce correctif :
-- LKD ne signale pas `EPOLLHUP` sur une socket dont le pair a fermé tant qu'elle garde des données non lues (même
-  résultat avant et après).
-- `test_sig_futex` bloque dans le cas `waitv` (même résultat avant et après).
+Two findings unrelated to this fix:
+- LKD does not report `EPOLLHUP` on a socket whose peer has closed as long as it keeps unread data (same
+  result before and after).
+- `test_sig_futex` hangs in the `waitv` case (same result before and after).
 
-### Profil du fil de rendu (Free Play débridé)
+### Profile of the render thread (uncapped Free Play)
 
-Un échantillonneur temporaire (suspension de chaque fil invité, PC hôte traduit en RIP invité par
-`RestoreRIPFromHostPC`, retiré depuis) donne :
-- code du jeu 15 à 17 % ;
-- `d3d11.dll` de Neptune 13 à 15 %, dont 5 % dans la soumission au ring (verrou, `sfence`, barrière complète,
-  échange atomique à chaque commande) ;
-- `memmove` et `memcmp` d'ucrtbase 5 % ;
-- l'attente active du jeu (`NtYieldExecution` : deux `getrusage` et un `sched_yield`) environ 30 % ;
-- des allers-retours avec wineserver 6 à 14 % : `NtCreateEvent`, puis `get_inproc_sync` qui va chercher le
-  descripteur ntsync de chaque nouvel évènement ;
-- le reste en attentes ntsync.
+A temporary sampler (suspension of each guest thread, host PC translated to guest RIP by
+`RestoreRIPFromHostPC`, removed since) gives:
+- game code 15 to 17%;
+- Neptune's `d3d11.dll` 13 to 15%, 5% of it in the submission to the ring (lock, `sfence`, full barrier,
+  atomic exchange at each command);
+- ucrtbase's `memmove` and `memcmp` 5%;
+- the game's busy-wait (`NtYieldExecution`: two `getrusage` and one `sched_yield`) about 30%;
+- round trips with wineserver 6 to 14%: `NtCreateEvent`, then `get_inproc_sync` which fetches the
+  ntsync descriptor of each new event;
+- the rest in ntsync waits.
 
-Le fil principal attend surtout le fil de rendu (ntsync) et fait des ioctls de socket (13 %). Fautes SMC : 4 en 11 s,
-JIT : 4 ms. Dans le serveur de rendu, environ 9 % du décodeur part dans `dxmt::guid::make_guid_helper` :
-`__uuidof` y relit le texte du GUID à chaque `QueryInterface`.
+The main thread mostly waits for the render thread (ntsync) and makes socket ioctls (13%). SMC faults: 4 in 11 s,
+JIT: 4 ms. In the render server, about 9% of the decoder goes into `dxmt::guid::make_guid_helper`:
+`__uuidof` rereads the GUID text there at each `QueryInterface`.
 
-### Essais écartés
+### Rejected trials
 
-| Essai | Résultat |
+| Trial | Result |
 |---|---|
-| `TSOEnabled=0` | Le jeu plante dans `d3d11.dll` (le ring de Neptune dépend de l'ordre mémoire x86). |
-| QoS user-interactive pour tous les fils invités | 189 à 211 i/s débridé (moyenne +6 %), mais un lancement sur six sans EAC. |
-| D3DMetal (serveur de rendu x86_64 sous Rosetta) | Image correcte, 119,4 i/s, 212 i/s débridé (comme DXMT), démarrage 22,5 s. Premier lancement sans EAC. |
-| Métadonnées volatiles des PE (TSO désactivé hors accès volatils) | Aucun des jeux installés n'en a. |
+| `TSOEnabled=0` | The game crashes in `d3d11.dll` (Neptune's ring depends on x86 memory ordering). |
+| User-interactive QoS for all guest threads | 189 to 211 fps uncapped (average +6%), but one launch out of six without EAC. |
+| D3DMetal (x86_64 render server under Rosetta) | Correct frame, 119.4 fps, 212 fps uncapped (like DXMT), startup 22.5 s. First launch without EAC. |
+| PE volatile metadata (TSO disabled outside volatile accesses) | None of the installed games has any. |
 
-### EAC : la course du montage du module
+### EAC: the module mapping race
 
-Sur tous les journaux de lancement de la journée, EAC est absent exactement quand « Wine module mapping » a duré
-2,31 s (d'habitude 0,37 à 0,41 s ; un lancement à 1,08 s est resté actif). Les deux cas : un lancement avec la QoS
-user-interactive, et le premier lancement de D3DMetal, pendant que Rosetta traduisait le serveur de rendu. Toute
-charge forte au moment du lancement peut donc désactiver EAC. C'est à corriger pour lui-même.
+On all the launch logs of the day, EAC is absent exactly when "Wine module mapping" lasted
+2.31 s (usually 0.37 to 0.41 s; a launch at 1.08 s stayed active). The two cases: a launch with the
+user-interactive QoS, and the first D3DMetal launch, while Rosetta was translating the render server. Any
+heavy load at launch time can therefore disable EAC. It is to be fixed for its own sake.
 
-Suite (8 octobre). Les deux échecs durent 2,305 et 2,306 s : c'est un délai fixe d'environ 2 s dans la bootstrapper,
-pas une lenteur quelconque. Les deux lancements ratés démarraient aussi le jeu bien plus lentement (préinitialisation
-de 5,4 s contre 1,4 s avec D3DMetal). Un lancement avec les 18 cœurs saturés par 18 boucles `yes` pendant 25 s à partir
-du clic : montage en 0,386 s, EAC actif. Une charge CPU ordinaire ne suffit donc pas. Aucun échec sur plus de 45
-lancements avec la configuration retenue. Ce qu'attend la bootstrapper pendant ces 2 s reste inconnu.
+Follow-up (October 8). The two failures last 2.305 and 2.306 s: it is a fixed delay of about 2 s in the bootstrapper,
+not just any slowness. The two failed launches also started the game much more slowly (preinitialization
+of 5.4 s against 1.4 s with D3DMetal). A launch with the 18 cores saturated by 18 `yes` loops for 25 s from
+the click: mapping in 0.386 s, EAC active. An ordinary CPU load is therefore not enough. No failure over more than 45
+launches with the chosen configuration. What the bootstrapper waits for during these 2 s remains unknown.
 
-## La cadence suit la VSync du jeu (8 octobre)
+## The pacing follows the game's VSync (October 8)
 
-Le `SyncInterval` de chaque `Present` va maintenant de Neptune (D3D11 et D3D12) jusqu'à nptunix (Neptune `144f613`,
-voile-wine `5ec9624`). Un `Present` avec VSync attend la prise de l'image par wsd (`latch`), un `Present` sans VSync
-n'attend rien, comme sur Windows. `NPT_WSD_PACING` impose toujours un mode pour toutes les images. Obelisk recopie le
-`d3d11.dll` du runtime dans le préfixe avant chaque lancement, donc le pilote et nptunix ont toujours la même structure
-de paramètres.
+The `SyncInterval` of each `Present` now goes from Neptune (D3D11 and D3D12) to nptunix (Neptune `144f613`,
+voile-wine `5ec9624`). A `Present` with VSync waits for wsd to latch the frame (`latch`), a `Present` without VSync
+waits for nothing, as on Windows. `NPT_WSD_PACING` still forces a mode for all frames. Obelisk copies the
+runtime's `d3d11.dll` into the prefix before each launch, so the driver and nptunix always have the same parameter
+structure.
 
-| Lancement (Free Play) | Écran | `SyncInterval` reçu | Images soumises | Images affichées | EAC |
+| Launch (Free Play) | Display | `SyncInterval` received | Frames submitted | Frames displayed | EAC |
 |---|---|---|---|---|---|
-| VSync décochée, FPS illimités | MacBook 120 Hz | 0 | 190 i/s (menu 385) | 120 i/s | True |
-| VSync décochée, FPS limités (`UncappedFramerate=False`) | MacBook 120 Hz | 0 | 194 i/s | 120 i/s | True |
-| `UseVsync=True` + `UncappedFramerate=True` | 240 Hz, fenêtré et plein écran | 0 sur 20 270 et 15 062 images | 179 à 187 i/s | 173 à 179 i/s | True |
-| VSync cochée dans le jeu (`UncappedFramerate=False`) | 240 Hz | ≥ 1 (attente de cadence 3,9 à 5,6 ms) | 176 i/s | 176 i/s | True |
+| VSync unchecked, unlimited FPS | MacBook 120 Hz | 0 | 190 fps (menu 385) | 120 fps | True |
+| VSync unchecked, limited FPS (`UncappedFramerate=False`) | MacBook 120 Hz | 0 | 194 fps | 120 fps | True |
+| `UseVsync=True` + `UncappedFramerate=True` | 240 Hz, windowed and fullscreen | 0 on 20,270 and 15,062 frames | 179 to 187 fps | 173 to 179 fps | True |
+| VSync checked in the game (`UncappedFramerate=False`) | 240 Hz | ≥ 1 (pacing wait 3.9 to 5.6 ms) | 176 fps | 176 fps | True |
 
-Rocket League n'envoie la VSync que si les FPS ne sont pas illimités. `UncappedFramerate=False` ne limite rien
-ici. Démarrage inchangé (20,7 s). En plein écran, soumission → affichage tombe à 12,6 ms (24 ms en fenêtré).
+Rocket League sends the VSync only if the FPS are not unlimited. `UncappedFramerate=False` limits nothing
+here. Startup unchanged (20.7 s). In fullscreen, submission → display drops to 12.6 ms (24 ms in windowed).
 
-À voir : sur l'écran externe à 240 Hz (XG27AQWMG), wsd n'affiche pas plus de 173 à 179 i/s, avec ou sans cadence,
-même quand le jeu en soumet davantage.
+To look into: on the external 240 Hz display (XG27AQWMG), wsd displays no more than 173 to 179 fps, with or without pacing,
+even when the game submits more.

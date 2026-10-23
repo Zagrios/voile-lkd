@@ -1,99 +1,99 @@
-# Statut du module ptrace (LKD)
+# Status of the ptrace module (LKD)
 
-Date : 2026-10-02, 20 h 40 (apres le redemarrage de 20 h 21). Jalon 3 : la sequence EAC passe de bout en bout entre deux vrais processus hotes, les requetes, les options, les evenements, la mort du traceur et du tracee sont testees. 4 programmes de test, 852 assertions (MESURE, build prive core + mm + fs + task + sig + ptrace dans `build-ptrace-agent/` (projet `proj/`, `-j 4`, `nice`), chaque test sous `src/fexdarwin/scripts/run-with-timeout.sh`, aucun processus restant apres les executions ; 5 executions de suite sans echec avant le redemarrage, une apres).
+Date: 2026-10-02, 20:40 (after the restart at 20:21). Milestone 3: the EAC sequence passes end to end between two real host processes, the requests, the options, the events, the death of the tracer and of the tracee are tested. 4 test programs, 852 assertions (MEASURED, private core + mm + fs + task + sig + ptrace build in `build-ptrace-agent/` (project `proj/`, `-j 4`, `nice`), each test under `src/fexdarwin/scripts/run-with-timeout.sh`, no process left after the runs; 5 runs in a row without failure before the restart, one after).
 
-## Ce qui existe
+## What exists
 
-`src/ptrace/` (NOTICE : blocs importes de HyperLinux `proc_ptrace.c`, Apache-2.0) :
+`src/ptrace/` (NOTICE: blocks imported from HyperLinux `proc_ptrace.c`, Apache-2.0):
 
-- `transport.c` : table des liens partagee par toute la famille. Un fichier temporaire non lie est projete `MAP_SHARED` (512 emplacements de 3,4 Kio), cree par le premier processus, herite par `fork`, nomme par `LKD_PTRACE_FD` pour une re-execution hote. Exclusion mutuelle : mutex local (rang 61) plus verrou d'octet `fcntl` sur le fichier (le noyau hote le relache a la mort du detenteur : MESURE, cas `lock_is_released_when_the_holder_dies`). Reveil du tracee et notification du traceur par `famsvc` (opcodes 64 et 65 de la plage ptrace). Aucun autre transport.
-- `stop.c` : cote tracee. Un arret est publie dans l'emplacement (code Linux, message, siginfo, vue des registres, images FXSAVE et XSAVE, masque de signaux) par le thread hote du tracee, qui se gare sur son tube de reveil. Les ecritures du traceur (SETREGS, SETFPREGS, SETSIGINFO, SETSIGMASK, signal de reprise, mode, pas) sont des commandes que le tracee applique lui-meme a la reprise, en une seule section critique ; une ecriture apres la reprise echoue (ESRCH). Crochets : `lkd_ptrace_syscall_enter/exit`, `lkd_ptrace_signal_stop`, `lkd_ptrace_event`, `lkd_ptrace_stop`, `lkd_ptrace_trap_stop`.
-- `request.c` : l'appel `ptrace(2)` dans l'ordre d'erreurs du noyau.
-- `life.c` : `wait4`/`waitid` (`lkd_ptrace_wait_event`, `lkd_ptrace_has_tracees`, `lkd_ptrace_wait_has`), `lkd_ptrace_check_access`, `lkd_ptrace_tracer_of`, mort d'un traceur (detachement, EXITKILL), mort d'un tracee (arret `PTRACE_EVENT_EXIT`, rapport au traceur, processus hote disparu), auto-attachement fork/vfork/clone, crochets de module (init, fork, exec, sortie).
-- `regs.c` : `getreg/putreg`, selecteurs, `FLAG_MASK`, bases FS/GS, registres de debogage, MXCSR, en-tete XSAVE.
+- `transport.c`: table of links shared by the whole family. An unlinked temporary file is mapped `MAP_SHARED` (512 slots of 3.4 KiB), created by the first process, inherited by `fork`, named by `LKD_PTRACE_FD` for a host re-exec. Mutual exclusion: local mutex (rank 61) plus `fcntl` byte lock on the file (the host kernel releases it when the holder dies: MEASURED, case `lock_is_released_when_the_holder_dies`). Wakeup of the tracee and notification of the tracer through `famsvc` (opcodes 64 and 65 of the ptrace range). No other transport.
+- `stop.c`: tracee side. A stop is published in the slot (Linux code, message, siginfo, register view, FXSAVE and XSAVE images, signal mask) by the tracee's host thread, which parks on its wakeup pipe. The tracer's writes (SETREGS, SETFPREGS, SETSIGINFO, SETSIGMASK, resume signal, mode, step) are commands that the tracee applies itself on resume, in a single critical section; a write after the resume fails (ESRCH). Hooks: `lkd_ptrace_syscall_enter/exit`, `lkd_ptrace_signal_stop`, `lkd_ptrace_event`, `lkd_ptrace_stop`, `lkd_ptrace_trap_stop`.
+- `request.c`: the `ptrace(2)` call in the kernel's error order.
+- `life.c`: `wait4`/`waitid` (`lkd_ptrace_wait_event`, `lkd_ptrace_has_tracees`, `lkd_ptrace_wait_has`), `lkd_ptrace_check_access`, `lkd_ptrace_tracer_of`, death of a tracer (detach, EXITKILL), death of a tracee (`PTRACE_EVENT_EXIT` stop, report to the tracer, vanished host process), fork/vfork/clone auto-attach, module hooks (init, fork, exec, exit).
+- `regs.c`: `getreg/putreg`, selectors, `FLAG_MASK`, FS/GS bases, debug registers, MXCSR, XSAVE header.
 
-## Requetes implementees
+## Implemented requests
 
-TRACEME, ATTACH, SEIZE, INTERRUPT, DETACH, KILL, CONT, SYSCALL, SYSEMU, SINGLESTEP et SYSEMU_SINGLESTEP (EIO tant que le moteur n'a pas `set_single_step`), SINGLEBLOCK (EIO), PEEKTEXT/PEEKDATA, POKETEXT/POKEDATA (par `lkd_mm_remote_*`, qui invalide le code traduit de la cible), PEEKUSER/POKEUSER (registres, registres de debogage a l'offset 848, zone vide en zero), GETREGS/SETREGS, GETFPREGS/SETFPREGS, GETREGSET/SETREGSET (NT_PRSTATUS 216, NT_PRFPREG 512, NT_X86_XSTATE de la taille du moteur, NT_386_IOPERM : ENXIO en lecture et EOPNOTSUPP en ecriture), GETSIGINFO/SETSIGINFO, GETEVENTMSG, SETOPTIONS (masque 0x3000ff ; SUSPEND_SECCOMP = EINVAL), GETSIGMASK/SETSIGMASK, GET_SYSCALL_INFO (24, 80 ou 33 octets), ARCH_PRCTL. EIO journalise : LISTEN, PEEKSIGINFO, SECCOMP_GET_*, GET_RSEQ_CONFIGURATION, user dispatch, GET/SET_THREAD_AREA, GET/SETFPXREGS, toute requete inconnue.
+TRACEME, ATTACH, SEIZE, INTERRUPT, DETACH, KILL, CONT, SYSCALL, SYSEMU, SINGLESTEP and SYSEMU_SINGLESTEP (EIO as long as the engine has no `set_single_step`), SINGLEBLOCK (EIO), PEEKTEXT/PEEKDATA, POKETEXT/POKEDATA (through `lkd_mm_remote_*`, which invalidates the target's translated code), PEEKUSER/POKEUSER (registers, debug registers at offset 848, empty area as zero), GETREGS/SETREGS, GETFPREGS/SETFPREGS, GETREGSET/SETREGSET (NT_PRSTATUS 216, NT_PRFPREG 512, NT_X86_XSTATE of the engine's size, NT_386_IOPERM: ENXIO on read and EOPNOTSUPP on write), GETSIGINFO/SETSIGINFO, GETEVENTMSG, SETOPTIONS (mask 0x3000ff; SUSPEND_SECCOMP = EINVAL), GETSIGMASK/SETSIGMASK, GET_SYSCALL_INFO (24, 80 or 33 bytes), ARCH_PRCTL. Logged EIO: LISTEN, PEEKSIGINFO, SECCOMP_GET_*, GET_RSEQ_CONFIGURATION, user dispatch, GET/SET_THREAD_AREA, GET/SETFPXREGS, any unknown request.
 
-Statuts de wait : `(exit_code << 8) | 0x7f` : 0x137f (SIGSTOP), 0x57f, 0x857f (TRACESYSGOOD), 0x4057f (EXEC), 0x1057f (FORK), 0x6057f (EXIT), 0x80057f (PTRACE_EVENT_STOP), 0x80137f (arret de groupe d'un tracee SEIZE). `waitid` rend CLD_TRAPPED pour tout arret ptrace (`wait_task_stopped`, ligne 1345 de kernel/exit.c v6.12).
+Wait statuses: `(exit_code << 8) | 0x7f`: 0x137f (SIGSTOP), 0x57f, 0x857f (TRACESYSGOOD), 0x4057f (EXEC), 0x1057f (FORK), 0x6057f (EXIT), 0x80057f (PTRACE_EVENT_STOP), 0x80137f (group stop of a SEIZE tracee). `waitid` returns CLD_TRAPPED for any ptrace stop (`wait_task_stopped`, line 1345 of kernel/exit.c v6.12).
 
-## Ce qui passe (MESURE)
+## What passes (MEASURED)
 
-| Programme | Assertions | Contenu |
+| Program | Assertions | Content |
 | --- | --- | --- |
-| `test_ptrace_requests` | 368 | 17 cas, tracee dans un thread : ATTACH et regles d'acces, SEIZE, ESRCH selon le traceur et l'etat, formats de regsets, SETREGSET et putreg, zone USER et registres de debogage, FP et XSTATE, arrets de syscall et GET_SYSCALL_INFO, modification de numero, d'arguments et de resultat, `orig_rax` = -1, SYSEMU, signaux (CONT(0), CONT(sig), signal remplace, SETSIGINFO, signal donne a un arret de syscall remis en file en SI_KERNEL), pas a pas refuse, INTERRUPT, masque, ARCH_PRCTL, requetes non modelisees, PEEK/POKE et invalidation |
-| `test_ptrace_eac` | 134 | la sequence EAC entre deux processus hotes (voir plus bas) |
-| `test_ptrace_life` | 302 | 16 cas : mort du traceur (detachement, signal supprime, EXITKILL), mort du tracee (statut, TRACEEXIT), KILL, DETACH avec signal, wait4/waitid (WNOWAIT, selection, WNOTHREAD), arret de groupe (non SEIZE : EINVAL pour GETSIGINFO ; SEIZE : evenement 128), exec avec et sans TRACEEXEC, TRACEME et thread createur, fork avec TRACEFORK et auto-attachement (3 processus), options des evenements, matrice d'auto-attachement, selecteurs, tracee tue de l'exterieur (processus hote disparu), traceur tue de l'exterieur (le tracee gare reprend 594 ms apres, MESURE), recopie des ids a l'exec d'un thread non chef |
-| `test_ptrace_transport` | 48 | table pleine (EAGAIN a 513), verrou relache a la mort, table partagee entre processus, reveil entre processus, mesures |
+| `test_ptrace_requests` | 368 | 17 cases, tracee in a thread: ATTACH and access rules, SEIZE, ESRCH depending on the tracer and the state, regset formats, SETREGSET and putreg, USER area and debug registers, FP and XSTATE, syscall stops and GET_SYSCALL_INFO, change of number, arguments and result, `orig_rax` = -1, SYSEMU, signals (CONT(0), CONT(sig), replaced signal, SETSIGINFO, signal given to a syscall stop requeued as SI_KERNEL), single-step refused, INTERRUPT, mask, ARCH_PRCTL, unmodeled requests, PEEK/POKE and invalidation |
+| `test_ptrace_eac` | 134 | the EAC sequence between two host processes (see below) |
+| `test_ptrace_life` | 302 | 16 cases: death of the tracer (detach, signal suppressed, EXITKILL), death of the tracee (status, TRACEEXIT), KILL, DETACH with signal, wait4/waitid (WNOWAIT, selection, WNOTHREAD), group stop (non-SEIZE: EINVAL for GETSIGINFO; SEIZE: event 128), exec with and without TRACEEXEC, TRACEME and creating thread, fork with TRACEFORK and auto-attach (3 processes), event options, auto-attach matrix, selectors, tracee killed from outside (vanished host process), tracer killed from outside (the parked tracee resumes 594 ms after, MEASURED), copy of the ids at the exec of a non-leader thread |
+| `test_ptrace_transport` | 48 | full table (EAGAIN at 513), lock released on death, table shared between processes, wakeup between processes, measurements |
 
-Sequence EAC (`test_ptrace_eac`, fork reel, enfant joue le moteur) : TRACEME, tgkill(SIGSTOP) -> 0x137f avec `waitid(WNOWAIT)` puis `wait4`, SETOPTIONS 0x11, PTRACE_SYSCALL x4 avec GETREGSET de 216 octets (entree : rax = -38, orig_rax, rcx = rip, r11 = rflags ; sortie : rax = resultat ; message 1 et 2), CONT, evenement exec 0x4057f (message = ancien tid, siginfo 5/0x405), PTRACE_SYSCALL -> sortie d'execve 0x857f (message 2, orig_rax 59, rax 0, rip = entree, eflags 0x202, fs_base = 0, rcx = 0), PEEK puis POKE de l'INT3 dans une page de code en lecture seule du tracee (le tracee voit 0xcc et `invalidate_code` a ete appele une fois avant sa reprise), CONT, SIGTRAP 0x57f (si_code 128, si_addr 0, rip = int3 + 1, orig_rax = -1, cs 0x33, ss 0x2b, eflags 0x246), SETREGSET (rip - 1), POKE de restauration, sauvegarde NT_PRFPREG, POKE du chemin et de l'adresse de retour 9 sur la pile, SETREGSET (rdi, rsi, rdx, rip, rsp), CONT, SIGSEGV 0xb7f (si_addr 9, rax = resultat), restauration des registres et du FP, CONT(0) (le tracee voit les valeurs restaurees), second SIGSEGV et CONT(11) : le tracee meurt, `wait4` rend 11.
+EAC sequence (`test_ptrace_eac`, real fork, the child plays the engine): TRACEME, tgkill(SIGSTOP) -> 0x137f with `waitid(WNOWAIT)` then `wait4`, SETOPTIONS 0x11, PTRACE_SYSCALL x4 with a 216-byte GETREGSET (entry: rax = -38, orig_rax, rcx = rip, r11 = rflags; exit: rax = result; message 1 and 2), CONT, exec event 0x4057f (message = old tid, siginfo 5/0x405), PTRACE_SYSCALL -> execve exit 0x857f (message 2, orig_rax 59, rax 0, rip = entry, eflags 0x202, fs_base = 0, rcx = 0), PEEK then POKE of the INT3 into a read-only code page of the tracee (the tracee sees 0xcc and `invalidate_code` was called once before its resume), CONT, SIGTRAP 0x57f (si_code 128, si_addr 0, rip = int3 + 1, orig_rax = -1, cs 0x33, ss 0x2b, eflags 0x246), SETREGSET (rip - 1), restoring POKE, NT_PRFPREG save, POKE of the path and of the return address 9 on the stack, SETREGSET (rdi, rsi, rdx, rip, rsp), CONT, SIGSEGV 0xb7f (si_addr 9, rax = result), restore of the registers and of the FP, CONT(0) (the tracee sees the restored values), second SIGSEGV and CONT(11): the tracee dies, `wait4` returns 11.
 
-Cout d'un arret et d'une reprise (MESURE, M5 Max, `test_ptrace_transport`, 1500 tours, PTRACE_SYSCALL + attente du stop suivant) :
+Cost of a stop and a resume (MEASURED, M5 Max, `test_ptrace_transport`, 1500 rounds, PTRACE_SYSCALL + wait for the next stop):
 
 | Mode | p50 | p90 | p99 |
 | --- | --- | --- | --- |
-| tracee dans un autre processus hote, `wait4(WNOHANG)` en boucle | 42 us | 63 us | 120 us |
-| tracee dans un thread du meme processus (la boucle du tracee dort 300 us) | 367 us | 423 us | 481 us |
-| tracee dans un autre processus, `wait4` bloquant (module task actuel) | 11 110 us puis 36 us (deux executions) | 11 203 us puis 80 us | 11 253 us puis 10 757 us |
-| tracee dans un thread, `wait4` bloquant (module task actuel) | 11 127 us | 11 529 us | 11 587 us |
-| meme, avec le correctif de `wait.c` de la demande ptrace-2 (copie de scratchpad) | 43 us | 53 us | 73 us |
-| GETREGSET de 216 octets (lecture du cliche, sans aller-retour) | 2 us | 3 us | 3 us |
+| tracee in another host process, `wait4(WNOHANG)` in a loop | 42 us | 63 us | 120 us |
+| tracee in a thread of the same process (the tracee's loop sleeps 300 us) | 367 us | 423 us | 481 us |
+| tracee in another process, blocking `wait4` (current task module) | 11,110 us then 36 us (two runs) | 11,203 us then 80 us | 11,253 us then 10,757 us |
+| tracee in a thread, blocking `wait4` (current task module) | 11,127 us | 11,529 us | 11,587 us |
+| same, with the `wait.c` fix of request ptrace-2 (scratchpad copy) | 43 us | 53 us | 73 us |
+| 216-byte GETREGSET (read of the snapshot, without a round trip) | 2 us | 3 us | 3 us |
 
-Le `wait4` bloquant perd jusqu'a 11 ms par arret (selon que le reveil tombe avant ou pendant la tranche de 10 ms) a cause de la boucle d'attente de task : voir `docs/requests/ptrace-2.md` (correctif de quatre lignes, mesure).
+The blocking `wait4` loses up to 11 ms per stop (depending on whether the wakeup falls before or during the 10 ms slice) because of task's wait loop: see `docs/requests/ptrace-2.md` (four-line fix, measured).
 
-## Ecarts connus
+## Known differences
 
-1. `PTRACE_INTERRUPT` ne s'arrete qu'a la prochaine frontiere de syscall, de signal ou d'evenement tant que `lkd_signal_next` n'honore pas `LKD_TF_TRACE_STOP` (demande ptrace-1). Poser ce drapeau sans cela ferait tourner a vide les attentes bloquantes du tracee. Un tracee en code traduit pur ou bloque dans un syscall n'est pas interrompu.
-2. Pas de pas a pas : le moteur n'a pas `set_single_step` (EIO, journalise). Aucun arret n'est fabrique.
-3. `orig_rax` d'un arret de signal : -1 pour un signal de faute (`si_code > 0` ou `SI_KERNEL`), sinon la valeur du moteur (le dernier syscall). Un signal asynchrone devrait aussi donner -1 (demande ptrace-1, moteur).
-4. L'arret de sortie d'execve est emis dans `lkd_ptrace_event(EXEC)`, car `lkd_syscall` n'appelle pas `lkd_ptrace_syscall_exit` pour `LKD_CONTEXT_REPLACED` (demande ptrace-1). Meme limite pour `rt_sigreturn` : pas d'arret de sortie.
-5. Yama absent (noyau modele sans Yama, comme `PR_SET_PTRACER` = EINVAL dans task) : seules les regles classiques de `__ptrace_may_access` s'appliquent. Le registre ne garde pas suid et sgid d'une cible : euid et egid les remplacent.
-6. Tracee qui n'est pas enfant du traceur : le parent reel apprend la mort par le module task tout de suite, pas apres la collecte par le traceur (pas de reparentage ptrace). Si le traceur est le parent, ptrace ne rapporte pas la mort (task le fait).
-7. Un tracee dont le processus hote disparait sans passer par la sortie est rapporte comme tue par SIGKILL (statut reel inconnu).
-8. `PTRACE_LISTEN`, `PEEKSIGINFO`, seccomp, rseq, user dispatch, `GET/SET_THREAD_AREA` : EIO journalise. `SETREGSET` lit tout le tampon utilisateur avant d'appliquer (Linux peut appliquer un prefixe puis fautter).
-9. `wait4` bloquant : latence de 11 ms (ptrace-2). `wait4(pid)` d'un pid qui n'est pas un enfant attend au lieu de rendre ECHILD tant que le traceur a un tracee (`lkd_ptrace_wait_has` existe, task doit l'appeler). `waitid` : `si_status` d'un arret ptrace est tronque a 8 bits par task.
-10. Exec depuis un thread non chef : le tid du tracee et celui du traceur sont recopies dans la table par `lkd_ptrace_exec_commit` (teste en simulant le changement de tid, pas avec un vrai de_thread).
+1. `PTRACE_INTERRUPT` only stops at the next syscall, signal or event boundary as long as `lkd_signal_next` does not honor `LKD_TF_TRACE_STOP` (request ptrace-1). Setting this flag without that would make the tracee's blocking waits spin idle. A tracee in pure translated code or blocked in a syscall is not interrupted.
+2. No single-step: the engine has no `set_single_step` (EIO, logged). No stop is fabricated.
+3. `orig_rax` of a signal stop: -1 for a fault signal (`si_code > 0` or `SI_KERNEL`), otherwise the engine's value (the last syscall). An asynchronous signal should also give -1 (request ptrace-1, engine).
+4. The execve exit stop is emitted in `lkd_ptrace_event(EXEC)`, because `lkd_syscall` does not call `lkd_ptrace_syscall_exit` for `LKD_CONTEXT_REPLACED` (request ptrace-1). Same limit for `rt_sigreturn`: no exit stop.
+5. Yama missing (kernel modeled without Yama, like `PR_SET_PTRACER` = EINVAL in task): only the classic rules of `__ptrace_may_access` apply. The registry does not keep the suid and sgid of a target: euid and egid replace them.
+6. Tracee that is not a child of the tracer: the real parent learns of the death through the task module right away, not after the collection by the tracer (no ptrace reparenting). If the tracer is the parent, ptrace does not report the death (task does).
+7. A tracee whose host process vanishes without going through exit is reported as killed by SIGKILL (real status unknown).
+8. `PTRACE_LISTEN`, `PEEKSIGINFO`, seccomp, rseq, user dispatch, `GET/SET_THREAD_AREA`: logged EIO. `SETREGSET` reads the whole user buffer before applying (Linux can apply a prefix then fault).
+9. Blocking `wait4`: 11 ms latency (ptrace-2). `wait4(pid)` of a pid that is not a child waits instead of returning ECHILD as long as the tracer has a tracee (`lkd_ptrace_wait_has` exists, task must call it). `waitid`: `si_status` of a ptrace stop is truncated to 8 bits by task.
+10. Exec from a non-leader thread: the tracee's tid and the tracer's tid are copied into the table by `lkd_ptrace_exec_commit` (tested by simulating the tid change, not with a real de_thread).
 
-## Demandes ouvertes
+## Open requests
 
-`docs/requests/ptrace-1.md` (sig : TRACE_STOP ; core : arret de sortie pour contexte remplace ; moteur : orig_rax, pas a pas), `docs/requests/ptrace-2.md` (task : reveil de wait4, selecteur, si_status).
+`docs/requests/ptrace-1.md` (sig: TRACE_STOP; core: exit stop for a replaced context; engine: orig_rax, single-step), `docs/requests/ptrace-2.md` (task: wait4 wakeup, selector, si_status).
 
-## Suite possible
+## Possible next steps
 
-Tests de bout en bout avec le vrai moteur FEX (le chef lance les temoins x86 : `probe-x86_64`, `target-x86_64`, `target-flags-x86_64`), arret asynchrone par `kick` dans du code traduit, pas a pas, reparentage ptrace, `PTRACE_LISTEN`.
+End-to-end tests with the real FEX engine (the project lead runs the x86 witnesses: `probe-x86_64`, `target-x86_64`, `target-flags-x86_64`), asynchronous stop through `kick` in translated code, single-step, ptrace reparenting, `PTRACE_LISTEN`.
 
-## Incident du 2026-10-02 20 h 05
+## Incident of 2026-10-02 20:05
 
-Quatre rapports de plantage `test_ptrace_life-2026-10-02-2005*.ips` : tous dans `traceme_rules`, `test_ptrace_life.c:365`, lecture de `x->proc` apres `lkd_task_release(x)` dans une impression de debogage temporaire du test (utilisation apres liberation dans le test, pas dans le module). Corrige a 20 h 10 : le test garde le tid avant la liberation. MESURE apres le redemarrage : `test_ptrace_life` 302 assertions, 0 echec.
+Four crash reports `test_ptrace_life-2026-10-02-2005*.ips`: all in `traceme_rules`, `test_ptrace_life.c:365`, read of `x->proc` after `lkd_task_release(x)` in a temporary debug print of the test (use after free in the test, not in the module). Fixed at 20:10: the test keeps the tid before the release. MEASURED after the restart: `test_ptrace_life` 302 assertions, 0 failures.
 
-## Campagne de sondes EAC x86-64 (2026-10-02, 20 h 44 à 20 h 58, mainteneur d'intégration)
+## x86-64 EAC probe campaign (2026-10-02, 20:44 to 20:58, integration maintainer)
 
-Lanceur : `witnesses/eac-probes/run-probes.py`, hôte `build-integration/host/fexdarwin-run` lié à `build-integration/lib/liblkd.a`.
+Launcher: `witnesses/eac-probes/run-probes.py`, host `build-integration/host/fexdarwin-run` linked to `build-integration/lib/liblkd.a`.
 
-MESURE :
+MEASURED:
 
-| Exécution | Sondes | Contrôles | Échecs |
+| Run | Probes | Checks | Failures |
 | --- | --- | --- | --- |
-| avant (20261002T204415, identique à celle du chef 20261002T204027) | 39 | 1824 | 232 |
-| après les trois correctifs LKD (20261002T205456) | 39 | 3257 | 7 |
-| après correction du lanceur (20261002T205719) | 40 | 4376 | 38 |
+| before (20261002T204415, identical to the project lead's 20261002T204027) | 39 | 1824 | 232 |
+| after the three LKD fixes (20261002T205456) | 39 | 3257 | 7 |
+| after the launcher fix (20261002T205719) | 40 | 4376 | 38 |
 
-Le nombre de contrôles augmente parce que les sondes qui s'arrêtaient au premier échec vont maintenant jusqu'au bout.
+The number of checks goes up because the probes that stopped at the first failure now go to the end.
 
-Correctifs LKD, chacun avec un test qui échoue avant et passe après :
+LKD fixes, each with a test that fails before and passes after:
 
-1. POKE forcé dans du code en lecture seule dont la page hôte de 16 Kio contient aussi des données (cold_INT3_POKEDATA : EIO). Cause : `mm_local_rw` (`src/mm/remote.c`) déduisait la protection hôte de l'union des VMA (RW), alors que la page surveillée par le JIT était encore en lecture seule après le retrait de la surveillance (`mm_unwatch_for_write` laisse l'ouverture à l'écrivain FOLL_FORCE). Correctif : quand la surveillance vient d'être retirée, la page est ouverte explicitement. Test : `test_mm_watch` cas `host_page_shared_with_data`.
-2. Exec d'un tracé issu d'un fork (cluster GETEVENTMSG et GETSIGINFO après l'arrêt d'exec, 14 sondes). Cause : `lkd_ptrace_exec_commit` (`src/ptrace/life.c`) suivait le changement de tid de `de_thread` à partir de `tid_seen`, qui vaut encore le tid du parent dans l'enfant d'un fork (le crochet de fork de ptrace passe avant le changement d'identité). Le `tracer_tid` du lien devenait le tid du tracé et toute requête suivante rendait ESRCH. Correctif : ne réécrire que les liens du même groupe de threads. Test : `test_ptrace_life` cas `exec_of_a_forked_tracee_keeps_its_tracer`.
-3. Code chaud après POKE (warm_INT3, « warm repeat execution after write ») : invalidation appelée depuis le fil de service mm, sans thread invité, ignorée par le moteur. Corrigé côté moteur par le chef (InvalidateCode sans thread). Le mécanisme de rejeu ajouté un temps dans LKD a été retiré.
+1. Forced POKE into read-only code whose 16 KiB host page also contains data (cold_INT3_POKEDATA: EIO). Cause: `mm_local_rw` (`src/mm/remote.c`) deduced the host protection from the union of the VMAs (RW), while the page watched by the JIT was still read-only after the watch was removed (`mm_unwatch_for_write` leaves the opening to the FOLL_FORCE writer). Fix: when the watch has just been removed, the page is opened explicitly. Test: `test_mm_watch` case `host_page_shared_with_data`.
+2. Exec of a tracee born from a fork (GETEVENTMSG and GETSIGINFO cluster after the exec stop, 14 probes). Cause: `lkd_ptrace_exec_commit` (`src/ptrace/life.c`) followed the tid change of `de_thread` from `tid_seen`, which still holds the parent's tid in the child of a fork (ptrace's fork hook runs before the identity change). The `tracer_tid` of the link became the tracee's tid and every following request returned ESRCH. Fix: only rewrite the links of the same thread group. Test: `test_ptrace_life` case `exec_of_a_forked_tracee_keeps_its_tracer`.
+3. Warm code after POKE (warm_INT3, "warm repeat execution after write"): invalidation called from the mm service thread, without a guest thread, ignored by the engine. Fixed on the engine side by the project lead (InvalidateCode without a thread). The replay mechanism added for a while in LKD was removed.
 
-Lanceur (`run-probes.py`) : la ligne de commande de la sonde reprend maintenant celle de son `run-hl.py` (cible, mode ou phase `pre`/`post` seulement s'ils y figurent ; avant, `peek`, `poke`, `poke-commit`, `proc-remote-maps*` sortaient avec 87 ou 89). La sonde tourne dans une copie privée et inscriptible de son répertoire, parce que les sondes créent des fichiers témoins dans leur répertoire courant (`/`). Avant : EROFS sur `owned marker O_EXCL creation`.
+Launcher (`run-probes.py`): the probe's command line now takes that of its `run-hl.py` (target, mode or `pre`/`post` phase only if they appear in it; before, `peek`, `poke`, `poke-commit`, `proc-remote-maps*` exited with 87 or 89). The probe runs in a private, writable copy of its directory, because the probes create marker files in their current directory (`/`). Before: EROFS on `owned marker O_EXCL creation`.
 
-Échecs restants (MESURE, 20261002T205719) :
+Remaining failures (MEASURED, 20261002T205719):
 
-- `ptrace-peek-control`, `ptrace-poke-control` (9 chacun), `ptrace-poke-commit` pre et post (7 chacun) : l'enfant mappe en MAP_FIXED à 0x7ffff7ff0000 et 0x7ffffdffb000. Cette adresse dépasse la fenêtre invitée de 2^46 octets (TASK_SIZE de LKD, `docs/requests/mm-2.md` point 3). L'enfant sort avec 70 avant l'arrêt. LU : une fenêtre de 2^47 ne tient pas dans l'espace d'adresses hôte avec la base de 8 Tio. Limite de conception, pas un défaut de ptrace.
-- `ptrace-setregset-deliver` (2) et `ptrace-setregset-two-trap` (4) : `CONT(pid, SIGTRAP)` à l'arrêt de délivrance d'un SIGTRAP, sans gestionnaire. LKD délivre SIGTRAP et le tracé meurt (statut 5). INFERE : c'est le comportement de Linux (`get_signal`, action par défaut coredump, RLIMIT_CORE 0). L'attendu 0 du probe n'a pas d'oracle natif dans son répertoire, et l'exécution HyperLinux enregistrée échouait aussi. À confirmer sur un vrai Linux avant tout changement.
+- `ptrace-peek-control`, `ptrace-poke-control` (9 each), `ptrace-poke-commit` pre and post (7 each): the child maps with MAP_FIXED at 0x7ffff7ff0000 and 0x7ffffdffb000. This address goes beyond the guest window of 2^46 bytes (LKD's TASK_SIZE, `docs/requests/mm-2.md` point 3). The child exits with 70 before the stop. READ: a 2^47 window does not fit in the host address space with the 8 TiB base. Design limit, not a ptrace defect.
+- `ptrace-setregset-deliver` (2) and `ptrace-setregset-two-trap` (4): `CONT(pid, SIGTRAP)` at the delivery stop of a SIGTRAP, without a handler. LKD delivers SIGTRAP and the tracee dies (status 5). INFERRED: this is Linux's behavior (`get_signal`, default action coredump, RLIMIT_CORE 0). The probe's expected 0 has no native oracle in its directory, and the recorded HyperLinux run failed too. To be confirmed on a real Linux before any change.
 
-## Mise à jour d'intégration (2026-10-02, 21 h 45)
+## Integration update (2026-10-02, 21:45)
 
-Écarts 1 (INTERRUPT d'un tracé bloqué), 4 (arrêt de sortie pour contexte remplacé, rt_sigreturn compris) et 9 (wait4 : latence de 11 ms, ECHILD, si_status) corrigés, avec les tests `interrupt_reaches_a_blocked_tracee`, `sigreturn_has_an_exit_stop`, `blocking_wait4_wakes_at_once` et `wait_selectors_see_tracees`. Voir les demandes ptrace-1 et ptrace-2 (sections « Traitée »).
+Differences 1 (INTERRUPT of a blocked tracee), 4 (exit stop for a replaced context, rt_sigreturn included) and 9 (wait4: 11 ms latency, ECHILD, si_status) fixed, with the tests `interrupt_reaches_a_blocked_tracee`, `sigreturn_has_an_exit_stop`, `blocking_wait4_wakes_at_once` and `wait_selectors_see_tracees`. See requests ptrace-1 and ptrace-2 ("Handled" sections).

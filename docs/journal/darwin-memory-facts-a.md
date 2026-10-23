@@ -1,43 +1,43 @@
-# Faits macOS 27 arm64 sur l'espace d'adressage, la taille de page et les fonctions CPU (groupes A, B, E)
+# macOS 27 arm64 facts on the address space, page size and CPU features (groups A, B, E)
 
-Etat du document: premier jet du 2026-10-02, a completer au fur et a mesure des mesures. Les sections marquees "a completer" n'ont pas encore de mesure.
+Document status: first draft of 2026-10-02, to be completed as measurements come in. Sections marked "to be completed" have no measurement yet.
 
-## Contexte et machine
+## Context and machine
 
-- Machine: Apple M5 Max, macOS 27.0.1 (build 26A434), noyau xnu-13432.1.9~1/RELEASE_ARM64_T6050, 36 GiB de RAM (hw.memsize 38654705664). MESURE (sysctl).
-- `hw.pagesize` = 16384 et `vm.pagesize` = 16384. MESURE.
-- Outils: Apple clang 21.0.0, SDK macOS 27. MESURE.
-- Les programmes de test sont dans `witnesses/darwin-memory/` (prefixes a_, b_, e_), les journaux dans `evidence/darwin-memory/`.
+- Machine: Apple M5 Max, macOS 27.0.1 (build 26A434), kernel xnu-13432.1.9~1/RELEASE_ARM64_T6050, 36 GiB of RAM (hw.memsize 38654705664). MEASURED (sysctl).
+- `hw.pagesize` = 16384 and `vm.pagesize` = 16384. MEASURED.
+- Tools: Apple clang 21.0.0, macOS 27 SDK. MEASURED.
+- The test programs are in `witnesses/darwin-memory/` (prefixes a_, b_, e_), the logs in `evidence/darwin-memory/`.
 
-## Resume des constats
+## Summary of findings
 
-A completer.
+To be completed.
 
-## A. Espace d'adressage d'un processus arm64
+## A. Address space of an arm64 process
 
-A completer.
+To be completed.
 
-## B. Taille de page
+## B. Page size
 
-A completer.
+To be completed.
 
-## E. TSO et fonctions CPU
+## E. TSO and CPU features
 
-A completer.
+To be completed.
 
 ## Implications for a 16 KiB-host FEXCore design
 
-A completer.
+To be completed.
 
-## Limites, points non testables et questions ouvertes
+## Limits, untestable points and open questions
 
-A completer.
+To be completed.
 
 ## Reproduction
 
-A completer.
+To be completed.
 
-<!-- notes de travail (supprimees en fin de rapport) -->
-- 2026-10-02 premiers constats: posix_spawnattr_set_4k_page_size_np existe dans spawn.h (macOS 26.0), accepte pour x86_64/Rosetta, EBADMACHO (88) pour tout arm64/arm64e. -pagezero_size < 4 Gio: ld l'accepte, le noyau refuse (EBADMACHO) tant que pagezero + glissement ASLR < 4 Gio. MH_PIE obligatoire (EBADEXEC 85 sinon). Glissement ASLR de l'executable: 0..80 Mio par pas de 16 Kio.
-- FEX: Source/Common/HostFeatures.cpp lit les registres ID par mrs (Linux les emule); sous macOS il faudra les fabriquer depuis sysctl.
-- FEX/AGENTS.md et CLAUDE.md: "AI must not be used to generate code for contributions to this project."
+<!-- working notes (removed at the end of the report) -->
+- 2026-10-02 first findings: posix_spawnattr_set_4k_page_size_np exists in spawn.h (macOS 26.0), accepted for x86_64/Rosetta, EBADMACHO (88) for any arm64/arm64e. -pagezero_size < 4 GiB: ld accepts it, the kernel refuses (EBADMACHO) as long as pagezero + ASLR slide < 4 GiB. MH_PIE mandatory (EBADEXEC 85 otherwise). ASLR slide of the executable: 0..80 MiB in steps of 16 KiB.
+- FEX: Source/Common/HostFeatures.cpp reads the ID registers with mrs (Linux emulates them); under macOS they will have to be built from sysctl.
+- FEX/AGENTS.md and CLAUDE.md: "AI must not be used to generate code for contributions to this project."
