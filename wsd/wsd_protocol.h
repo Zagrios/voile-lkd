@@ -51,6 +51,7 @@ enum {
   WSD_WINDOW_MINIMIZE = 26, /* wsd_window_flag (value: 1 into the Dock, 0 back) */
   WSD_APP_ICON = 27,       /* wsd_app_icon + 1 fd: the Dock and Cmd-Tab icon */
   WSD_OPEN_URL = 28,       /* UTF-8 http or https address: opened in the Mac's default browser */
+  WSD_AUDIO_OPEN_INPUT = 29, /* wsd_audio_open + 1 fd: an input stream (the default microphone) writing a shared ring */
 };
 
 /* server -> client */
@@ -152,7 +153,11 @@ struct wsd_present_region {
 /* Audio output (PCM, interleaved, little-endian). The client writes frames at ring frame (write_frames % ring_frames)
  * and then publishes write_frames (release); the server's audio callback reads from read_frames and publishes it
  * (release). Both counters only grow (64-bit frame counts); unread = write_frames - read_frames <= ring_frames.
- * The ring data follows the 64-byte header at `offset` in the fd. */
+ * The ring data follows the 64-byte header at `offset` in the fd.
+ * An input stream (WSD_AUDIO_OPEN_INPUT) swaps the roles: the server writes write_frames and the client publishes
+ * read_frames; underrun_frames counts the frames the server dropped because the ring was full. The client resets
+ * the stream itself (read_frames = write_frames), WSD_AUDIO_RESET is refused. START, STOP and CLOSE work as for output;
+ * the frames are converted to the open request's format, rate and channels. */
 enum { WSD_AUDIO_S16 = 1, WSD_AUDIO_S24 = 2, WSD_AUDIO_S32 = 3, WSD_AUDIO_F32 = 4, WSD_AUDIO_U8 = 5 };
 struct wsd_audio_ring {
   uint64_t write_frames;  /* client */

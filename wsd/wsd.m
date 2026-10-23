@@ -208,6 +208,12 @@ struct wsd_audio_rt {
   uint32_t ring_frames, frame_bytes;
   uint8_t silence;
   _Atomic int running;
+  /* input streams only */
+  AudioComponentInstance unit; /* the callback pulls the captured frames from it */
+  AudioConverterRef conv;      /* device float frames to the client's rate, channels and sample format */
+  uint32_t channels, dev_channels, scratch_frames, out_frames;
+  float *scratch;              /* one render of the device */
+  uint8_t *out;                /* what conv made of it, in the client's format */
 };
 
 static OSStatus audio_render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
@@ -236,6 +242,52 @@ static OSStatus audio_render(void *ref, AudioUnitRenderActionFlags *flags, const
   return noErr;
 }
 
+/* Audio input stream (WSD_AUDIO_OPEN_INPUT): the default input device through an AUHAL unit at the device's own rate
+ * (AUHAL's rate conversion fails to render once the rates differ). The callback renders the device's interleaved float
+ * frames, an AudioConverter turns them into the client's rate, channels and sample format, and they are published in the
+ * client's ring. */
+struct wsd_capture_feed { struct wsd_audio_rt *rt; uint32_t frames; int given; };
+
+static OSStatus capture_feed(AudioConverterRef c, UInt32 *packets, AudioBufferList *io,
+                             AudioStreamPacketDescription **desc, void *ref) {
+  struct wsd_capture_feed *f = ref;
+  (void)c; (void)desc;
+  if (f->given) { *packets = 0; return 1; } /* the converter returns this once it has used the render */
+  f->given = 1;
+  *packets = f->frames;
+  io->mBuffers[0].mNumberChannels = f->rt->dev_channels;
+  io->mBuffers[0].mDataByteSize = f->frames * f->rt->dev_channels * (UInt32)sizeof(float);
+  io->mBuffers[0].mData = f->rt->scratch;
+  return noErr;
+}
+
+static OSStatus audio_capture(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
+                              UInt32 frames, AudioBufferList *unused) {
+  struct wsd_audio_rt *rt = ref;
+  (void)unused;
+  if (!atomic_load_explicit(&rt->running, memory_order_acquire) || frames > rt->scratch_frames) return noErr;
+  AudioBufferList in = {1, {{rt->dev_channels, frames * rt->dev_channels * (UInt32)sizeof(float), rt->scratch}}};
+  OSStatus e = AudioUnitRender(rt->unit, flags, ts, bus, frames, &in);
+  if (e != noErr) return e;
+  struct wsd_capture_feed feed = {rt, frames, 0};
+  UInt32 got = rt->out_frames;
+  AudioBufferList out = {1, {{rt->channels, got * rt->frame_bytes, rt->out}}};
+  AudioConverterFillComplexBuffer(rt->conv, capture_feed, &feed, &got, &out, NULL);
+  _Atomic uint64_t *wp = (_Atomic uint64_t *)&rt->ring->write_frames, *rp = (_Atomic uint64_t *)&rt->ring->read_frames;
+  uint64_t w = atomic_load_explicit(wp, memory_order_relaxed), r = atomic_load_explicit(rp, memory_order_acquire);
+  uint64_t used = w > r ? w - r : 0;
+  uint32_t space = used >= rt->ring_frames ? 0 : (uint32_t)(rt->ring_frames - used), n = got < space ? got : space;
+  for (uint32_t done = 0; done < n;) {
+    uint32_t pos = (uint32_t)((w + done) % rt->ring_frames), k = rt->ring_frames - pos;
+    if (k > n - done) k = n - done;
+    memcpy(rt->data + (size_t)pos * rt->frame_bytes, rt->out + (size_t)done * rt->frame_bytes, (size_t)k * rt->frame_bytes);
+    done += k;
+  }
+  atomic_store_explicit(wp, w + n, memory_order_release);
+  if (n < got) rt->ring->underrun_frames += got - n; /* the client did not read: these frames are lost */
+  return noErr;
+}
+
 /* CoreAudio calls can block: AudioOutputUnitStop waits out the render thread. On the main queue they held frames and
  * input (2026-10-21: Rocket League reopened a stream every 0.45 s, and each frame was held 0.4 to 0.9 s), so a
  * stream's unit is made, started, stopped and disposed in order on this queue. */
@@ -247,6 +299,7 @@ static dispatch_queue_t g_audio_queue;
 @property void *map;
 @property size_t mapLen;
 @property struct wsd_audio_rt *rt;
+@property BOOL input; /* the server writes the ring and the client reads it */
 @end
 @implementation WsdAudio
 /* On g_audio_queue: a default-output unit that plays the ring in the client's format. */
@@ -278,6 +331,73 @@ static dispatch_queue_t g_audio_queue;
   if (e != noErr) [self teardown];
   return e;
 }
+/* On g_audio_queue: an AUHAL unit that captures the default input device in the client's rate. */
+- (OSStatus)setUpInput:(struct wsd_audio_open)o {
+  AudioComponentDescription desc = {kAudioUnitType_Output, kAudioUnitSubType_HALOutput, kAudioUnitManufacturer_Apple,
+                                    0, 0};
+  AudioComponent comp = AudioComponentFindNext(NULL, &desc);
+  AudioComponentInstance unit = NULL;
+  OSStatus e = comp ? AudioComponentInstanceNew(comp, &unit) : -1;
+  UInt32 on = 1, off = 0, size;
+  AudioDeviceID dev = kAudioObjectUnknown;
+  AudioObjectPropertyAddress addr = {kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal,
+                                     kAudioObjectPropertyElementMain};
+  AudioStreamBasicDescription f = {0};
+  if (e == noErr) e = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &on, sizeof(on));
+  if (e == noErr) e = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &off, sizeof(off));
+  if (e == noErr) {
+    size = sizeof(dev);
+    e = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, &dev);
+    if (e == noErr && dev == kAudioObjectUnknown) e = kAudioHardwareBadDeviceError; /* no microphone */
+  }
+  if (e == noErr) e = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, sizeof(dev));
+  if (e == noErr) {
+    size = sizeof(f);
+    e = AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &f, &size);
+  }
+  if (e == noErr && (!f.mChannelsPerFrame || f.mChannelsPerFrame > 64)) e = kAudioUnitErr_FormatNotSupported;
+  if (e == noErr) {
+    /* f is the device's format; the unit hands over its frames as interleaved float at the same rate */
+    f.mFormatID = kAudioFormatLinearPCM;
+    f.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    f.mFramesPerPacket = 1;
+    f.mBitsPerChannel = 32;
+    f.mBytesPerFrame = f.mBytesPerPacket = f.mChannelsPerFrame * 4;
+    self.rt->dev_channels = f.mChannelsPerFrame;
+    e = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &f, sizeof(f));
+  }
+  if (e == noErr) {
+    AudioStreamBasicDescription c = {0};
+    c.mSampleRate = o.rate;
+    c.mFormatID = kAudioFormatLinearPCM;
+    c.mFormatFlags = kAudioFormatFlagIsPacked |
+                     (o.format == WSD_AUDIO_F32 ? kAudioFormatFlagIsFloat
+                      : o.format == WSD_AUDIO_U8 ? 0 : kAudioFormatFlagIsSignedInteger);
+    c.mFramesPerPacket = 1;
+    c.mChannelsPerFrame = o.channels;
+    c.mBitsPerChannel = o.frame_bytes / o.channels * 8;
+    c.mBytesPerFrame = c.mBytesPerPacket = o.frame_bytes;
+    e = AudioConverterNew(&f, &c, &self.rt->conv);
+    self.rt->out_frames = (uint32_t)ceil(4096.0 * o.rate / f.mSampleRate) + 64; /* a render is at most 4096 frames */
+    self.rt->out = calloc(self.rt->out_frames, o.frame_bytes);
+  }
+  if (e == noErr) {
+    size = sizeof(UInt32);
+    e = AudioUnitGetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0,
+                             &self.rt->scratch_frames, &size);
+  }
+  if (e == noErr) {
+    if (self.rt->scratch_frames > 4096) self.rt->scratch_frames = 4096;
+    self.rt->scratch = calloc((size_t)self.rt->scratch_frames * self.rt->dev_channels, sizeof(float));
+    self.rt->unit = unit;
+    AURenderCallbackStruct cb = {audio_capture, self.rt};
+    e = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &cb, sizeof(cb));
+  }
+  if (e == noErr) e = AudioUnitInitialize(unit);
+  self.unit = unit;
+  if (e != noErr) [self teardown];
+  return e;
+}
 /* On g_audio_queue. */
 - (void)teardown {
   if (!self.unit) return;
@@ -285,11 +405,14 @@ static dispatch_queue_t g_audio_queue;
   AudioUnitUninitialize(self.unit);
   AudioComponentInstanceDispose(self.unit);
   self.unit = NULL;
+  if (self.rt->conv) AudioConverterDispose(self.rt->conv); /* the render callback is gone */
+  self.rt->conv = NULL;
 }
 /* The ring outlives the unit: the client holds the stream until it closes it, and each block queued on
  * g_audio_queue holds it until it ran, the teardown last. */
 - (void)dealloc {
   if (self.map) munmap(self.map, self.mapLen);
+  if (self.rt) { free(self.rt->scratch); free(self.rt->out); }
   free(self.rt);
 }
 @end
@@ -962,8 +1085,9 @@ static CAMetalLayer *make_metal_layer(void) {
   LOG("client %d: window %u %ux%u px style 0x%x", self.pid, c->window_id, c->width_px, c->height_px, c->style);
 }
 
-- (void)audioOpen:(const struct wsd_audio_open *)o {
-  if (!self.fdQueue.count) { [self error:WSD_AUDIO_OPEN code:-EBADF]; return; }
+- (void)audioOpen:(const struct wsd_audio_open *)o input:(BOOL)input {
+  uint32_t type = input ? WSD_AUDIO_OPEN_INPUT : WSD_AUDIO_OPEN;
+  if (!self.fdQueue.count) { [self error:type code:-EBADF]; return; }
   int fd = self.fdQueue.firstObject.intValue;
   [self.fdQueue removeObjectAtIndex:0];
   uint32_t sample = o->format == WSD_AUDIO_S16 ? 2 : o->format == WSD_AUDIO_S24 ? 3 : o->format == WSD_AUDIO_U8 ? 1
@@ -978,12 +1102,12 @@ static CAMetalLayer *make_metal_layer(void) {
       (uint64_t)o->ring_frames * o->frame_bytes || (delta % 8) || fstat(fd, &st) ||
       (uint64_t)st.st_size < o->offset + o->size) { /* the mapping may end in a partial page past EOF: never read */
     close(fd);
-    [self error:WSD_AUDIO_OPEN code:-EINVAL];
+    [self error:type code:-EINVAL];
     return;
   }
   void *p = mmap(NULL, maplen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)floor_off);
   close(fd);
-  if (p == MAP_FAILED) { [self error:WSD_AUDIO_OPEN code:-errno]; return; }
+  if (p == MAP_FAILED) { [self error:type code:-errno]; return; }
   WsdAudio *a = [WsdAudio new];
   a.streamId = o->stream_id;
   a.map = p;
@@ -994,23 +1118,26 @@ static CAMetalLayer *make_metal_layer(void) {
   rt->ring_frames = o->ring_frames;
   rt->frame_bytes = o->frame_bytes;
   rt->silence = o->format == WSD_AUDIO_U8 ? 0x80 : 0;
+  rt->channels = o->channels;
   a.rt = rt;
+  a.input = input;
   self.audio[@(o->stream_id)] = a;
-  LOG("client %d: audio stream %u: format %u, %u Hz, %u channels, ring %u frames", self.pid, o->stream_id, o->format,
+  LOG("client %d: audio %s stream %u: format %u, %u Hz, %u channels, ring %u frames", self.pid,
+      input ? "input" : "output", o->stream_id, o->format,
       o->rate, o->channels, o->ring_frames);
 
   struct wsd_audio_open open = *o;
   pid_t pid = self.pid;
   __weak WsdClient *weakSelf = self;
   dispatch_async(g_audio_queue, ^{
-    OSStatus e = [a setUp:open sample:sample];
+    OSStatus e = input ? [a setUpInput:open] : [a setUp:open sample:sample];
     if (e == noErr) return;
     LOG("client %d: audio stream %u: AudioUnit setup failed (%d)", pid, open.stream_id, (int)e);
     dispatch_async(dispatch_get_main_queue(), ^{
       WsdClient *c = weakSelf;
       if (c.audio[@(open.stream_id)] != a) return; /* closed meanwhile */
       [c.audio removeObjectForKey:@(open.stream_id)];
-      [c error:WSD_AUDIO_OPEN code:-EIO];
+      [c error:type code:-EIO];
     });
   });
 }
@@ -1229,9 +1356,10 @@ static CAMetalLayer *make_metal_layer(void) {
     [self attachBuffer:m];
     break;
   }
-  case WSD_AUDIO_OPEN: {
+  case WSD_AUDIO_OPEN:
+  case WSD_AUDIO_OPEN_INPUT: {
     NEED(wsd_audio_open);
-    [self audioOpen:m];
+    [self audioOpen:m input:type == WSD_AUDIO_OPEN_INPUT];
     break;
   }
   case WSD_AUDIO_START:
@@ -1262,6 +1390,7 @@ static CAMetalLayer *make_metal_layer(void) {
         if (a.unit) AudioOutputUnitStop(a.unit);
       });
     } else if (type == WSD_AUDIO_RESET) {
+      if (a.input) { [self error:type code:-EINVAL]; break; } /* the client reads the ring: it resets it itself */
       _Atomic uint64_t *wp = (_Atomic uint64_t *)&a.rt->ring->write_frames;
       atomic_store_explicit((_Atomic uint64_t *)&a.rt->ring->read_frames,
                             atomic_load_explicit(wp, memory_order_acquire), memory_order_release);
