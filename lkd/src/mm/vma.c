@@ -98,7 +98,29 @@ static void refresh(mm_vma *n, uint64_t key)
     upd(n);
 }
 
-void vt_init(vtree *t, uint64_t lo) { t->root = NULL; t->n = 0; t->lo = lo; }
+void vt_init(vtree *t, uint64_t lo) { *t = (vtree){ .lo = lo }; }
+
+/* vm_stat_account with is_stack_mapping, is_exec_mapping and is_data_mapping (mm/internal.h): a VMA counts in
+ * one class at most, the stack first. */
+static uint64_t *class_of(vtree *t, const mm_vma *v)
+{
+    if (v->lkind == LBL_STACK) return &t->stack;
+    if ((v->prot & (LX_PROT_WRITE | LX_PROT_EXEC)) == LX_PROT_EXEC) return &t->exec;
+    if ((v->prot & LX_PROT_WRITE) && !(v->vflags & VF_SHARED)) return &t->data;
+    return NULL;
+}
+
+void vt_account(vtree *t, const mm_vma *v, int sign)
+{
+    uint64_t sz = v->end - v->start, *c = class_of(t, v);
+    if (sign > 0) {
+        t->total += sz;
+        if (c) *c += sz;
+    } else {
+        t->total -= sz;
+        if (c) *c -= sz;
+    }
+}
 
 mm_vma *vt_first_end_after(const vtree *t, uint64_t addr)
 {
@@ -163,6 +185,7 @@ void vt_insert(vtree *t, mm_vma *v)
     v->maxgap = v->start - v->prev_end;
     t->root = ins(t->root, v);
     t->n++;
+    vt_account(t, v, 1);
     if (succ) {
         succ->prev_end = v->end;
         refresh(t->root, succ->start);
@@ -175,6 +198,7 @@ void vt_remove(vtree *t, mm_vma *v)
     uint64_t pe = v->prev_end;
     t->root = rm(t->root, v->start);
     t->n--;
+    vt_account(t, v, -1);
     v->l = v->r = NULL;
     if (succ) {
         succ->prev_end = pe;
@@ -184,14 +208,18 @@ void vt_remove(vtree *t, mm_vma *v)
 
 void vt_set_start(vtree *t, mm_vma *v, uint64_t s)
 {
+    vt_account(t, v, -1);
     v->start = s;
+    vt_account(t, v, 1);
     refresh(t->root, s);
 }
 
 void vt_set_end(vtree *t, mm_vma *v, uint64_t e)
 {
     mm_vma *succ = vt_next(t, v);
+    vt_account(t, v, -1);
     v->end = e;
+    vt_account(t, v, 1);
     if (succ) {
         succ->prev_end = e;
         refresh(t->root, succ->start);
@@ -272,11 +300,14 @@ int vt_check(const vtree *t)
     chk(t->root, 0, UINT64_MAX, &bad);
     uint64_t pe = t->lo;
     size_t n = 0;
+    vtree sums = { 0 };
     for (mm_vma *v = vt_first(t); v; v = vt_next(t, v)) {
         if (v->prev_end != pe || v->start < pe) bad++;
         pe = v->end;
         n++;
+        vt_account(&sums, v, 1);
     }
     if (n != t->n) bad++;
+    if (sums.total != t->total || sums.stack != t->stack || sums.exec != t->exec || sums.data != t->data) bad++;
     return bad;
 }

@@ -88,7 +88,7 @@ Same results in the private core + mm build (scratchpad script) and in the commo
 | `test_mm_vma` | 32 | tree: lookups, gaps, 20,000 random operations compared against a reference array |
 | `test_mm_map` | 144 | mmap/munmap/mprotect on real memory, host accesses probed by write/read on a pipe, real SIGBUS/SIGSEGV fault in a child, MAP_FIXED, NOREPLACE, hint, MAP_32BIT, THP, anonymous MAP_SHARED shared with a child, JIT invalidation |
 | `test_mm_file` | 70 | real host file, through `lkd_mm_map` (ELF loader path) and through the syscall: direct mapping, 4 KiB offsets, ld.so segment pattern, copy-on-write, MAP_SHARED write visible in the file (msync), EACCES/ENODEV/EOPNOTSUPP rules, "(deleted)" |
-| `test_mm_misc` | 159 | brk, mremap, madvise, mincore, msync, mlock*, pkeys, exact maps format (column 73, trailing space), futex keys |
+| `test_mm_misc` | 220 | brk, mremap, madvise, mincore, msync, mlock*, high-water marks, RSS and its cache, Vm* counters against a walk, pkeys, exact maps format (column 73, trailing space), futex keys |
 | `test_mm_fork` | 23 | real fork through `lkd_fork_host`: private copy, MAP_SHARED sharing, DONTFORK, WIPEONFORK, memory locks not inherited; reset at exec |
 | `test_mm_shm` | 71 | SysV: creation, attach by another process, nattch, deferred IPC_RMID, permissions, IPC_INFO, SHM_STAT |
 | `test_mm_remote` | 45 | process_vm_readv/writev (partial counts, errors), forced POKE into read-only code with invalidation, service between two real host processes |
@@ -129,20 +129,23 @@ Measure the cost of mmap/munmap and of the remote service. Apply RLIMIT_AS. Add 
 
 `mm_backing.hbias`: a memfd can have a host phase (host offset = file offset + phase), set by its first mmap, so that a MAP_SHARED at an address not congruent to the offset modulo 16 KiB is possible. The JIT code watches cover all the views of the same shared object in the process (`mm_alias_pages`). Details, measurements and limits: `docs/requests/wine-7.md`.
 
-## Cost of VmRSS (2026-10-03, profile of the game menu)
+## Cost of VmRSS and of the Vm* counters (2026-10-03, rewritten 2026-10-23)
 
-The RSS of `lkd_mm_stats`:
-- Is counted per host region when the region is entirely inside the VMA: a single `mach_vm_region` query, MEASURED same total as mincore (270180 kB both ways on the witness).
-- Is counted through mincore for the edge pages.
-- Is cached for 100 ms (`MM_RSS_TTL_NS`) as long as no mapping is added or removed.
+`lkd_mm_stats` walks nothing:
+- VmSize, VmData, VmExe and VmStk come from counters the VMA tree keeps at every insertion, removal and bound change, and around a change of prot or label in place (`vt_account`), as Linux keeps them (`vm_stat_account`). The VMA holding `start_stack` moves to VmStk at read time. VmLck is `locked_bytes`. `vt_check` compares the counters with a walk.
+- RSS is the host process's resident memory, `task_info(TASK_VM_INFO)`: `internal` as RssAnon, the rest as RssFile, RssShmem 0. It is cached for 100 ms (`MM_RSS_TTL_NS`) as long as no mapping is added or removed, so `stat` and `status` read back to back agree.
 
-Accuracy: the RSS read can lag 100 ms behind pages touched or freed without a mapping change. VmHWM is only sampled on these reads.
+Accuracy: RSS includes the engine's own memory (FEX's code cache, LKD), a few hundred MiB for a big game, and shared anonymous memory counts as anonymous or file by its host backing. It can lag 100 ms behind pages touched or freed without a mapping change. VmHWM is sampled at these reads and before every unmap. smaps still gives the guest residency of each VMA from the host regions (`mach_vm_region`, mincore for the edge pages).
 
-MEASURED (witness `w20_statbench`: 1000 small VMAs and 256 MiB touched, real engine):
+Why: the RSS of 2026-10-03 was a walk of the VMAs, one `mach_vm_region` per host region and mincore for the edge pages, cached the same way. Dead by Daylight reads `/proc/self/status` every frame (`GetProcessMemoryInfo`) and maps or unmaps memory all the time, so the cache never served and every frame paid the walk: 35 to 40 fps instead of 60 (`docs/journal/02-performance.md`, October 23). Every munmap also walked the VMAs for VmPeak.
+
+MEASURED (witness `w20_statbench`: 1000 small VMAs and 256 MiB touched, real engine, 2026-10-03, with the walk):
 
 | Operation | Before | After |
 | --- | --- | --- |
 | read of `/proc/self/status` | 4.45 ms | 24 to 26 us |
 | full walk, without cache | 4.5 ms | 1.26 ms |
 
-Test: `test_mm_misc` case `rss_counting_and_cache`.
+MEASURED (native test, 40,000 host regions, 2026-10-23): a `mach_vm_region` walk 19.5 ms, one `task_info(TASK_VM_INFO)` 0.48 us.
+
+Tests: `test_mm_misc` cases `high_water_marks`, `rss_counting_and_cache` and `vm_counters_follow_the_tree`.

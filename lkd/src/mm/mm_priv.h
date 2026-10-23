@@ -99,6 +99,11 @@ typedef struct vtree {
     mm_vma *root;
     size_t n;
     uint64_t lo;                 /* prev_end of the first VMA */
+    /* Bytes of all VMAs and of the stack, exec and data ones, kept by every change of the tree as Linux keeps
+     * total_vm, stack_vm, exec_vm and data_vm (vm_stat_account): /proc/<pid>/status and munmap read them instead
+     * of walking tens of thousands of VMAs (Dead by Daylight). The stack here is the [stack] label only; the VMA
+     * holding start_stack moves to it at read time (lkd_mm_stats). */
+    uint64_t total, stack, exec, data;
 } vtree;
 
 /* ---- vma.c: AVL tree --------------------------------------------------------------------------- */
@@ -107,6 +112,8 @@ void vt_insert(vtree *t, mm_vma *v);
 void vt_remove(vtree *t, mm_vma *v);
 void vt_set_start(vtree *t, mm_vma *v, uint64_t s);   /* order must be preserved */
 void vt_set_end(vtree *t, mm_vma *v, uint64_t e);
+/* Takes v out of the counters (sign -1) or puts it back (+1), around a change of its prot or label in place. */
+void vt_account(vtree *t, const mm_vma *v, int sign);
 mm_vma *vt_find(const vtree *t, uint64_t addr);       /* containing addr */
 mm_vma *vt_first_end_after(const vtree *t, uint64_t addr); /* first VMA with end > addr (Linux find_vma) */
 mm_vma *vt_last_start_before(const vtree *t, uint64_t addr); /* last VMA with start < addr */
@@ -114,7 +121,7 @@ mm_vma *vt_next(const vtree *t, const mm_vma *v);
 mm_vma *vt_prev(const vtree *t, const mm_vma *v);
 mm_vma *vt_first(const vtree *t);
 mm_vma *vt_last(const vtree *t);
-int vt_check(const vtree *t);                         /* invariant check for tests: 0 ok */
+int vt_check(const vtree *t);                         /* invariant check for tests, counters too: 0 ok */
 /* Gap search. Calls fit(ctx, gap_lo, gap_hi, prev, next) for raw gaps of at least `len` bytes inside
  * [low, high), from the highest (topdown) or the lowest; stops when fit returns nonzero and returns that
  * value. The gap above the last VMA is bounded by `top`. */
@@ -124,7 +131,7 @@ uint64_t vt_search(const vtree *t, uint64_t len, uint64_t low, uint64_t high, ui
 
 /* ---- The address space ------------------------------------------------------------------------- */
 
-#define MM_RSS_TTL_NS 100000000ll   /* lkd_mm_stats RSS cache validity: 100 ms */
+#define MM_RSS_TTL_NS 100000000ll   /* lkd_mm_stats RSS cache validity: 100 ms (consistent back-to-back reads) */
 
 /* The VMA leaf lock. Not a pthread_rwlock: on macOS 27.0.1 a pthread_rwlock whose waiting threads take signals
  * stops waking them for good (a native test with 16 readers, 4 writers and empty signal handlers freezes within
@@ -202,9 +209,9 @@ struct lkd_mm {
     uint32_t def_flags;          /* VF_LOCKED | VF_LOCKONFAULT from mlockall(MCL_FUTURE) */
     uint64_t locked_bytes;
     uint64_t hiwater_vm, hiwater_rss; /* VmPeak, VmHWM (lkd_mm_stats) */
-    /* RSS cache of lkd_mm_stats (a mincore walk of every VMA): reused while younger than MM_RSS_TTL_NS and
-     * while no mapping was added or removed (map_gen). Pages touched or reclaimed meanwhile show up at the
-     * next refresh: RSS is up to MM_RSS_TTL_NS old. */
+    /* RSS cache of lkd_mm_stats (host_rss): reused while younger than MM_RSS_TTL_NS and while no mapping was
+     * added or removed (map_gen), so /proc/<pid>/stat and status read back to back agree. Pages touched or
+     * reclaimed meanwhile show up at the next refresh: RSS is up to MM_RSS_TTL_NS old. */
     uint64_t map_gen, rss_gen;
     int64_t rss_ns;
     uint64_t rss_anon, rss_file, rss_shmem;

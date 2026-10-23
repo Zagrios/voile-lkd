@@ -436,16 +436,29 @@ int mm_discard_range(lkd_mm *mm, const mm_vma *v, uint64_t s, uint64_t e)
 
 static uint64_t resident_bytes(const mm_vma *v, uint64_t *dirty);
 
-/* update_hiwater_vm (and update_hiwater_rss for large unmaps): called before VMAs go away. mmap lock held. */
+/* RSS of this guest process: the host process's resident memory (TASK_VM_INFO, what ps shows), anonymous (internal)
+ * and the rest. It includes the engine's own memory (FEX's code cache, LKD), and shared anonymous memory counts as
+ * anonymous or file by its host backing (RssShmem stays 0). A walk of the guest's VMAs gave guest pages only but
+ * cost one mach_vm_region per host region: MESURE about 20 ms for 40000 regions, against 0.5 us here; Dead by
+ * Daylight reads /proc/self/status (GetProcessMemoryInfo) every frame with that many. */
+static void host_rss(uint64_t *anon, uint64_t *rest)
+{
+    task_vm_info_data_t vi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    *anon = *rest = 0;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) != KERN_SUCCESS) return;
+    *anon = vi.internal < vi.resident_size ? vi.internal : vi.resident_size;
+    *rest = vi.resident_size - *anon;
+}
+
+/* update_hiwater_vm and update_hiwater_rss: called before VMAs go away. mmap lock held. */
 static void hiwater_before_unmap(lkd_mm *mm, uint64_t start, uint64_t end)
 {
     if (start <= mm_win.g_lo && end >= mm_win.g_hi) return; /* exec reset or destruction: the mm restarts */
-    /* VM exactly; RSS from the last lkd_mm_stats walk (a full walk per munmap cost a mincore of the whole
-     * address space: hiwater_rss is a lower bound anyway) */
-    uint64_t vm = 0, rss = mm->rss_anon + mm->rss_file + mm->rss_shmem;
-    for (mm_vma *x = vt_first(&mm->vt); x; x = vt_next(&mm->vt, x)) vm += x->end - x->start;
-    if (vm > mm->hiwater_vm) mm->hiwater_vm = vm;
-    if (rss > mm->hiwater_rss) mm->hiwater_rss = rss;
+    uint64_t anon, rest;
+    host_rss(&anon, &rest);
+    if (mm->vt.total > mm->hiwater_vm) mm->hiwater_vm = mm->vt.total;
+    if (anon + rest > mm->hiwater_rss) mm->hiwater_rss = anon + rest;
 }
 
 int mm_unmap_locked(lkd_mm *mm, uint64_t start, uint64_t end, struct mm_inval *iv)
@@ -760,7 +773,9 @@ int mm_protect_locked(lkd_mm *mm, uint64_t start, uint64_t end, uint32_t prot, s
             if ((err = mm_split(mm, cur)) || (err = mm_split(mm, pe))) break;
             v = vt_find(&mm->vt, cur);
             if ((v->prot | prot) & LX_PROT_EXEC) mm_inval_add(iv, cur, pe);
+            vt_account(&mm->vt, v, -1);
             v->prot = prot;
+            vt_account(&mm->vt, v, 1);
         }
         cur = pe;
     }
@@ -1043,7 +1058,9 @@ int lkd_mm_set_vma_name(lkd_mm *mm, uint64_t addr, uint64_t len, const char *nam
         if (kind && !dup) { r = -LX_ENOMEM; break; }
         free(v->label);
         v->label = dup;
+        vt_account(&mm->vt, v, -1);
         v->lkind = kind;
+        vt_account(&mm->vt, v, 1);
         if (kind == LBL_STACK && !mm->start_stack) mm->start_stack = v->end - 1;
         cur = v->end;
     }
@@ -1306,32 +1323,33 @@ int lkd_mm_stats(lkd_mm *mm, struct lkd_mm_stats *out)
     if (!mm || !out) return -LX_EINVAL;
     memset(out, 0, sizeof *out);
     mm_lock(mm);
-    int64_t now = lkd_host_mono_ns();
-    int fresh = mm->rss_ns && mm->rss_gen == mm->map_gen && now - mm->rss_ns < MM_RSS_TTL_NS;
-    for (mm_vma *v = vt_first(&mm->vt); v; v = vt_next(&mm->vt, v)) {
-        uint64_t sz = v->end - v->start, dirty, rss;
-        out->total_vm += sz;
-        out->nmaps++;
-        if (v->vflags & VF_LOCKED) out->locked_vm += sz;
-        int shared = (v->vflags & VF_SHARED) != 0;
-        /* is_data_mapping, is_stack_mapping, is_exec_mapping (mm/internal.h) */
-        if (v->lkind == LBL_STACK || (mm->start_stack && v->start <= mm->start_stack && v->end >= mm->start_stack))
-            out->stack_vm += sz;
-        else if ((v->prot & (LX_PROT_WRITE | LX_PROT_EXEC)) == LX_PROT_EXEC) out->exec_vm += sz;
-        else if ((v->prot & LX_PROT_WRITE) && !shared) out->data_vm += sz;
-        if (fresh) continue;
-        rss = resident_bytes(v, &dirty);
-        if (!v->bk) out->rss_anon += rss;
-        else if (v->bk->kind == MB_FILE) out->rss_file += rss;
-        else out->rss_shmem += rss;
+    out->total_vm = mm->vt.total;
+    out->nmaps = mm->vt.n;
+    out->locked_vm = mm->locked_bytes;
+    out->stack_vm = mm->vt.stack;
+    out->exec_vm = mm->vt.exec;
+    out->data_vm = mm->vt.data;
+    /* is_stack_mapping also takes the VMA holding start_stack or ending there (show_map_vma names it [stack]):
+     * out of the class the tree counts it in */
+    uint64_t ss = mm->start_stack;
+    mm_vma *at[2] = { ss ? vt_find(&mm->vt, ss) : NULL, ss ? vt_find(&mm->vt, ss - 1) : NULL };
+    if (at[1] && (at[1] == at[0] || at[1]->end != ss)) at[1] = NULL;
+    for (int i = 0; i < 2; i++) {
+        if (!at[i]) continue;
+        vtree one = { 0 };
+        vt_account(&one, at[i], 1);
+        out->stack_vm += one.total - one.stack;
+        out->exec_vm -= one.exec;
+        out->data_vm -= one.data;
     }
-    if (fresh) {
-        out->rss_anon = mm->rss_anon; out->rss_file = mm->rss_file; out->rss_shmem = mm->rss_shmem;
-    } else {
-        mm->rss_anon = out->rss_anon; mm->rss_file = out->rss_file; mm->rss_shmem = out->rss_shmem;
+    int64_t now = lkd_host_mono_ns();
+    if (!mm->rss_ns || mm->rss_gen != mm->map_gen || now - mm->rss_ns >= MM_RSS_TTL_NS) {
+        host_rss(&mm->rss_anon, &mm->rss_file);
+        mm->rss_shmem = 0;
         mm->rss_ns = now;
         mm->rss_gen = mm->map_gen;
     }
+    out->rss_anon = mm->rss_anon; out->rss_file = mm->rss_file; out->rss_shmem = mm->rss_shmem;
     uint64_t rss = out->rss_anon + out->rss_file + out->rss_shmem;
     if (out->total_vm > mm->hiwater_vm) mm->hiwater_vm = out->total_vm;
     if (rss > mm->hiwater_rss) mm->hiwater_rss = rss;

@@ -264,8 +264,8 @@ LT_TEST(mlock_semantics)
     down();
 }
 
-/* VmPeak and VmHWM (request procfs-2): mm->hiwater_vm is updated before every unmap (update_hiwater_vm,
- * mm/mmap.c), hiwater_rss before large unmaps and at reads; /proc shows max(hiwater, current). */
+/* VmPeak and VmHWM (request procfs-2): mm->hiwater_vm and hiwater_rss are updated before every unmap
+ * (update_hiwater_vm, update_hiwater_rss in mm/mmap.c) and at reads; /proc shows max(hiwater, current). */
 LT_TEST(high_water_marks)
 {
     up();
@@ -275,16 +275,17 @@ LT_TEST(high_water_marks)
     int64_t a = MMAP(0, 8 << 20, RW, PA);
     LT_CHECK(a > 0);
     memset(H((uint64_t)a), 1, 8 << 20);                      /* resident */
-    LT_EQ(lkd_mm_stats(T->mm, &st), 0);                       /* RSS is sampled by reads (cache, MM_RSS_TTL_NS) */
+    LT_EQ(lkd_mm_stats(T->mm, &st), 0);                       /* the mapping changed: a fresh RSS */
     LT_CHECK(st.rss_anon >= (8u << 20));
+    uint64_t r8 = st.rss_anon;
     int64_t b = MMAP(0, 4 << 20, RW, PA);
     LT_CHECK(b > 0);
     LT_EQ(sc(LKD_NR_munmap, (uint64_t)a, 8 << 20, 0, 0, 0, 0), 0);
     LT_EQ(lkd_mm_stats(T->mm, &st), 0);
     LT_EQ(st.total_vm, vm0 + (4 << 20));
     LT_EQ(st.hiwater_vm, vm0 + (12 << 20));                   /* the peak before the unmap */
-    LT_CHECK(st.hiwater_rss >= (8u << 20));                   /* the 8 MiB that were resident */
-    LT_CHECK(st.rss_anon < (8u << 20));
+    LT_CHECK(st.hiwater_rss >= r8);                           /* with the 8 MiB that were resident */
+    LT_CHECK(st.rss_anon + (7u << 20) <= r8);                 /* they went back to the host */
     LT_EQ(sc(LKD_NR_munmap, (uint64_t)b, 4 << 20, 0, 0, 0, 0), 0);
     LT_EQ(lkd_mm_stats(T->mm, &st), 0);
     LT_EQ(st.hiwater_vm, vm0 + (12 << 20));                   /* never decreases */
@@ -294,29 +295,78 @@ LT_TEST(high_water_marks)
     down();
 }
 
-/* RSS of /proc/<pid>/status (menu profile: a full mincore walk per read cost 387 ms in 5 s). Resident pages are
- * counted per host region when the region lies inside the VMA, by mincore at the edges; the result is cached
- * for MM_RSS_TTL_NS (100 ms) unless a mapping is added or removed. */
+/* RSS of /proc/<pid>/status: the host process's resident memory (host_rss in mm.c; a walk of the VMAs cost 20 ms
+ * per read with 40000 host regions, Dead by Daylight reads it every frame). It is cached for MM_RSS_TTL_NS
+ * (100 ms) unless a mapping is added or removed. */
 LT_TEST(rss_counting_and_cache)
 {
     up();
     struct lkd_mm_stats st;
     int64_t a = MMAP(0, 8 << 20, RW, PA);
     LT_CHECK(a > 0);
-    memset(H((uint64_t)a), 1, 3 << 20);                       /* 3 MiB of 8 MiB resident */
     LT_EQ(lkd_mm_stats(T->mm, &st), 0);
-    uint64_t r1 = st.rss_anon;
-    LT_CHECK(r1 >= (3u << 20) && r1 < (8u << 20));
-    memset(H((uint64_t)a + (3 << 20)), 1, 2 << 20);           /* 2 MiB more, no mapping change */
+    uint64_t r0 = st.rss_anon;
+    memset(H((uint64_t)a), 1, 3 << 20);                       /* 3 MiB of 8 MiB resident, no mapping change */
     LT_EQ(lkd_mm_stats(T->mm, &st), 0);
-    LT_EQ(st.rss_anon, r1);                                   /* within the validity: the cached value */
+    LT_EQ(st.rss_anon, r0);                                   /* within the validity: the cached value */
     usleep(120000);
     LT_EQ(lkd_mm_stats(T->mm, &st), 0);
-    LT_CHECK(st.rss_anon >= r1 + (2u << 20));                 /* refreshed after 100 ms */
-    uint64_t r2 = st.rss_anon;
+    LT_CHECK(st.rss_anon >= r0 + (3u << 20));                 /* refreshed after 100 ms */
+    uint64_t r1 = st.rss_anon;
     LT_EQ(sc(LKD_NR_munmap, (uint64_t)a, 8 << 20, 0, 0, 0, 0), 0);
     LT_EQ(lkd_mm_stats(T->mm, &st), 0);
-    LT_CHECK(st.rss_anon + (5u << 20) <= r2);                 /* a mapping change refreshes at once */
+    LT_CHECK(st.rss_anon + (2u << 20) <= r1);                 /* a mapping change refreshes at once */
+    down();
+}
+
+/* VmSize, VmData, VmExe and VmStk come from counters the VMA tree keeps (vm_stat_account): after maps, splits,
+ * merges, mprotect, mremap, names and unmaps they still equal a walk of the VMAs (vt_check). */
+LT_TEST(vm_counters_follow_the_tree)
+{
+    up();
+    struct lkd_mm_stats st;
+    LT_EQ(lkd_mm_stats(T->mm, &st), 0);
+    uint64_t vm0 = st.total_vm, data0 = st.data_vm, exec0 = st.exec_vm, stk0 = st.stack_vm;
+    int64_t a = MMAP(0, 0x10000, RW, PA);                                   /* data */
+    int64_t x = MMAP(0, 0x4000, LX_PROT_READ | LX_PROT_EXEC, PA);          /* exec */
+    int64_t s = MMAP(0, 0x4000, RW, LX_MAP_SHARED | LX_MAP_ANONYMOUS);     /* shared: neither */
+    LT_CHECK(a > 0 && x > 0 && s > 0);
+    LT_EQ(lkd_mm_stats(T->mm, &st), 0);
+    LT_EQ(st.total_vm, vm0 + 0x18000);
+    LT_EQ(st.data_vm, data0 + 0x10000);
+    LT_EQ(st.exec_vm, exec0 + 0x4000);
+    LT_EQ(sc(LKD_NR_mprotect, (uint64_t)a + 0x4000, 0x4000, LX_PROT_READ | LX_PROT_EXEC, 0, 0, 0), 0); /* split */
+    LT_EQ(lkd_mm_stats(T->mm, &st), 0);
+    LT_EQ(st.data_vm, data0 + 0xc000);
+    LT_EQ(st.exec_vm, exec0 + 0x8000);
+    LT_EQ(vt_check(&T->mm->vt), 0);
+    LT_EQ(sc(LKD_NR_mprotect, (uint64_t)a + 0x4000, 0x4000, RW, 0, 0, 0), 0);                          /* merge */
+    LT_EQ(vt_check(&T->mm->vt), 0);
+    int64_t m = MREMAP(a, 0x10000, 0x20000, LX_MREMAP_MAYMOVE, 0);                                     /* grow */
+    LT_CHECK(m > 0);
+    LT_EQ(lkd_mm_stats(T->mm, &st), 0);
+    LT_EQ(st.data_vm, data0 + 0x20000);
+    LT_EQ(sc(LKD_NR_munmap, (uint64_t)m + 0x8000, 0x4000, 0, 0, 0, 0), 0);                             /* a hole */
+    LT_EQ(lkd_mm_stats(T->mm, &st), 0);
+    LT_EQ(st.total_vm, vm0 + 0x24000);
+    LT_EQ(st.data_vm, data0 + 0x1c000);
+    LT_EQ(vt_check(&T->mm->vt), 0);
+    LT_EQ(lkd_mm_set_vma_name(T->mm, (uint64_t)m, 0x4000, "[stack]"), 0);                               /* a stack */
+    LT_EQ(lkd_mm_stats(T->mm, &st), 0);
+    LT_EQ(st.stack_vm, stk0 + 0x4000);
+    LT_EQ(st.data_vm, data0 + 0x18000);
+    LT_EQ(vt_check(&T->mm->vt), 0);
+    lkd_mm_set_stack_start(T->mm, (uint64_t)x + 0x100);                    /* the VMA holding start_stack */
+    LT_EQ(lkd_mm_stats(T->mm, &st), 0);
+    LT_EQ(st.stack_vm, stk0 + 0x8000);
+    LT_EQ(st.exec_vm, exec0);
+    LT_EQ(sc(LKD_NR_munmap, (uint64_t)m, 0x20000, 0, 0, 0, 0), 0);
+    LT_EQ(sc(LKD_NR_munmap, (uint64_t)x, 0x4000, 0, 0, 0, 0), 0);
+    LT_EQ(sc(LKD_NR_munmap, (uint64_t)s, 0x4000, 0, 0, 0, 0), 0);
+    LT_EQ(lkd_mm_stats(T->mm, &st), 0);
+    LT_EQ(st.total_vm, vm0);
+    LT_EQ(st.data_vm, data0);
+    LT_EQ(vt_check(&T->mm->vt), 0);
     down();
 }
 
@@ -408,6 +458,7 @@ int main(void)
     LT_RUN(mlock_semantics);
     LT_RUN(high_water_marks);
     LT_RUN(rss_counting_and_cache);
+    LT_RUN(vm_counters_follow_the_tree);
     LT_RUN(pkeys_and_shadow_stack);
     LT_RUN(maps_exact_format);
     LT_RUN(futex_keys);

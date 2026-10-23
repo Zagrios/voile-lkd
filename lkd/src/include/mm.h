@@ -114,13 +114,14 @@ void lkd_mm_set_mmap_base(lkd_mm *mm, uint64_t base);
 uint64_t lkd_mm_window_guest_lo(void);
 uint64_t lkd_mm_window_guest_hi(void);
 
-/* Counters for /proc/<pid>/status and statm (Vm*, RSS from the host where known). */
+/* Counters for /proc/<pid>/status and statm (Vm* of the guest's VMAs; RSS of the whole host process, see
+ * host_rss in mm.c). */
 struct lkd_mm_stats {
     uint64_t total_vm, locked_vm, data_vm, stack_vm, exec_vm, rss_anon, rss_file, rss_shmem, pte_bytes, nmaps;
     /* high-water marks for VmPeak and VmHWM (request procfs-2), never below the current values.
      * hiwater_vm is exact (recorded before every unmap, like update_hiwater_vm); hiwater_rss is recorded
-     * at every stats read and before unmaps of 2 MiB or more, so a short-lived resident peak between two
-     * reads can be missed (lower bound). Both restart at exec. */
+     * at every stats read and before every unmap, so a short-lived resident peak between two can be
+     * missed (lower bound). Both restart at exec. */
     uint64_t hiwater_vm, hiwater_rss;
 };
 int lkd_mm_stats(lkd_mm *mm, struct lkd_mm_stats *out);
