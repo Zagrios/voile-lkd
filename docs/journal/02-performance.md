@@ -712,3 +712,91 @@ Left as they are:
 
 Reading Wine's Unix frames in a dump: the printed offset is a file offset, and `ntdll.so` and `win32u.so` map their
 code 0x4000 above it (LOAD segment), so add 0x4000 before looking the address up with `nm`.
+
+## Round trips of the render thread: Neptune, Wine events and msync (October 24)
+
+Runtime Voile `v26.3.0-19` with the engine `a079f402`, M5 Max, built-in 120 Hz display, on AC. Benchmark: Rocket
+League's main menu (Epic, uncapped there), `guest NPT_WSD_PACING=off` and `guest NPT_PRESENT_QUEUE=0` in
+`fexdarwin.env`, 45 s, frames submitted per nptunix. The guest sampler of October 7 (not committed) now also records
+the Windows stack of a thread in a syscall: TEB (GS base) + 0x378 is Wine's `syscall_frame`, its `rip` (+0x70) and
+`rsp` (+0x88) give the caller, and the stack is read a page at a time.
+
+Profile before, `RenderingThread`: about 22% waiting for wineserver replies (`NtCreateEvent`, then
+`get_inproc_sync_fd` with its `SCM_RIGHTS` fd, then `close_handle`: UE3's `FAsyncTask` creates its `DoneEvent` again
+about 7 times a frame), 18% waiting for the host in Neptune calls that drain the ring (`GetData` on every query,
+`OMGetRenderTargets` and a host `QueryInterface` per returned view, `GetResource` on views, `GetDesc` on textures and
+render target views, `RSGetViewports`), 24% spinning in `NtYieldExecution`, 13% game code, 12% Neptune guest code.
+The host decoder thread (`npt-ring-1`): 42% `nanosleep` and 13% `sched_yield` (idle), 7% `memmove` (ring copies),
+4.3% DXMT parsing `__uuidof` strings in every `QueryInterface`, and a linear scan per query `End` in the feedback
+table.
+
+| Change | Commit | Menu fps |
+|---|---|---|
+| Release -19 | | 315 to 337 |
+| `__uuidof` GUIDs parsed at compile time | dxmt `ec19ace` | same (decoder CPU -2%) |
+| `create_event` returns the event's in-process sync (one request instead of two, no `SCM_RIGHTS`) | voile-wine `460580a` | +2 to 3% |
+| `GetData` answered from the query's feedback slot, host side indexed by object | neptune `d826616` | +2.5% |
+| Render targets, depth stencil view and viewports answered from what the context set; a view holds its resource; non-mappable texture descriptions kept | neptune `e1a75dd` | +15% |
+| View descriptions kept after the first `GetDesc` | neptune `b82a59e` | +3.5% |
+| `ID3DUserDefinedAnnotation` answered in the guest | neptune `bf8b60b` | Dead by Daylight, below |
+| `GetData` reads the clock on one poll in 16 | neptune `bb6633c` | small |
+| All | | 397 to 404 (+20 to 27%) |
+
+Without `fexdarwin.env` (default pacing), the menu goes from 316 to 400 fps. Free Play (The Block - Hoops): 124 to
+170 fps submitted uncapped; capped at 120 by the game, 2.40 cores before, 1.6 to 1.7 after. EAC True on every
+launch.
+
+Dead by Daylight (Epic, UE5, 60 fps cap in the menu): 56.4 fps at 4.3 cores before, 60 fps at 3.35 cores with the
+render target record, 2.6 to 2.8 cores with the annotations too (UE5 wraps its passes in `BeginEvent`/`EndEvent`,
+each a host round trip, and asks `GetStatus` before). The GPU is the limit there: fence wait about 11 ms a frame, GPU
+80 to 86%. Fall Guys (Unity): lobby unchanged, 282 to 292 fps, GPU-bound.
+
+Events, measured with a test program that creates, sets, waits for and closes an event in a loop:
+
+| Engine | Lifecycle before | after | Create + close of an event never waited for |
+|---|---|---|---|
+| Linux (ntsync in LKD) | 43.2 us | 31.4 us | 22.1 → 29.8 us |
+| macOS (msync) | 31 us | 21.4 us | 18.65 → 20.76 us |
+
+The last column is the cost: an event created and closed without a wait now also opens its in-process sync.
+`WaitForSingleObject(0)` stays at about 315 ns and `SetEvent` at 140 ns on the Linux engine.
+
+msync (macOS engine), voile-wine `7c2dfce`: a `WaitForMultipleObjects` registers the thread on every object in the
+server's msync thread. The server, finding the second object already signaled, unregistered only from the third
+object on (`i > 1`), and a client that saw an object signaled before the server took its registration returned
+without unregistering. An object nobody signals again keeps such entries for good; once the 512K-node pool is spent,
+every registration mallocs and prints "node memory pool exhausted" from the server thread. Test with two events where
+only the second is set: 5,868,630 such lines in 30 s and 182,000 → 100,000 waits a second before; none and 190,000 to
+197,000 waits a second after. Kingdom New Lands had left a 240 MB log this way.
+
+The render target record and the view's resource are private holds (`npt_com_hold`): the game's refcount is
+unchanged, as on Windows, where a context holds what is bound to it and a view its resource. A first version held
+only the wrapper: a released, held texture whose parent was a view the game also released kept a dangling parent,
+and the wrapper cache refused any wrapper with no public reference, so the host naming that texture again gave
+NULL after 8 retries. The committed version holds the parent too, and the cache hands a held wrapper out again (the
+hold count drops only under the cache mutex).
+
+Rejected:
+
+- QoS class per process (`USER_INTERACTIVE` for the game only): `EPERM` on wineserver, no gain on the game.
+- Spinning in LKD before sleeping on a wait: 31.3 → 33.5 us per event lifecycle, worse.
+- Ring idle timeout of 100 us in the decoder: no gain.
+- Dropping redundant state calls in the guest (same shaders, layout, topology, states, samplers, scissors): +1% on
+  Rocket League, nothing on Dead by Daylight; not committed.
+- Game Mode: macOS turns it on only for native fullscreen.
+- FEX options: multiblock and TSO half barriers are already on, and the host's LRCPC, LRCPC2 and LSE2 are used.
+
+Left as they are:
+
+- Rocket League's render thread still waits on its pool events (about 23%) and on the `create_event`/`close_handle`
+  pairs that remain (about 10%); its main thread spends about 11% in Winsock requests and 4.5% looking up
+  localization files every frame.
+- wineserver costs about 8.7 us of CPU per request under FEX and LKD: the anchor `pipe()`, `fcntl`, `fstat`,
+  `getsockopt`, and `lkd_proc_list` for each ntsync object.
+- The decoder thread spins when idle.
+- Dead by Daylight's GPU time is in DXMT's GPU work; a Metal capture is the next step.
+- One Fall Guys start of nine with these changes ended during the scene load: "NoExec instruction in entry block:
+  7EFE7229E780" (a heap address), then glibc's "The futex facility returned an unexpected error code." in the game
+  process. That start ran the first version of the holds; not reproduced in the five starts after it.
+- Unrailed and Kingdom New Lands (OpenGL, macOS engine) hang at startup when launched in the background by the test
+  automation, with the release Wine as with the new one.
