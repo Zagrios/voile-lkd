@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <csignal>
 #include <cstring>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -27,6 +29,10 @@ thread_local GuestThread* CurrentGuestThread = nullptr;
 extern "C" int fexdarwin_lkd_vma_at(uint64_t gva, uint64_t* start, uint64_t* end, uint32_t* prot);
 extern "C" int fexdarwin_lkd_code_write_fault(uint64_t gva);
 extern "C" int fexdarwin_lkd_code_watched(uint64_t gva);
+extern "C" int fexdarwin_lkd_guard_fault(uint64_t gva, int write, uint64_t* page);
+extern "C" void fexdarwin_lkd_guard_close(uint64_t page);
+extern "C" void fexdarwin_lkd_guard_close_all(void);
+extern "C" void fexdarwin_kick_trampoline();
 
 namespace {
 // Protection of the guest page holding Addr: negative when unmapped. In LKD mode the VMA table of LKD is the authority.
@@ -263,6 +269,112 @@ bool DarwinSignalDelegator::HandleSmcWrite(GuestThread* T, int Sig, siginfo_t* I
   return true;
 }
 
+// A guarded host page (LKD mm, mm_page_guarded) is PROT_NONE on the host because some of its 4 KiB guest pages are
+// PROT_NONE next to accessible ones. A fault in one decides per 4 KiB: forbidden accesses stay guest page faults (the
+// caller delivers them), allowed ones go through. A store opens the page until its protection changes. A load opens it
+// for ONE guest instruction: the guest restarts at that instruction with the trap flag, which FEX turns into a single
+// step, and the trap closes the page again (EndGuardStep). Otherwise the neighbours, which must fault, would be readable.
+// In translator code (the decoder reading guest code) the page stays open until the end of the compilation (PostCompile).
+namespace {
+// Whether the host page of a guest address allows the access right now.
+bool HostAllows(uint64_t GuestAddr, bool Write) {
+  mach_vm_address_t A = reinterpret_cast<uint64_t>(FEXCore::G2H(GuestAddr));
+  const mach_vm_address_t Want = A;
+  mach_vm_size_t Sz = 0;
+  vm_region_basic_info_data_64_t Inf;
+  mach_msg_type_number_t C = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t O;
+  if (mach_vm_region(mach_task_self(), &A, &Sz, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&Inf), &C, &O) != KERN_SUCCESS ||
+      A > Want) {
+    return false;
+  }
+  return (Inf.protection & (Write ? VM_PROT_WRITE : VM_PROT_READ)) != 0;
+}
+} // namespace
+
+bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, uint64_t Addr, bool Write, bool InJit) {
+  uint64_t Page = 0;
+  const int R = fexdarwin_lkd_guard_fault(Addr, Write, &Page);
+  if (R == 0) {
+    // Not a guarded page. The fault can still have outlived its cause: another thread (THEIA decrypting a page,
+    // NtProtectVirtualMemory) changed the page's protection between the access and this handler, and the guest map
+    // already allows the access while the host page is not updated yet (or was just updated). The guest map is the
+    // truth: retry the access, giving the other thread a moment to finish its host protection change. A page that
+    // keeps faulting while the guest allows it is the guest's own fault after all (RaceCount bounds the retries).
+    // An episode is the faults of one page with less than RaceGapNs between them; it gives up after RaceMaxNs.
+    constexpr uint64_t RaceGapNs = 5'000'000, RaceMaxNs = 20'000'000;
+    const int GProt = GuestProtAt(Addr);
+    const bool GuestAllows = GProt >= 0 && (GProt & (Write ? PROT_WRITE : PROT_READ));
+    if (GuestAllows) {
+      const uint64_t Page0 = Addr & ~0xfffull;
+      const uint64_t Now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+      if (T->RaceAddr != Page0 || Now - T->RaceLast > RaceGapNs) {
+        T->RaceAddr = Page0;
+        T->RaceStart = Now;
+        T->RaceCount = 0;
+      }
+      T->RaceLast = Now;
+      if (Now - T->RaceStart < RaceMaxNs) {
+        if (++T->RaceCount > 4 && !HostAllows(Addr, Write)) usleep(20);
+        return true;
+      }
+      T->RaceAddr = 0;
+    }
+  }
+  if (R != 1 && R != 2) return false;
+  if (R == 2 || Write || !InJit) {
+    return true; // retry the host instruction
+  }
+  return BeginGuardStep(T, Uc, Page);
+}
+
+bool DarwinSignalDelegator::BeginGuardStep(GuestThread* T, ucontext_t* Uc, uint64_t Page) {
+  auto* Th = T->State;
+  auto* Frame = Th->CurrentFrame;
+  auto& TF = Frame->State.flags[FEXCore::X86State::RFLAG_TF_RAW_LOC];
+  if (Frame->InSyscallInfo != 0 || Frame->State.DeferredSignalRefCount.Load() != 0 || (TF && !T->GuardStepping)) {
+    // Cannot step now (inside an inline system call, signals deferred, or the guest is single-stepping itself): the page
+    // stays open until the next system call ends.
+    return true;
+  }
+  if (!T->GuardStepping) {
+    T->GuardStepping = true;
+    T->GuardN = 0;
+  }
+  bool Known = false;
+  for (int I = 0; I < T->GuardN; I++) Known |= T->GuardPages[I] == Page;
+  if (!Known && T->GuardN < 4) T->GuardPages[T->GuardN++] = Page;
+  SpillSRA(Th, Uc, Frame->InSyscallInfo & 0xFFFF);
+  TF = 1; // trap flag set, blocked for one instruction: that instruction runs, the next one raises #DB
+  DarwinCtx::SetSp(Uc, Frame->ReturningStackLocation);
+  DarwinCtx::SetPc(Uc, reinterpret_cast<uint64_t>(&fexdarwin_kick_trampoline));
+  DarwinCtx::SetReg(Uc, 0, reinterpret_cast<uint64_t>(T));
+  DarwinCtx::SetReg(Uc, 28, reinterpret_cast<uint64_t>(Frame));
+  return true;
+}
+
+void CancelGuardStep(GuestThread* T) {
+  if (!T->GuardStepping) return;
+  for (int I = 0; I < T->GuardN; I++) fexdarwin_lkd_guard_close(T->GuardPages[I]);
+  // and the pages the translator opened to compile the stepped instruction (DarwinSyscallHandler::PostCompile)
+  fexdarwin_lkd_guard_close_all();
+  T->GuardN = 0;
+  T->GuardStepping = false;
+  // BeginGuardStep only steps a thread whose trap flag is clear
+  T->State->CurrentFrame->State.flags[FEXCore::X86State::RFLAG_TF_RAW_LOC] = 0;
+}
+
+void DarwinSignalDelegator::EndGuardStep(GuestThread* T, ucontext_t* Uc) {
+  auto* Frame = T->State->CurrentFrame;
+  CancelGuardStep(T);
+  Frame->SynchronousFaultData.FaultToTopAndGeneratedException = false;
+  Frame->InSyscallInfo = 0;
+  DarwinCtx::SetSp(Uc, Frame->ReturningStackLocation);
+  DarwinCtx::SetPc(Uc, reinterpret_cast<uint64_t>(&fexdarwin_kick_trampoline));
+  DarwinCtx::SetReg(Uc, 0, reinterpret_cast<uint64_t>(T));
+  DarwinCtx::SetReg(Uc, 28, reinterpret_cast<uint64_t>(Frame));
+}
+
 // Faults that belong to the guest program: memory accesses from translated code that the guest's own memory map forbids,
 // and the exceptions FEX raises itself (ud2, int3, hlt, ...) through the dispatcher stubs.
 bool DarwinSignalDelegator::HandleGuestFault(GuestThread* T, int Sig, siginfo_t* Info, ucontext_t* Uc) {
@@ -275,6 +387,11 @@ bool DarwinSignalDelegator::HandleGuestFault(GuestThread* T, int Sig, siginfo_t*
   if (InDispatcher && Frame->SynchronousFaultData.FaultToTopAndGeneratedException) {
     // Break op: FEX stored the reason in the frame and spilled the guest registers before the host exception instruction.
     const auto& D = Frame->SynchronousFaultData;
+    if (T->GuardStepping && D.TrapNo == Linux::TRAP_DB) {
+      // The one instruction that read a guarded page has run (BeginGuardStep): the single-step trap is ours.
+      EndGuardStep(T, Uc);
+      return true;
+    }
     F.Signal = D.Signal; // Core::FAULT_* are the host numbers of SIGSEGV, SIGILL and SIGTRAP, which equal the Linux ones
     F.SiCode = D.si_code;
     F.TrapNo = D.TrapNo;
@@ -300,6 +417,7 @@ bool DarwinSignalDelegator::HandleGuestFault(GuestThread* T, int Sig, siginfo_t*
     const int Prot = GuestProtAt(Addr);
     const uint32_t Esr = DarwinCtx::GetEsr(Uc);
     const bool Write = (Esr >> 6) & 1; // WnR of a data abort syndrome
+    if (LkdEnabled() && ResolveGuardedFault(T, Uc, Addr, Write, true)) return true;
     F.Signal = Linux::L_SIGSEGV;
     F.SiCode = Prot < 0 ? Linux::SEGV_MAPERR_ : Linux::SEGV_ACCERR_;
     F.Addr = Addr;
@@ -361,7 +479,15 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
   }
 
   // 5. Everything else that happens in translated code is the guest program's own fault.
-  return HandleGuestFault(T, Sig, Info, Uc);
+  if (HandleGuestFault(T, Sig, Info, Uc)) return true;
+
+  // 6. Host C++ reading guest memory that sits in a guarded host page (the decoder reading code): open it for the
+  //    compilation, then retry the host instruction.
+  if ((Sig == SIGSEGV || Sig == SIGBUS) && LkdEnabled() && !G->CTX->IsAddressInCodeBuffer(Th, PC)) {
+    const uint32_t Esr = DarwinCtx::GetEsr(Uc);
+    if (ResolveGuardedFault(T, Uc, FEXCore::H2G(Info->si_addr), (Esr >> 6) & 1, false)) return true;
+  }
+  return false;
 }
 
 namespace {

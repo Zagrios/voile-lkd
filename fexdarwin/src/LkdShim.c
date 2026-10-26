@@ -103,6 +103,16 @@ int fexdarwin_lkd_code_write_fault(uint64_t gva) {
 int fexdarwin_lkd_code_watched(uint64_t gva) {
   return lkd_mm_code_watched(gva);
 }
+// Guarded host pages (lkd_mm_watch.h): PROT_NONE on the host, decided per 4 KiB of the guest's protection.
+int fexdarwin_lkd_guard_fault(uint64_t gva, int write, uint64_t* page) {
+  return lkd_mm_guard_fault(gva, write, page);
+}
+void fexdarwin_lkd_guard_close(uint64_t page) {
+  lkd_mm_guard_close(page);
+}
+void fexdarwin_lkd_guard_close_all(void) {
+  lkd_mm_guard_close_all();
+}
 
 // procfs (src/lkd/src/procfs/lkd_procfs.h): /proc/cpuinfo and /sys cache files are rendered from the CPUID the guest
 // itself executes, which only the engine can answer. fexdarwin_cpuid is defined in LkdGlue.cpp.

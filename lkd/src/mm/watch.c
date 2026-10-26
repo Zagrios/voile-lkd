@@ -27,6 +27,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <sys/mman.h>
+#include <time.h>
 
 #include "mm_priv.h"
 #include "lkd_mm_watch.h"
@@ -156,13 +157,13 @@ static lkd_mm *cur_mm(void)
     return t && t->mm ? t->mm : mm_win.owner;
 }
 
-/* Host protection the page should have now (I2 minus PROT_WRITE when watched). Watch lock held. */
+/* Host protection the page should have now (I2, or PROT_NONE for a guarded page, minus PROT_WRITE when watched).
+ * Watch lock held. */
 static int wanted_prot(lkd_mm *mm, uint64_t p)
 {
-    int h = PROT_NONE;
+    int h;
     mrw_rdlock(&mm->vlock);
-    for (mm_vma *v = vt_first_end_after(&mm->vt, p); v && v->start < p + mm_hps; v = vt_next(&mm->vt, v))
-        h |= mm_host_prot_of(v->prot);
+    h = mm_page_guarded(mm, p) ? PROT_NONE : mm_page_union(mm, p);
     mrw_rdunlock(&mm->vlock);
     if (mm_watched(p)) h &= ~PROT_WRITE;
     return h;
@@ -420,5 +421,143 @@ void lkd_mm_file_written(struct lkd_fdobj *file, uint64_t off, uint64_t len)
         mm_watch_lock();
         mm_host_protect(pages[i], mm_hps, wanted_prot(mm, pages[i]));
         mm_watch_unlock();
+    }
+}
+
+
+/* ---- Guarded host pages (mm.c, mm_page_guarded) ---------------------------------------------------------
+ * The host protection of a guarded page is PROT_NONE, so the guest's accesses fault and are decided here per 4 KiB
+ * (lkd_mm_watch.h has the return values). A page opened for a store stays open until something sets its host
+ * protection again (a protection change, a translation of its code, another thread's close): a packer writes the
+ * decrypted bytes of a page it has just made writable, one store at a time, and stepping each store would be too slow.
+ * Meanwhile its PROT_NONE neighbours are open too. A page opened for a read is closed again by the caller after one
+ * instruction (lkd_mm_guard_close) or, for the LKD and the translator, by lkd_mm_guard_close_all at the end of the
+ * operation: the PROT_NONE neighbours must not be readable meanwhile, or the guest reads the encrypted bytes.
+ * The decision looks at the 4 KiB of the faulting address only: an access that runs from an allowed 4 KiB into a
+ * forbidden one of the same host page completes once the page is open, where x86 faults at the boundary. */
+
+#define GUARD_OPEN_MAX 16
+static _Thread_local uint64_t guard_open[GUARD_OPEN_MAX];
+static _Thread_local int guard_open_n;
+static _Thread_local uint64_t guard_last_page = ~0ull;
+static _Thread_local int guard_last_count;
+
+static void guard_forget(uint64_t p)
+{
+    for (int i = 0; i < guard_open_n; i++)
+        if (guard_open[i] == p) { guard_open[i] = guard_open[--guard_open_n]; return; }
+}
+
+/* A full list closes its oldest page first: an operation still using it faults and opens it again. */
+static void guard_note_open(uint64_t p)
+{
+    for (int i = 0; i < guard_open_n; i++) if (guard_open[i] == p) return;
+    if (guard_open_n == GUARD_OPEN_MAX) lkd_mm_guard_close(guard_open[0]);
+    guard_open[guard_open_n++] = p;
+}
+
+/* A page that this thread reads again and again (the PE header of a module, next to its encrypted first pages) costs a
+ * fault and a single-stepped instruction per read. After GUARD_HOT_READS reads in GUARD_HOT_NS it stays open for
+ * GUARD_BURST_NS: its PROT_NONE neighbours are readable meanwhile, which the closing timer (any later guard fault, end
+ * of a system call or of a compilation of this thread) bounds. */
+#define GUARD_HOT_READS 6
+#define GUARD_HOT_NS 20000000ull
+#define GUARD_BURST_NS 4000000ull
+#define GUARD_BURST_MAX 8
+#define GUARD_HIST 8
+static _Thread_local struct { uint64_t page, t0; unsigned n; } guard_hist[GUARD_HIST];
+static _Thread_local unsigned guard_hist_next;
+static _Thread_local struct { uint64_t page, expiry; } guard_burst[GUARD_BURST_MAX];
+static _Thread_local int guard_burst_n;
+
+static uint64_t guard_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+static void guard_expire(uint64_t now)
+{
+    for (int i = 0; i < guard_burst_n;) {
+        if (guard_burst[i].expiry > now) { i++; continue; }
+        uint64_t p = guard_burst[i].page;
+        guard_burst[i] = guard_burst[--guard_burst_n];
+        lkd_mm_guard_close(p);
+    }
+}
+
+static int guard_hot(uint64_t p)
+{
+    uint64_t now = guard_now();
+    int h = -1;
+    for (int i = 0; i < GUARD_HIST; i++) if (guard_hist[i].page == p) { h = i; break; }
+    if (h < 0) { h = (int)(guard_hist_next++ % GUARD_HIST); guard_hist[h].page = p; guard_hist[h].t0 = now; guard_hist[h].n = 0; }
+    if (now - guard_hist[h].t0 >= GUARD_HOT_NS) { guard_hist[h].t0 = now; guard_hist[h].n = 0; }
+    if (++guard_hist[h].n < GUARD_HOT_READS) return 0;
+    for (int i = 0; i < guard_burst_n; i++) if (guard_burst[i].page == p) { guard_burst[i].expiry = now + GUARD_BURST_NS; return 1; }
+    if (guard_burst_n == GUARD_BURST_MAX) return 0;
+    guard_burst[guard_burst_n].page = p;
+    guard_burst[guard_burst_n++].expiry = now + GUARD_BURST_NS;
+    return 1;
+}
+
+int lkd_mm_guard_fault(uint64_t gva, int write, uint64_t *page_out)
+{
+    lkd_mm *mm = cur_mm();
+    if (!mm || !in_window(gva)) return 0;
+    uint64_t p = HP_DOWN(gva);
+    if (guard_burst_n) guard_expire(guard_now());
+    mrw_rdlock(&mm->vlock);
+    int guarded = mm_page_guarded(mm, p);
+    mm_vma *v = guarded ? vt_find(&mm->vt, gva) : NULL;
+    int allowed = v && (write ? (v->prot & LX_PROT_WRITE) : (v->prot & (LX_PROT_READ | LX_PROT_WRITE | LX_PROT_EXEC)));
+    mrw_rdunlock(&mm->vlock);
+    if (!guarded) return 0;
+    if (!allowed) return -1;
+    /* the same access failing again and again although the page is already open: stop and make it a guest fault */
+    int hprot = host_prot_now(p);
+    if (hprot >= 0 && (hprot & (write ? PROT_WRITE : PROT_READ))) {
+        if (p == guard_last_page) { if (++guard_last_count > 64) { guard_last_page = ~0ull; return -1; } }
+        else { guard_last_page = p; guard_last_count = 1; }
+    } else guard_last_page = ~0ull;
+    if (write && mm_watched(p)) mm_unwatch_for_write(mm, gva, 0, NULL); /* translated code: drop it before the store */
+    mm_watch_lock();
+    int prot;
+    mrw_rdlock(&mm->vlock);
+    prot = mm_page_union(mm, p);
+    mrw_rdunlock(&mm->vlock);
+    if (mm_watched(p)) prot &= ~PROT_WRITE;
+    mm_host_protect(p, mm_hps, prot);
+    mm_watch_unlock();
+    if (page_out) *page_out = p;
+    if (write) return 1;
+    if (guard_hot(p)) return 2; /* open for a while: nothing to close after the access */
+    guard_note_open(p);
+    return 1;
+}
+
+void lkd_mm_guard_close(uint64_t page)
+{
+    lkd_mm *mm = cur_mm();
+    guard_last_page = ~0ull;
+    guard_forget(page);
+    if (!mm) return;
+    mm_watch_lock();
+    mm_host_protect(page, mm_hps, wanted_prot(mm, page));
+    mm_watch_unlock();
+}
+
+void lkd_mm_guard_close_all(void)
+{
+    while (guard_open_n > 0) lkd_mm_guard_close(guard_open[--guard_open_n]);
+    if (guard_burst_n) guard_expire(guard_now());
+}
+
+/* LKD copies of [gva, gva+len): open the guarded pages for the duration of the syscall. */
+void mm_guard_open_range(lkd_mm *mm, uint64_t gva, uint64_t len, int write)
+{
+    if (!atomic_load_explicit(&mm_any_guarded, memory_order_relaxed) || !len) return;
+    for (uint64_t p = HP_DOWN(gva); p < gva + len; p += mm_hps) {
+        uint64_t a = p > gva ? p : gva;
+        mrw_rdlock(&mm->vlock);
+        int guarded = mm_page_guarded(mm, p);
+        mrw_rdunlock(&mm->vlock);
+        if (guarded) lkd_mm_guard_fault(a, write, NULL);
     }
 }

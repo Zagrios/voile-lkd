@@ -47,6 +47,15 @@ struct GuestThread {
   uint64_t SysArgs[6] {};      // its arguments (thread dump)
   std::atomic<bool> Stopped {false};       // parked in a ptrace stop: registers are in memory
   std::atomic<bool> KickRequested {false};
+  // A guarded host page (LKD mm) opened for one instruction that reads it: DarwinSignalDelegator::BeginGuardStep.
+  uint64_t GuardPages[4] {};
+  int GuardN {};
+  bool GuardStepping {};
+  // Guest 4 KiB page of the faults retried because the guest map allows the access while the host page does not yet
+  // (a protection change in flight on another thread): DarwinSignalDelegator::ResolveGuardedFault.
+  uint64_t RaceAddr {};
+  uint64_t RaceStart {}, RaceLast {}; // CLOCK_UPTIME_RAW ns of the first and the latest retry of this episode
+  unsigned RaceCount {};
   std::atomic<bool> InLkd {false};         // inside lkd_syscall/lkd_signal_next: LKD checks pending signals on its way out
   uint64_t FaultErr {}, FaultTrapNo {}, FaultAddr {}; // sigcontext err/trapno/cr2 of the pending synchronous fault
   // Profile (FEXDARWIN_PROFILE): system calls of this thread, in all and per number. SysNr holds the counts of each

@@ -197,6 +197,15 @@ void DarwinSyscallHandler::HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) {
 
 extern "C" int fexdarwin_lkd_vma_at(uint64_t gva, uint64_t* start, uint64_t* end, uint32_t* prot);
 extern "C" int fexdarwin_lkd_watch_code(uint64_t gva, uint64_t len);
+extern "C" void fexdarwin_lkd_guard_close_all(void);
+
+// The decoder has read the guest's code: the guarded host pages it had to open go back to PROT_NONE. Not during a guard
+// step: the stepped instruction's block is compiled after BeginGuardStep opened its page, and CancelGuardStep closes
+// them all at the trap.
+void DarwinSyscallHandler::PostCompile() {
+  if (CurrentGuestThread && CurrentGuestThread->GuardStepping) return;
+  fexdarwin_lkd_guard_close_all();
+}
 
 void DarwinSyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState*, uint64_t Start, uint64_t Length) {
   if (LkdEnabled()) {

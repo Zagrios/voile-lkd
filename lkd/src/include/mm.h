@@ -95,6 +95,10 @@ int lkd_mm_check_range(uint64_t gva, size_t len, int need_write);
  * that holds translated code. Returns 1 when mm dropped the translations and restored the permission (retry the
  * store), 0 for a real guest fault. Core calls it from the usercopy fault recovery; the engine from its handler. */
 int lkd_mm_code_write_fault(uint64_t gva);
+/* Guarded host pages (lkd_mm_watch.h has the contract). */
+int lkd_mm_guard_fault(uint64_t gva, int write, uint64_t *page_out);
+void lkd_mm_guard_close(uint64_t page);
+void lkd_mm_guard_close_all(void);
 
 /* ---- /proc support ---------------------------------------------------------------------------- */
 

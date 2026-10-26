@@ -484,6 +484,7 @@ void InvalidateCode(uint64_t Gva, uint64_t Len) {
 // ---- signal frames ----
 int FrameBuild(lkd_task* t, const lkd_delivery* D) {
   auto* T = GT(t);
+  CancelGuardStep(T);
   auto* Th = T->State;
   auto& St = Th->CurrentFrame->State;
   const uint32_t EFlags = GuestEflags(Th);

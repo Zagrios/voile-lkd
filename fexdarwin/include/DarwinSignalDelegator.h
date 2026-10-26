@@ -49,5 +49,13 @@ private:
   bool HandleFault(GuestThread* T, int Sig, siginfo_t* Info, ucontext_t* Uc);
   bool HandleSmcWrite(GuestThread* T, int Sig, siginfo_t* Info, ucontext_t* Uc);
   bool HandleGuestFault(GuestThread* T, int Sig, siginfo_t* Info, ucontext_t* Uc);
+  bool BeginGuardStep(GuestThread* T, ucontext_t* Uc, uint64_t Page);
+  void EndGuardStep(GuestThread* T, ucontext_t* Uc);
+  bool ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, uint64_t Addr, bool Write, bool InJit);
   [[noreturn]] void Crash(GuestThread* T, int Sig, siginfo_t* Info, ucontext_t* Uc, const char* Why);
 };
+
+// Ends a guard step (DarwinSignalDelegator::BeginGuardStep) before its trap: closes the pages it opened and clears the
+// trap flag it set. Run before a guest signal frame is built in the middle of a step, so the guest never sees that trap
+// flag; the instruction faults again after the handler and is stepped anew. No-op when the thread is not stepping.
+void CancelGuardStep(GuestThread* T);

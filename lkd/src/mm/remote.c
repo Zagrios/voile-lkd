@@ -58,6 +58,7 @@ int64_t mm_local_rw(lkd_mm *mm, uint64_t gva, void *buf, uint64_t n, int write, 
         int hp = 0;
         for (mm_vma *o = vt_first_end_after(&mm->vt, hpg); o && o->start < hpg + mm_hps; o = vt_next(&mm->vt, o))
             hp |= mm_host_prot_of(o->prot);
+        if (mm_page_guarded(mm, hpg)) hp = PROT_NONE; /* opened for the copy, closed again by mm_host_refresh */
         if (write && mm_watched(hpg)) {
             /* translated again in the meantime: unwatch now, invalidate once the locks are dropped */
             mm_unwatch_bit(hpg);

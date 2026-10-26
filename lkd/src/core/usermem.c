@@ -102,6 +102,12 @@ int lkd_fault_try_recover(void *ctx)
         if ((ec == 0x24 || ec == 0x25) && (esr & (1u << 6)) &&
             lkd_mm_code_write_fault(lkd_h2g((const void *)(uintptr_t)uc->uc_mcontext->__es.__far)) == 1)
             return 1;
+        /* A guarded host page (src/mm/mm.c): PROT_NONE on the host, the guest's rights decide. Opened until the end of
+         * the system call; the copy is executed again. */
+        if (ec == 0x24 || ec == 0x25) {
+            int g = lkd_mm_guard_fault(lkd_h2g((const void *)(uintptr_t)uc->uc_mcontext->__es.__far), (esr & (1u << 6)) != 0, NULL);
+            if (g == 1 || g == 2) return 1;
+        }
         void *lr = (void *)arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
         arm_thread_state64_set_pc_fptr(uc->uc_mcontext->__ss, lr);
         uc->uc_mcontext->__ss.__x[0] = (uint64_t)-1;

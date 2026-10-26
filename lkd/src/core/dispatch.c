@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "lkd_internal.h"
+#include "mm.h"
 #include "ptrace.h"
 #include "sig.h"
 #include "task.h"
@@ -165,6 +166,7 @@ lkd_disp lkd_syscall(lkd_task *t, const lkd_sysreq *in, int64_t *rax)
     else if (disp == LKD_CONTEXT_REPLACED && traced) lkd_ptrace_syscall_exit_replaced(t);
     if (lkd_trace_level()) lkd_trace_exit(t, &rq, disp == LKD_RESTART ? -LX_ERESTARTSYS : ret);
     atomic_store(&t->cur_nr, -1);
+    lkd_mm_guard_close_all(); /* guarded host pages opened for this call's copies (src/mm/watch.c) */
     *rax = ret;
     return disp;
 }

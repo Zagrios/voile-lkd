@@ -12,7 +12,8 @@
  * Host pages are 16 KiB, guest pages 4 KiB. Invariants kept by every operation:
  *   I1 a host page that no VMA overlaps is a fresh piece of the reservation (PROT_NONE, zero, private);
  *   I2 the host protection of a host page is the union of its VMAs (r if any is not PROT_NONE, w if any
- *      is writable); host execute permission is never used (the engine translates guest code);
+ *      is writable), except a guarded host page (mm.c mm_page_guarded), which is PROT_NONE; host execute
+ *      permission is never used (the engine translates guest code);
  *   I3 a host page overlapped by a host-shared VMA (MAP_SHARED anonymous, SysV shm, MAP_SHARED file)
  *      belongs to that mapping alone: no private VMA overlaps it. Host-shared VMAs start on a host page
  *      boundary; their tail host page may hold guest-unmapped sub-pages.
@@ -267,6 +268,10 @@ int64_t mm_map_locked(lkd_mm *mm, struct mm_mapreq *rq, struct mm_inval *iv);
 int mm_unmap_locked(lkd_mm *mm, uint64_t start, uint64_t end, struct mm_inval *iv);
 int mm_protect_locked(lkd_mm *mm, uint64_t start, uint64_t end, uint32_t prot, struct mm_inval *iv);
 int mm_host_refresh(lkd_mm *mm, uint64_t start, uint64_t end);  /* re-apply I2 on host pages */
+int mm_page_union(lkd_mm *mm, uint64_t p);                      /* I2: union of the sub-pages' rights (VMA lock held) */
+int mm_page_guarded(lkd_mm *mm, uint64_t p);                    /* guarded host page, see mm.c (VMA lock held) */
+extern _Atomic int mm_any_guarded;
+void mm_guard_open_range(lkd_mm *mm, uint64_t gva, uint64_t len, int write); /* LKD copies: open the guarded pages of the range */
 void mm_host_cleanup(lkd_mm *mm, uint64_t start, uint64_t end); /* I1/I2 after VMAs left [start,end) */
 int mm_fill(lkd_mm *mm, const mm_vma *v, uint64_t s, uint64_t e); /* zero or file content into [s,e) */
 int mm_discard_range(lkd_mm *mm, const mm_vma *v, uint64_t s, uint64_t e); /* zero/refill, O(boundary) */

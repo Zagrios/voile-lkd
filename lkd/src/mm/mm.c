@@ -4,6 +4,7 @@
 #include <mach/mach_vm.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "mm_priv.h"
@@ -293,12 +294,53 @@ static int page_hostshared(lkd_mm *mm, uint64_t p)
     return 0;
 }
 
-static int page_prot(lkd_mm *mm, uint64_t p)
+int mm_page_union(lkd_mm *mm, uint64_t p)
 {
     int h = PROT_NONE;
     for (mm_vma *v = vt_first_end_after(&mm->vt, p); v && v->start < p + mm_hps; v = vt_next(&mm->vt, v))
         h |= mm_host_prot_of(v->prot);
     return h;
+}
+
+_Atomic int mm_any_guarded; /* a guarded page was seen in this process: LKD copies look for them (mm_guard_open_range) */
+
+/* A Windows module's file. Wine maps a module that needs its pages edited (relocations, an image section that is not
+ * file backed) from a temporary file of its own: /tmp/.wine-UID/server-.../tmpmap-N. */
+static int pe_name(const char *n)
+{
+    size_t l = n ? strlen(n) : 0;
+    return (l > 4 && (!strcasecmp(n + l - 4, ".exe") || !strcasecmp(n + l - 4, ".dll") || !strcasecmp(n + l - 4, ".sys"))) ||
+           (n && strstr(n, "/tmpmap-"));
+}
+
+/* Guarded host page: part of one file mapping, with guest sub-pages that are PROT_NONE next to accessible ones.
+ * I2 (union) would let the guest read and write the PROT_NONE sub-pages, so the host protection is PROT_NONE and every
+ * access faults; lkd_mm_guard_fault (watch.c) then decides per 4 KiB. Windows packers keep code and data encrypted
+ * under PAGE_NOACCESS and decrypt them in the access violation handler: THEIA (HELLDIVERS 2, THE FINALS) read the
+ * jump table of a switch from an encrypted page that shared its host page with decrypted code, and jumped to garbage.
+ * Only sub-pages of the same file object count, shared or private pieces of it (Wine maps a tmpmap file MAP_SHARED):
+ * the PROT_NONE tail of an anonymous reservation after a module does not make the module's last page slow.
+ * VMA lock held. */
+int mm_page_guarded(lkd_mm *mm, uint64_t p)
+{
+    const struct mm_backing *bk = NULL;
+    int none = 0, acc = 0;
+    for (mm_vma *v = vt_first_end_after(&mm->vt, p); v && v->start < p + mm_hps; v = vt_next(&mm->vt, v)) {
+        /* Windows modules only: the gaps between the segments of a Linux shared object are PROT_NONE file pages too,
+         * next to the hot data of the object. All the pieces on the page belong to one object, shared or private. */
+        if (!v->bk || v->bk->kind != MB_FILE || !pe_name(v->bk->name)) return 0;
+        if (bk && !mm_same_object(bk, v->bk)) return 0;
+        bk = v->bk;
+        if (v->prot & (LX_PROT_READ | LX_PROT_WRITE | LX_PROT_EXEC)) acc = 1; else none = 1;
+    }
+    if (!(none && acc)) return 0;
+    atomic_store_explicit(&mm_any_guarded, 1, memory_order_relaxed);
+    return 1;
+}
+
+static int page_prot(lkd_mm *mm, uint64_t p)
+{
+    return mm_page_guarded(mm, p) ? PROT_NONE : mm_page_union(mm, p);
 }
 
 /* I2 for every host page of [start, end); pages without VMA go back to PROT_NONE. */
@@ -938,6 +980,7 @@ int lkd_mm_check_range(uint64_t gva, size_t len, int need_write)
     if (!mm) return 0;
     if (mm_win.identity && (gva + len <= mm_win.g_lo || gva >= mm_win.g_hi)) return 0;
     int r = mm_check_range_mm(mm, gva, len, need_write, 0);
+    if (!r) mm_guard_open_range(mm, gva, len, need_write);
     if (r || !need_write || !len) return r;
     /* An LKD write into a page that holds translated code: drop the translations and make the page
      * writable before the copy (the same path as a guest store, lkd_mm_code_write_fault). */
