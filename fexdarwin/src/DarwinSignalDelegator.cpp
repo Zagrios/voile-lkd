@@ -38,6 +38,21 @@ int GuestProtAt(uint64_t Addr) {
   }
   return G->Mem.ProtAt(Addr);
 }
+
+// The first byte of the instruction at Rip that x86 cannot fetch, which an instruction fetch fault reports: Rip, or
+// the start of the 4 KiB page that an instruction begun in executable memory runs into. A packer that decrypts pages on
+// the fault (THEIA in HELLDIVERS 2) decrypts that page, and loops forever when told Rip instead.
+uint64_t FirstUnfetchable(uint64_t Rip) {
+  constexpr uint64_t MaxInstruction = 15;
+  for (uint64_t Page = Rip & ~uint64_t {0xfff}; Page < Rip + MaxInstruction; Page += 0x1000) {
+    const int Prot = GuestProtAt(Page);
+    if (Prot < 0 || !(Prot & Linux::PROT_EXEC_)) {
+      return Page > Rip ? Page : Rip;
+    }
+  }
+  return Rip;
+}
+
 } // namespace
 
 namespace {
@@ -266,7 +281,7 @@ bool DarwinSignalDelegator::HandleGuestFault(GuestThread* T, int Sig, siginfo_t*
     F.Err = D.err_code;
     F.Addr = (D.TrapNo == Linux::TRAP_PF) ? Frame->State.rip : Frame->State.rip;
     if (D.TrapNo == Linux::TRAP_PF && (D.err_code & Linux::PF_INSTR)) {
-      F.Addr = Frame->State.rip; // an instruction fetch fault reports the target address
+      F.Addr = FirstUnfetchable(Frame->State.rip);
       // FEX reports every instruction fetch fault as a protection fault. Linux distinguishes: an unmapped target is
       // SEGV_MAPERR with the present bit clear (error code 0x14), a mapped non-executable one SEGV_ACCERR with 0x15.
       if (GuestProtAt(F.Addr) < 0) {
