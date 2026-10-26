@@ -97,13 +97,19 @@ void DarwinSignalDelegator::RegisterThread(GuestThread* T) {
 }
 
 void DarwinSignalDelegator::UnregisterThread(GuestThread* T) {
+  // macOS wants ss_size >= MINSIGSTKSZ even with SS_DISABLE (ENOMEM otherwise). With a zero size the call failed and the
+  // stack stayed registered while the munmap below took its memory away: the next signal of this thread (a kick racing
+  // its exit, a fault) could not get its frame written, and the kernel ended the whole process with SIGILL, without
+  // running any handler. A stack that cannot be disabled (the thread is running on it) is kept mapped.
   stack_t Ss {};
+  Ss.ss_sp = T->HostAltStack;
+  Ss.ss_size = T->HostAltStack ? T->HostAltStackSize : MINSIGSTKSZ;
   Ss.ss_flags = SS_DISABLE;
-  sigaltstack(&Ss, nullptr);
-  if (T->HostAltStack) {
+  const bool Disabled = sigaltstack(&Ss, nullptr) == 0;
+  if (T->HostAltStack && Disabled) {
     ::munmap(T->HostAltStack, T->HostAltStackSize);
-    T->HostAltStack = nullptr;
   }
+  T->HostAltStack = nullptr;
   CurrentGuestThread = nullptr;
 }
 
