@@ -26,6 +26,8 @@ LKD_WEAK int lkd_net_wait_object(lkd_task *t, lkd_fdobj *o, uint32_t want, int64
     return -LX_ENOSYS;
 }
 
+LKD_WEAK char *lkd_net_render_routes(int ipv6, size_t *len_out) { (void)ipv6; if (len_out) *len_out = 0; return NULL; }
+
 /* No net module: no inotify, procfs does not publish the files; the Linux defaults for completeness. */
 LKD_WEAK void lkd_net_inotify_limits(struct lkd_inotify_limits *out)
 {

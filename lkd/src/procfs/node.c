@@ -80,7 +80,8 @@ static const struct pid_ent g_pid_ents[] = {
     { NULL, 0, 0, 0 }
 };
 
-static const char *const g_pnet_files[] = { "dev", "if_inet6", NULL };
+/* The index is the generator id pid.c renders (n->sub). */
+static const char *const g_pnet_files[] = { "dev", "if_inet6", "route", "ipv6_route", NULL };
 
 struct root_ent { const char *name; int kind; char type; uint16_t perm; const char *link; };
 /* Alphabetical, like the proc_root rbtree. */

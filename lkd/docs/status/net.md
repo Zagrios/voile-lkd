@@ -102,3 +102,5 @@ Minimal NETLINK_ROUTE (RTM_GETADDR, RTM_GETLINK) if a glibc witness asks for it;
 ## Interfaces and NETLINK_ROUTE (2026-10-03, request wine-8)
 
 `src/net/ifaces.c`: SIOCGIF* ioctls and NETLINK_ROUTE socket (dumps of links, addresses and routes) from the real state of the host, read-only. Difference 1 "AF_NETLINK refused" no longer applies to NETLINK_ROUTE. Details and limits: `docs/requests/wine-8.md`.
+
+`/proc/net/route` and `/proc/net/ipv6_route` (2026-10-27): the same routes, in the kernel's text format (`lkd_net_render_routes`, published by procfs). Wine reads its routing table there; without them every `GetAdaptersAddresses` failed with `ERROR_NOT_SUPPORTED` (PlayFab Party and the EOS SDK in HELLDIVERS 2).

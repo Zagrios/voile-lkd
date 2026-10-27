@@ -30,4 +30,8 @@ void lkd_net_signal_queued(lkd_task *t);
 struct lkd_inotify_limits { uint32_t max_user_instances, max_user_watches, max_queued_events; };
 void lkd_net_inotify_limits(struct lkd_inotify_limits *out);
 
+/* /proc/net/route (ipv6 0) or /proc/net/ipv6_route (ipv6 1): the routes of the guest-visible interfaces
+ * (ifaces.c), as the kernel prints them. Malloc'ed text, its length in *len_out; NULL on allocation failure. ANY. */
+char *lkd_net_render_routes(int ipv6, size_t *len_out);
+
 #endif /* LKD_NET_H */

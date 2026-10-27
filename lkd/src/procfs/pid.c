@@ -525,6 +525,11 @@ int pf_render_local(const struct lkd_procfs_wire *rq, lkd_task *tk, struct pbuf 
         if (rq->fd == 0)
             pb_puts(b, "Inter-|   Receive                                                |  Transmit\n"
                        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+        if (rq->fd == 2 || rq->fd == 3) {   /* net/route, net/ipv6_route: the routes of the interfaces net shows */
+            size_t len = 0;
+            char *t = lkd_net_render_routes(rq->fd == 3, &len);
+            if (t) { pb_write(b, t, len); free(t); } else rc = -LX_ENOMEM;
+        }
         break;
     case PK_WIRE_FDLIST: {
         int *fds = NULL, n = local_fd_list(tk, &fds);

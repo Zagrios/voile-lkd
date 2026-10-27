@@ -700,6 +700,13 @@ LT_TEST(small_files)
     s = slurp("/proc/self/net/dev", &len);
     LT_CHECK(s && !strncmp(s, "Inter-|   Receive", 17));
     free(s);
+    s = slurp("/proc/self/net/route", &len);   /* fib_route_seq_show: lines of 127 columns, the header first */
+    LT_CHECK(s && len >= 128 && len % 128 == 0 && !strncmp(s, "Iface\tDestination\tGateway \tFlags\t", 33) && s[127] == '\n');
+    free(s);
+    s = slurp("/proc/self/net/ipv6_route", &len);   /* rt6_info_route: lo carries ::1/128 */
+    LT_CHECK(s && strstr(s, "00000000000000000000000000000001 80 00000000000000000000000000000000 00 ") != NULL &&
+             strstr(s, " 00000100 00000001 00000000 00000001       lo\n") != NULL);
+    free(s);
     LT_ERRNO(gopen("/proc/self/nonexistent", LX_O_RDONLY), LX_ENOENT);
     LT_ERRNO(gopen("/proc/self/task/999999/status", LX_O_RDONLY), LX_ENOENT);
     LT_ERRNO(gopen("/proc/01/status", LX_O_RDONLY), LX_ENOENT);              /* leading zero: not a number */

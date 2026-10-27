@@ -5,14 +5,16 @@
  * (IFT_ETHER, en*) -> eth0, eth1...; point-to-point (utun VPN) -> tun0...; anything else -> net0... Indexes are
  * LKD's (1 for lo, then 2, 3...), stable for one snapshot; a snapshot is taken at each request.
  *
- * Two interfaces to them (Linux 6.12):
+ * Three interfaces to them (Linux 6.12):
  *   - the SIOCGIF* ioctls on any socket (net/core/dev_ioctl.c): SIOCGIFCONF (IPv4 addresses, ifconf),
  *     SIOCGIFNAME, SIOCGIFINDEX, SIOCGIFFLAGS, SIOCGIFADDR, SIOCGIFNETMASK, SIOCGIFBRDADDR, SIOCGIFMTU,
  *     SIOCGIFHWADDR, SIOCGIFTXQLEN; every SIOCSIF* is -EPERM (no CAP_NET_ADMIN);
  *   - a NETLINK_ROUTE socket (net/core/rtnetlink.c): LXN_RTM_GETLINK, LXN_RTM_GETADDR, LXN_RTM_GETROUTE as dumps (and
  *     LXN_RTM_GETLINK of one interface), NLMSG_DONE, NLMSG_ERROR. Requests that change state (RTM_NEW*,
  *     RTM_DEL*, RTM_SET*) answer -EPERM; other types -EOPNOTSUPP. No multicast notifications are ever sent
- *     (memberships are accepted: LKD does not watch the host for changes, documented gap).
+ *     (memberships are accepted: LKD does not watch the host for changes, documented gap);
+ *   - the route files /proc/net/route and /proc/net/ipv6_route (lkd_net_render_routes, published by procfs).
+ *     Wine reads its routing table there, and without one every GetAdaptersAddresses fails (ERROR_NOT_SUPPORTED).
  *
  * Netlink transport: the guest socket is one end of a host AF_UNIX datagram socketpair. A request written by
  * the guest never reaches the host: LKD parses it and writes the answer, one netlink message per datagram,
@@ -425,20 +427,34 @@ static int put_addr(int peer, const struct nif *f, const struct nif_addr *a, uin
     return nl_emit(peer, &m);
 }
 
-static int put_route(int peer, int family, const uint8_t *dst, int dst_len, const uint8_t *gw, int oif,
-                     const uint8_t *prefsrc, uint8_t scope, uint8_t proto, uint32_t seq, uint32_t pid)
+/* A route of the main table: the prefix route of an address (gw NULL) or a default (dst_len 0, gw set). */
+struct nroute {
+    int family;               /* LX_AF_INET or LX_AF_INET6 */
+    uint8_t dst[16];          /* the masked prefix */
+    int dst_len;
+    const uint8_t *gw;
+    const uint8_t *prefsrc;   /* the address a prefix route comes from */
+    const struct nif *f;      /* outgoing interface */
+};
+
+/* IPv6 metric (ip6_route_add): 256 for a prefix route, 1024 for a gateway. */
+static uint32_t route_metric6(const struct nroute *rt) { return rt->gw ? 1024 : 256; }
+
+static int put_route(int peer, const struct nroute *rt, uint32_t seq, uint32_t pid)
 {
     struct nlbuf m;
     nl_begin(&m, LXN_RTM_NEWROUTE, NLM_F_MULTI, seq, pid);
-    struct rtmsg_ rm = { (uint8_t)family, (uint8_t)dst_len, 0, 0, 254 /* RT_TABLE_MAIN */, proto, scope, 1 /* RTN_UNICAST */, 0 };
+    uint8_t proto = rt->gw ? 3 /* RTPROT_BOOT */ : 2 /* RTPROT_KERNEL */;
+    uint8_t scope = rt->gw ? 0 /* RT_SCOPE_UNIVERSE */ : 253 /* RT_SCOPE_LINK */;
+    struct rtmsg_ rm = { (uint8_t)rt->family, (uint8_t)rt->dst_len, 0, 0, 254 /* RT_TABLE_MAIN */, proto, scope, 1 /* RTN_UNICAST */, 0 };
     nl_put(&m, &rm, sizeof rm);
-    uint16_t al = family == LX_AF_INET ? 4 : 16;
-    uint32_t table = 254, oifv = (uint32_t)oif;
+    uint16_t al = rt->family == LX_AF_INET ? 4 : 16;
+    uint32_t table = 254, oifv = (uint32_t)rt->f->index;
     nl_attr(&m, LXN_RTA_TABLE, &table, 4);
-    if (dst_len) nl_attr(&m, LXN_RTA_DST, dst, al);
-    if (gw) nl_attr(&m, LXN_RTA_GATEWAY, gw, al);
-    if (prefsrc && family == LX_AF_INET) nl_attr(&m, LXN_RTA_PREFSRC, prefsrc, al);
-    if (family == LX_AF_INET6) { uint32_t prio = gw ? 1024 : 256; nl_attr(&m, LXN_RTA_PRIORITY, &prio, 4); }
+    if (rt->dst_len) nl_attr(&m, LXN_RTA_DST, rt->dst, al);
+    if (rt->gw) nl_attr(&m, LXN_RTA_GATEWAY, rt->gw, al);
+    if (rt->prefsrc && rt->family == LX_AF_INET) nl_attr(&m, LXN_RTA_PREFSRC, rt->prefsrc, al);
+    if (rt->family == LX_AF_INET6) { uint32_t prio = route_metric6(rt); nl_attr(&m, LXN_RTA_PRIORITY, &prio, 4); }
     nl_attr(&m, LXN_RTA_OIF, &oifv, 4);
     return nl_emit(peer, &m);
 }
@@ -484,11 +500,11 @@ static int host_defaults(int af, uint8_t gw[][16], char ifn[][IFNAMSIZ], int cap
     return n;
 }
 
-/* Guest index of a host interface (default routes), 0 when the guest does not see it. */
-static int guest_index_of_host(const struct nif *v, int n, const char *hostname)
+/* The guest interface of a host interface (default routes), NULL when the guest does not see it. */
+static const struct nif *nif_of_host(const struct nif *v, int n, const char *hostname)
 {
-    for (int i = 0; i < n; i++) if (!strcmp(v[i].hname, hostname)) return v[i].index;
-    return 0;
+    for (int i = 0; i < n; i++) if (!strcmp(v[i].hname, hostname)) return &v[i];
+    return NULL;
 }
 
 static void mask_prefix(uint8_t *d, const uint8_t *a, int bytes, int plen)
@@ -498,6 +514,33 @@ static void mask_prefix(uint8_t *d, const uint8_t *a, int bytes, int plen)
         uint8_t m = bits >= 8 ? 0xff : bits <= 0 ? 0 : (uint8_t)(0xff << (8 - bits));
         d[i] = a[i] & m;
     }
+}
+
+#define NROUTE_MAX (NIF_MAX * 8 + 4)
+
+/* The main table of one family, as the kernel derives it: the prefix route of each address (none for IPv4 on lo,
+ * those live in the local table), then the host's defaults through the interfaces the guest sees. The defaults
+ * point into gw. Returns the count. */
+static int route_list(const struct nif *v, int n, int family, uint8_t gw[4][16], struct nroute *out)
+{
+    int c = 0;
+    for (int i = 0; i < n; i++) {
+        if (family == LX_AF_INET && (v[i].flags & LX_IFF_LOOPBACK)) continue;
+        for (int k = 0; k < v[i].naddr; k++) {
+            const struct nif_addr *a = &v[i].a[k];
+            if (a->family != family) continue;
+            struct nroute *rt = &out[c++];
+            *rt = (struct nroute){ .family = family, .dst_len = a->mask_len, .prefsrc = a->addr, .f = &v[i] };
+            mask_prefix(rt->dst, a->addr, family == LX_AF_INET ? 4 : 16, a->mask_len);
+        }
+    }
+    char ifn[4][IFNAMSIZ];
+    int d = host_defaults(family == LX_AF_INET6 ? AF_INET6 : AF_INET, gw, ifn, 4);
+    for (int i = 0; i < d; i++) {
+        const struct nif *f = nif_of_host(v, n, ifn[i]);
+        if (f) out[c++] = (struct nroute){ .family = family, .gw = gw[i], .f = f };   /* else not visible to the guest */
+    }
+    return c;
 }
 
 static int nl_dump(int peer, const struct nlmsghdr_ *h, const uint8_t *body, uint32_t blen, uint32_t pid)
@@ -514,36 +557,69 @@ static int nl_dump(int peer, const struct nlmsghdr_ *h, const uint8_t *body, uin
             for (int k = 0; k < v[i].naddr && !r; k++)
                 if (!fam || fam == v[i].a[k].family) r = put_addr(peer, &v[i], &v[i].a[k], h->seq, pid);
         break;
-    case LXN_RTM_GETROUTE: {
-        for (int i = 0; i < n && !r; i++) {
-            for (int k = 0; k < v[i].naddr && !r; k++) {
-                const struct nif_addr *a = &v[i].a[k];
-                if (fam && fam != a->family) continue;
-                if (a->family == LX_AF_INET && (v[i].flags & LX_IFF_LOOPBACK)) continue;   /* lo: local table only */
-                uint8_t d[16] = { 0 };
-                int bytes = a->family == LX_AF_INET ? 4 : 16;
-                mask_prefix(d, a->addr, bytes, a->mask_len);
-                r = put_route(peer, a->family, d, a->mask_len, NULL, v[i].index, a->addr, 253 /* RT_SCOPE_LINK */,
-                              2 /* RTPROT_KERNEL */, h->seq, pid);
-            }
-        }
+    case LXN_RTM_GETROUTE:
         for (int af = 0; af < 2 && !r; af++) {
-            int lxaf = af ? LX_AF_INET6 : LX_AF_INET;
-            if (fam && fam != lxaf) continue;
+            int family = af ? LX_AF_INET6 : LX_AF_INET;
+            if (fam && fam != family) continue;
             uint8_t gw[4][16];
-            char ifn[4][IFNAMSIZ];
-            int c = host_defaults(af ? AF_INET6 : AF_INET, gw, ifn, 4);
-            for (int i = 0; i < c && !r; i++) {
-                int oif = guest_index_of_host(v, n, ifn[i]);
-                if (!oif) continue;   /* the default goes through an interface the guest does not see */
-                r = put_route(peer, lxaf, NULL, 0, gw[i], oif, NULL, 0 /* RT_SCOPE_UNIVERSE */, 3 /* RTPROT_BOOT */, h->seq, pid);
-            }
+            struct nroute rt[NROUTE_MAX];
+            int c = route_list(v, n, family, gw, rt);
+            for (int i = 0; i < c && !r; i++) r = put_route(peer, &rt[i], h->seq, pid);
         }
         break;
     }
-    }
     if (!r) r = nl_done(peer, h, pid);
     return r;
+}
+
+/* ---- /proc/net/route and /proc/net/ipv6_route ------------------------------------------------------------ */
+
+static void put_hex6(char *o, const uint8_t *a)
+{
+    for (int i = 0; i < 16; i++) snprintf(o + 2 * i, 3, "%02x", a[i]);
+}
+
+/* route_list as fib_route_seq_show (net/ipv4/fib_trie.c) and rt6_info_route (net/ipv6/route.c) print it. IPv4:
+ * addresses as the hex of the network-order word, every line padded to 127 columns, the default first (trie order).
+ * IPv6: 32 hex digits, flags RTF_UP (1) | RTF_GATEWAY (2). */
+char *lkd_net_render_routes(int ipv6, size_t *len_out)
+{
+    struct nif v[NIF_MAX];
+    int n = nif_snapshot(v, NIF_MAX);
+    uint8_t gw[4][16];
+    struct nroute rt[NROUTE_MAX];
+    int c = route_list(v, n, ipv6 ? LX_AF_INET6 : LX_AF_INET, gw, rt);
+    size_t cap = (size_t)(c + 1) * 192, o = 0;
+    char *t = malloc(cap);
+    if (!t) return NULL;
+    if (!ipv6) {
+        o += (size_t)snprintf(t + o, cap - o, "%-127s\n",
+                              "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT");
+        for (int defaults = 1; defaults >= 0; defaults--) {
+            for (int i = 0; i < c; i++) {
+                if (!rt[i].gw != !defaults) continue;
+                uint32_t dst, gwv = 0, mask = rt[i].dst_len ? htonl(~0u << (32 - rt[i].dst_len)) : 0;
+                memcpy(&dst, rt[i].dst, 4);
+                if (rt[i].gw) memcpy(&gwv, rt[i].gw, 4);
+                char line[128];
+                snprintf(line, sizeof line, "%s\t%08X\t%08X\t%04X\t0\t0\t0\t%08X\t0\t0\t0", rt[i].f->name, dst, gwv,
+                         rt[i].gw ? 0x3u : 0x1u, mask);
+                o += (size_t)snprintf(t + o, cap - o, "%-127s\n", line);
+            }
+        }
+    } else {
+        static const char zero[] = "00000000000000000000000000000000";
+        for (int i = 0; i < c; i++) {
+            char dh[33], gh[33];
+            put_hex6(dh, rt[i].dst);
+            if (rt[i].gw) put_hex6(gh, rt[i].gw);
+            else memcpy(gh, zero, sizeof gh);
+            o += (size_t)snprintf(t + o, cap - o, "%s %02x %s 00 %s %08x %08x %08x %08x %8s\n", dh, rt[i].dst_len, zero, gh,
+                                  route_metric6(&rt[i]), 1u, 0u, rt[i].gw ? 0x3u : 0x1u, rt[i].f->name);
+        }
+    }
+    *len_out = o;
+    return t;
 }
 
 /* One request message from the guest. */
