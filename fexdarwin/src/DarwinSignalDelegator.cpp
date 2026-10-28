@@ -2,6 +2,8 @@
 #include "DarwinSignalDelegator.h"
 #include "CodeValidation.h"
 #include "CrashReport.h"
+#include "GuardedLoadPatch.h"
+#include "GuardedLoadStub.h"
 #include "HitchLog.h"
 #include "LkdGlue.h"
 #include <FEXCore/Utils/GuestBase.h>
@@ -31,6 +33,7 @@ extern "C" int fexdarwin_lkd_code_write_fault(uint64_t gva);
 extern "C" int fexdarwin_lkd_code_watched(uint64_t gva);
 extern "C" int fexdarwin_lkd_guard_fault(uint64_t gva, int write, uint64_t* page);
 extern "C" void fexdarwin_lkd_guard_close(uint64_t page);
+extern "C" int fexdarwin_lkd_guard_read(uint64_t gva, void* dst, unsigned len);
 extern "C" void fexdarwin_lkd_guard_close_all(void);
 extern "C" void fexdarwin_kick_trampoline();
 
@@ -271,7 +274,8 @@ bool DarwinSignalDelegator::HandleSmcWrite(GuestThread* T, int Sig, siginfo_t* I
 
 // A guarded host page (LKD mm, mm_page_guarded) is PROT_NONE on the host because some of its 4 KiB guest pages are
 // PROT_NONE next to accessible ones. A fault in one decides per 4 KiB: forbidden accesses stay guest page faults (the
-// caller delivers them), allowed ones go through. A store opens the page until its protection changes. A load opens it
+// caller delivers them), allowed ones go through. A store opens the page until its protection changes. A load of
+// translated code runs here (DecodeGuardedLoad), read from the file of the page or while it is open; one it cannot run opens the page
 // for ONE guest instruction: the guest restarts at that instruction with the trap flag, which FEX turns into a single
 // step, and the trap closes the page again (EndGuardStep). Otherwise the neighbours, which must fault, would be readable.
 // In translator code (the decoder reading guest code) the page stays open until the end of the compilation (PostCompile).
@@ -290,9 +294,91 @@ bool HostAllows(uint64_t GuestAddr, bool Write) {
   }
   return (Inf.protection & (Write ? VM_PROT_WRITE : VM_PROT_READ)) != 0;
 }
+
+// The load of translated code that faulted on an open guarded page, run here instead of single-stepping its guest
+// instruction: a step costs a restart, a one-instruction compilation and a trap, which made the switch tables THEIA's
+// interpreter loops read from code pages (THE FINALS) so slow that the game missed its anti-cheat deadline. Handles the
+// loads FEX emits (LDR/LDUR/LDAPUR/LDAR/LDAPR, register offset, pre- and post-index, LDP/LDNP; integer and FP/SIMD
+// registers) when the access stays in the 4 KiB guest page that faulted, which the caller found readable; anything else
+// is stepped.
+struct GuardedLoad {
+  GuardedLoadStub::Load L;
+  uint32_t Insn;       // as FEX emitted it (GuardedLoadPatch::InstructionAt)
+  uint64_t Addr;       // host address of the first element
+  int Wb = -1;         // base register of a pre- or post-indexed load, which gets WbValue
+  uint64_t WbValue = 0;
+};
+
+bool DecodeGuardedLoad(ucontext_t* Uc, uint64_t FaultHost, GuardedLoad& D) {
+  D.Insn = GuardedLoadPatch::InstructionAt(DarwinCtx::GetPc(Uc)); // the original load of a patched site
+  if (!GuardedLoadStub::DecodeLoad(D.Insn, D.L)) return false;
+  const auto& L = D.L;
+  const uint64_t* X = DarwinCtx::GPRs(Uc);
+  const uint64_t Base = X[L.Rn]; // 31 is SP as a base register
+  const uint64_t Offset = static_cast<uint64_t>(L.Offset);
+  switch (L.Form) {
+  case GuardedLoadStub::Load::RegOff: {
+    uint64_t Off = L.Rm == 31 ? 0 : X[L.Rm]; // XZR
+    if (L.Option == 2) Off = static_cast<uint32_t>(Off);
+    else if (L.Option == 6) Off = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(Off)));
+    D.Addr = Base + (Off << L.Shift);
+    break;
+  }
+  case GuardedLoadStub::Load::PostIndex:
+  case GuardedLoadStub::Load::PairPostIndex: D.Addr = Base; break;
+  default: D.Addr = Base + Offset; break;
+  }
+  D.Wb = -1;
+  if (L.Form == GuardedLoadStub::Load::PreIndex || L.Form == GuardedLoadStub::Load::PostIndex ||
+      L.Form == GuardedLoadStub::Load::PairPreIndex || L.Form == GuardedLoadStub::Load::PairPostIndex) {
+    D.Wb = static_cast<int>(L.Rn);
+    D.WbValue = Base + Offset;
+  }
+  // The whole access in the 4 KiB guest page that faulted.
+  return (D.Addr & ~0xfffull) == (FaultHost & ~0xfffull) &&
+         ((D.Addr + L.Bytes() - 1) & ~0xfffull) == (FaultHost & ~0xfffull);
+}
+
+// Writes the loaded bytes to the destination registers and moves past the load.
+void ApplyGuardedLoad(ucontext_t* Uc, const GuardedLoad& D, const uint8_t* Bytes) {
+  uint64_t* X = DarwinCtx::GPRs(Uc);
+  const auto& L = D.L;
+  const unsigned N = 1u << L.Size;
+  auto Put = [&](const uint8_t* Src, unsigned Dest) {
+    if (L.Vec) {
+      __uint128_t V = 0;
+      memcpy(&V, Src, N);
+      DarwinCtx::Fprs(Uc)[Dest] = V;
+      return;
+    }
+    uint64_t V = 0;
+    memcpy(&V, Src, N);
+    if (L.Sign) {
+      const unsigned Bits = 8 * N;
+      const int64_t S = static_cast<int64_t>(V << (64 - Bits)) >> (64 - Bits);
+      V = L.Sign == 32 ? static_cast<uint32_t>(S) : static_cast<uint64_t>(S);
+    }
+    if (Dest != 31) X[Dest] = V;
+  };
+  Put(Bytes, L.Rt);
+  if (L.IsPair()) Put(Bytes + N, L.Rt2);
+  if (D.Wb == 31) DarwinCtx::SetSp(Uc, D.WbValue);
+  else if (D.Wb >= 0) X[D.Wb] = D.WbValue;
+  DarwinCtx::SetPc(Uc, DarwinCtx::GetPc(Uc) + 4);
+}
 } // namespace
 
 bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, uint64_t Addr, bool Write, bool InJit) {
+  // A load of translated code reads the guarded page's file instead of opening the page: no protection change at all.
+  GuardedLoad D {};
+  const bool Decoded = InJit && !Write && DecodeGuardedLoad(Uc, reinterpret_cast<uint64_t>(FEXCore::G2H(Addr)), D);
+  uint8_t Bytes[32];
+  const uint64_t LoadAddr = Decoded ? FEXCore::H2G(reinterpret_cast<void*>(D.Addr)) : 0;
+  if (Decoded && fexdarwin_lkd_guard_read(LoadAddr, Bytes, D.L.Bytes()) == 1) {
+    GuardedLoadPatch::NoteFileRead(DarwinCtx::GetPc(Uc), D.Insn, LoadAddr);
+    ApplyGuardedLoad(Uc, D, Bytes);
+    return true;
+  }
   uint64_t Page = 0;
   const int R = fexdarwin_lkd_guard_fault(Addr, Write, &Page);
   if (R == 0) {
@@ -321,9 +407,16 @@ bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, 
       T->RaceAddr = 0;
     }
   }
-  if (R != 1 && R != 2) return false;
-  if (R == 2 || Write || !InJit) {
+  if (R != 1) return false;
+  if (Write || !InJit) {
     return true; // retry the host instruction
+  }
+  // The page is open now: run the load here and close it again, or step its guest instruction.
+  if (Decoded) {
+    memcpy(Bytes, reinterpret_cast<const void*>(D.Addr), D.L.Bytes());
+    fexdarwin_lkd_guard_close(Page);
+    ApplyGuardedLoad(Uc, D, Bytes);
+    return true;
   }
   return BeginGuardStep(T, Uc, Page);
 }
@@ -434,6 +527,12 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
   const uint64_t Addr = reinterpret_cast<uint64_t>(Info->si_addr);
 
   if (Sig == SIGSEGV || Sig == SIGBUS) {
+    // 0. A stub of a load that reads a guarded page through its file (GuardedLoadPatch.h): the original load at its end
+    //    is handled from its own site, any other fault there puts the load back.
+    if (GuardedLoadPatch::OnFault(Uc)) {
+      return true;
+    }
+
     // 1. The JIT output buffer has a guard page. Running into it means the block needs a bigger buffer: restart the
     //    compilation through the saved jump buffer (same as the Linux frontend).
     if (Th->JITGuardPage && Addr >= Th->JITGuardPage && Addr < Th->JITGuardPage + FEXCore::Utils::FEX_HOST_PAGE_SIZE) {

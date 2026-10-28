@@ -97,6 +97,8 @@ int lkd_mm_check_range(uint64_t gva, size_t len, int need_write);
 int lkd_mm_code_write_fault(uint64_t gva);
 /* Guarded host pages (lkd_mm_watch.h has the contract). */
 int lkd_mm_guard_fault(uint64_t gva, int write, uint64_t *page_out);
+int lkd_mm_guard_read(uint64_t gva, void *dst, unsigned len);
+int lkd_mm_guard_aliases(uint64_t gva, const void *alias[4], const uint64_t **gen, uint64_t *gen_now);
 void lkd_mm_guard_close(uint64_t page);
 void lkd_mm_guard_close_all(void);
 

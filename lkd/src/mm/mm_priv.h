@@ -57,6 +57,8 @@ struct mm_backing {
     uint64_t obj_size;           /* MB_SHANON/MB_SYSV: size of the shared object (host pages) */
     int shm_slot;                /* MB_SYSV: slot in the SysV table */
     int shm_id;                  /* MB_SYSV: shmid */
+    _Atomic(uint8_t *) alias;    /* MB_FILE: read-only shared mapping of the whole file for guarded reads (watch.c) */
+    _Atomic uint64_t alias_len;  /* its length, 0 until it is usable */
 };
 
 /* VMA flags (vflags). */
@@ -202,6 +204,9 @@ struct lkd_mm {
     _Atomic int refs;
     pthread_mutex_t lock;        /* mmap_lock, LKD_RANK_MM */
     mm_rwlock vlock;             /* VMA leaf lock, LKD_RANK_VMA: tree readers vs writers */
+    /* Changes when a mapping or a protection may have changed (mm_wlock, mm_wunlock, mm_host_refresh): what the engine
+     * caches about guarded pages (lkd_mm_guard_aliases) is valid while it holds the value read with the cache. */
+    _Atomic uint64_t guard_gen;
     vtree vt;
     uint64_t identity;
     uint64_t start_brk, brk;     /* guest; 0 = unknown (brk then fails like an absent heap) */

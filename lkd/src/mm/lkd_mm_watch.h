@@ -34,11 +34,18 @@ int lkd_mm_code_watched(uint64_t gva);
  *   -1  the guest's protection for that 4 KiB forbids the access: a real guest page fault;
  *   1   it allows the access and the host page is open: redo the access. A load leaves the page open until
  *       lkd_mm_guard_close(page) or lkd_mm_guard_close_all() (this thread's loads; also run at the end of every
- *       system call); a store leaves it open until its host protection is set again (watch.c);
- *   2   same for a load of a page this thread reads all the time: it stays open for a few milliseconds, until this
- *       thread's next guard fault, system call end or compilation after that; nothing to close.
+ *       system call); a store leaves it open until its host protection is set again (watch.c).
  * Callable from a SIGSEGV/SIGBUS handler of a guest thread. page_out receives the host page (guest address). */
 int lkd_mm_guard_fault(uint64_t gva, int write, uint64_t *page_out);
+/* A load of len bytes at gva inside one 4 KiB guest page, from a guarded host page, without opening it: 1 copied to dst
+ * (a shared file piece, read through a read-only mapping of its file), -1 the guest forbids it, 0 not guarded or not
+ * readable that way (open the page with lkd_mm_guard_fault). Callable from a SIGSEGV/SIGBUS handler of a guest thread. */
+int lkd_mm_guard_read(uint64_t gva, void *dst, unsigned len);
+/* Where a load can read each 4 KiB guest page of the guarded host page of gva without a fault: 1 with alias[i] the
+ * read-only view of page i's file (the source of lkd_mm_guard_read), NULL for a page the guest forbids or that has no
+ * shared file piece; 0 when the page is not guarded. The views stay valid while *gen holds gen_now: *gen changes
+ * whenever a mapping or a protection of the address space may change. Callable from a SIGSEGV/SIGBUS handler. */
+int lkd_mm_guard_aliases(uint64_t gva, const void *alias[4], const uint64_t **gen, uint64_t *gen_now);
 void lkd_mm_guard_close(uint64_t page);
 void lkd_mm_guard_close_all(void);
 

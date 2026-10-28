@@ -27,7 +27,8 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <sys/mman.h>
-#include <time.h>
+#include <sys/stat.h>
+#include <string.h>
 
 #include "mm_priv.h"
 #include "lkd_mm_watch.h"
@@ -456,45 +457,82 @@ static void guard_note_open(uint64_t p)
     guard_open[guard_open_n++] = p;
 }
 
-/* A page that this thread reads again and again (the PE header of a module, next to its encrypted first pages) costs a
- * fault and a single-stepped instruction per read. After GUARD_HOT_READS reads in GUARD_HOT_NS it stays open for
- * GUARD_BURST_NS: its PROT_NONE neighbours are readable meanwhile, which the closing timer (any later guard fault, end
- * of a system call or of a compilation of this thread) bounds. */
-#define GUARD_HOT_READS 6
-#define GUARD_HOT_NS 20000000ull
-#define GUARD_BURST_NS 4000000ull
-#define GUARD_BURST_MAX 8
-#define GUARD_HIST 8
-static _Thread_local struct { uint64_t page, t0; unsigned n; } guard_hist[GUARD_HIST];
-static _Thread_local unsigned guard_hist_next;
-static _Thread_local struct { uint64_t page, expiry; } guard_burst[GUARD_BURST_MAX];
-static _Thread_local int guard_burst_n;
-
-static uint64_t guard_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
-
-static void guard_expire(uint64_t now)
+/* The whole file of a guarded page's pieces, mapped read-only and shared: it shows what the guest's shared pieces hold
+ * (THEIA's decryption writes through them to the file) without opening the guarded host page. */
+static const uint8_t *guard_alias(struct mm_backing *b, uint64_t *len)
 {
-    for (int i = 0; i < guard_burst_n;) {
-        if (guard_burst[i].expiry > now) { i++; continue; }
-        uint64_t p = guard_burst[i].page;
-        guard_burst[i] = guard_burst[--guard_burst_n];
-        lkd_mm_guard_close(p);
+    uint8_t *a = atomic_load_explicit(&b->alias, memory_order_acquire);
+    if (!a) {
+        struct stat st;
+        if (fstat(b->host_fd, &st) != 0 || st.st_size <= 0) return NULL;
+        void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, b->host_fd, 0);
+        if (m == MAP_FAILED) return NULL;
+        uint8_t *none = NULL;
+        if (atomic_compare_exchange_strong(&b->alias, &none, (uint8_t *)m)) {
+            atomic_store_explicit(&b->alias_len, (uint64_t)st.st_size, memory_order_release);
+            a = m;
+        } else {
+            munmap(m, (size_t)st.st_size);
+            a = none;
+        }
     }
+    *len = atomic_load_explicit(&b->alias_len, memory_order_acquire);
+    return *len ? a : NULL;
 }
 
-static int guard_hot(uint64_t p)
+/* The view of [gva, gva + len) in its shared file piece (guard_alias), NULL when the guest forbids it (*forbidden set)
+ * or when it is not readable that way. vlock held. */
+static const uint8_t *guard_view(lkd_mm *mm, uint64_t gva, uint64_t len, int *forbidden)
 {
-    uint64_t now = guard_now();
-    int h = -1;
-    for (int i = 0; i < GUARD_HIST; i++) if (guard_hist[i].page == p) { h = i; break; }
-    if (h < 0) { h = (int)(guard_hist_next++ % GUARD_HIST); guard_hist[h].page = p; guard_hist[h].t0 = now; guard_hist[h].n = 0; }
-    if (now - guard_hist[h].t0 >= GUARD_HOT_NS) { guard_hist[h].t0 = now; guard_hist[h].n = 0; }
-    if (++guard_hist[h].n < GUARD_HOT_READS) return 0;
-    for (int i = 0; i < guard_burst_n; i++) if (guard_burst[i].page == p) { guard_burst[i].expiry = now + GUARD_BURST_NS; return 1; }
-    if (guard_burst_n == GUARD_BURST_MAX) return 0;
-    guard_burst[guard_burst_n].page = p;
-    guard_burst[guard_burst_n++].expiry = now + GUARD_BURST_NS;
-    return 1;
+    mm_vma *v = vt_find(&mm->vt, gva);
+    if (!v || !(v->prot & (LX_PROT_READ | LX_PROT_WRITE | LX_PROT_EXEC))) {
+        if (forbidden) *forbidden = 1;
+        return NULL;
+    }
+    if (!(v->vflags & VF_SHARED) || !v->bk || v->bk->kind != MB_FILE || v->bk->host_fd < 0) return NULL;
+    uint64_t alen = 0;
+    const uint8_t *a = guard_alias(v->bk, &alen);
+    const uint64_t off = host_off_of(v, gva);
+    return a && off + len <= alen ? a + off : NULL;
+}
+
+int lkd_mm_guard_read(uint64_t gva, void *dst, unsigned len)
+{
+    lkd_mm *mm = cur_mm();
+    if (!mm || !len || !in_window(gva) || ((gva ^ (gva + len - 1)) & ~0xfffull)) return 0;
+    int r = 0;
+    mrw_rdlock(&mm->vlock);
+    if (mm_page_guarded(mm, HP_DOWN(gva))) {
+        int forbidden = 0;
+        const uint8_t *view = guard_view(mm, gva, len, &forbidden);
+        if (forbidden) {
+            r = -1;
+        } else if (view) {
+            memcpy(dst, view, len);
+            r = 1;
+        }
+    }
+    mrw_rdunlock(&mm->vlock);
+    return r;
+}
+
+int lkd_mm_guard_aliases(uint64_t gva, const void *alias[4], const uint64_t **gen, uint64_t *gen_now)
+{
+    lkd_mm *mm = cur_mm();
+    if (!mm || !in_window(gva)) return 0;
+    const uint64_t p = HP_DOWN(gva);
+    const unsigned n = mm_hps / 4096 < 4 ? (unsigned)(mm_hps / 4096) : 4;
+    *gen = (const uint64_t *)&mm->guard_gen;
+    /* before the VMAs: a change made after this load moves the generation past it */
+    *gen_now = atomic_load_explicit(&mm->guard_gen, memory_order_acquire);
+    int r = 0;
+    mrw_rdlock(&mm->vlock);
+    if (mm_page_guarded(mm, p)) {
+        r = 1;
+        for (unsigned i = 0; i < 4; i++) alias[i] = i < n ? guard_view(mm, p + (uint64_t)i * 4096, 4096, NULL) : NULL;
+    }
+    mrw_rdunlock(&mm->vlock);
+    return r;
 }
 
 int lkd_mm_guard_fault(uint64_t gva, int write, uint64_t *page_out)
@@ -502,7 +540,6 @@ int lkd_mm_guard_fault(uint64_t gva, int write, uint64_t *page_out)
     lkd_mm *mm = cur_mm();
     if (!mm || !in_window(gva)) return 0;
     uint64_t p = HP_DOWN(gva);
-    if (guard_burst_n) guard_expire(guard_now());
     mrw_rdlock(&mm->vlock);
     int guarded = mm_page_guarded(mm, p);
     mm_vma *v = guarded ? vt_find(&mm->vt, gva) : NULL;
@@ -527,7 +564,6 @@ int lkd_mm_guard_fault(uint64_t gva, int write, uint64_t *page_out)
     mm_watch_unlock();
     if (page_out) *page_out = p;
     if (write) return 1;
-    if (guard_hot(p)) return 2; /* open for a while: nothing to close after the access */
     guard_note_open(p);
     return 1;
 }
@@ -546,7 +582,6 @@ void lkd_mm_guard_close(uint64_t page)
 void lkd_mm_guard_close_all(void)
 {
     while (guard_open_n > 0) lkd_mm_guard_close(guard_open[--guard_open_n]);
-    if (guard_burst_n) guard_expire(guard_now());
 }
 
 /* LKD copies of [gva, gva+len): open the guarded pages for the duration of the syscall. */

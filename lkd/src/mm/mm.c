@@ -17,8 +17,16 @@ static uint64_t new_identity(void) { return ((uint64_t)getpid() << 24) | (atomic
 
 void mm_lock(lkd_mm *mm) { pthread_mutex_lock(&mm->lock); }
 void mm_unlock(lkd_mm *mm) { pthread_mutex_unlock(&mm->lock); }
-void mm_wlock(lkd_mm *mm) { mrw_wrlock(&mm->vlock); }
-void mm_wunlock(lkd_mm *mm) { mrw_wrunlock(&mm->vlock); }
+void mm_wlock(lkd_mm *mm)
+{
+    mrw_wrlock(&mm->vlock);
+    atomic_fetch_add_explicit(&mm->guard_gen, 1, memory_order_release);
+}
+void mm_wunlock(lkd_mm *mm)
+{
+    atomic_fetch_add_explicit(&mm->guard_gen, 1, memory_order_release);
+    mrw_wrunlock(&mm->vlock);
+}
 lkd_mm *mm_of(lkd_task *t) { return t ? t->mm : NULL; }
 
 int mm_capable(lkd_task *t, int cap)
@@ -81,6 +89,8 @@ void mb_put(struct mm_backing *b)
 {
     if (!b || atomic_fetch_sub(&b->refs, 1) != 1) return;
     if (b->file) lkd_fdobj_put(b->file);
+    uint8_t *alias = atomic_load(&b->alias);
+    if (alias) munmap(alias, atomic_load(&b->alias_len));
     free(b->name);
     free(b);
 }
@@ -404,6 +414,8 @@ int mm_host_refresh(lkd_mm *mm, uint64_t start, uint64_t end)
         int x = mm_host_protect(r.s, r.e - r.s, r.prot);
         if (x && !r.err) r.err = x;
     }
+    /* mprotect changes v->prot without the VMA write lock: this is where the change becomes visible */
+    atomic_fetch_add_explicit(&mm->guard_gen, 1, memory_order_release);
     mm_watch_unlock();
     return r.err;
 }
