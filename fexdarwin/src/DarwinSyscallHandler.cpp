@@ -199,10 +199,16 @@ extern "C" int fexdarwin_lkd_vma_at(uint64_t gva, uint64_t* start, uint64_t* end
 extern "C" int fexdarwin_lkd_watch_code(uint64_t gva, uint64_t len);
 extern "C" void fexdarwin_lkd_guard_close_all(void);
 
+// Host faults on guest memory from now to PostCompile are the decoder's (DarwinSignalDelegator::HandleFault, step 7).
+void DarwinSyscallHandler::PreCompile() {
+  if (CurrentGuestThread) CurrentGuestThread->Compiling = true;
+}
+
 // The decoder has read the guest's code: the guarded host pages it had to open go back to PROT_NONE. Not during a guard
 // step: the stepped instruction's block is compiled after BeginGuardStep opened its page, and CancelGuardStep closes
 // them all at the trap.
 void DarwinSyscallHandler::PostCompile() {
+  if (CurrentGuestThread) CurrentGuestThread->Compiling = false;
   if (CurrentGuestThread && CurrentGuestThread->GuardStepping) return;
   fexdarwin_lkd_guard_close_all();
 }

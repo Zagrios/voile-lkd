@@ -21,6 +21,7 @@ public:
     return std::nullopt;
   }
   void SleepThread(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) override;
+  void PreCompile() override;
   void PostCompile() override;
 
   // Statistics for the benchmark and the README.

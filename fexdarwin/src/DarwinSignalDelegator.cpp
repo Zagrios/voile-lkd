@@ -584,7 +584,24 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
   //    compilation, then retry the host instruction.
   if ((Sig == SIGSEGV || Sig == SIGBUS) && LkdEnabled() && !G->CTX->IsAddressInCodeBuffer(Th, PC)) {
     const uint32_t Esr = DarwinCtx::GetEsr(Uc);
-    if (ResolveGuardedFault(T, Uc, FEXCore::H2G(Info->si_addr), (Esr >> 6) & 1, false)) return true;
+    const uint64_t GuestAddr = FEXCore::H2G(Info->si_addr);
+    const bool Write = (Esr >> 6) & 1;
+    if (ResolveGuardedFault(T, Uc, GuestAddr, Write, false)) return true;
+    // 7. The decoder reading code whose page lost its execute permission after the decoder checked it: LKD changes
+    //    the protection first and drops the translations after, so a compilation on another thread can read the page
+    //    in between. THEIA does this to its code pages (THE FINALS' "Foreground Work" and "Background Work" threads,
+    //    once the main menu is up). The instruction becomes a fetch fault, which the guest handles; the read itself
+    //    returns zeros, which the rollback discards.
+    if (T->Compiling && !Write) {
+      const int GProt = GuestProtAt(GuestAddr);
+      GuardedLoad D {};
+      if ((GProt < 0 || !(GProt & Linux::PROT_EXEC_)) && DecodeGuardedLoad(Uc, reinterpret_cast<uint64_t>(Info->si_addr), D)) {
+        G->CTX->StopDecodeAtNonExecutable(Th);
+        const uint8_t Zero[32] {};
+        ApplyGuardedLoad(Uc, D, Zero);
+        return true;
+      }
+    }
   }
   return false;
 }

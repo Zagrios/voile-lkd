@@ -51,6 +51,7 @@ struct GuestThread {
   uint64_t GuardPages[4] {};
   int GuardN {};
   bool GuardStepping {};
+  bool Compiling {}; // between PreCompile and PostCompile: host C++ faults on guest memory are the decoder's
   // Guest 4 KiB page of the faults retried because the guest map allows the access while the host page does not yet
   // (a protection change in flight on another thread): DarwinSignalDelegator::ResolveGuardedFault.
   uint64_t RaceAddr {};
