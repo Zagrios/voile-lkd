@@ -67,19 +67,23 @@ constexpr uint32_t DmbIshld = 0xD50339BFu;
 
 // A load FEX emits, decoded: what DarwinSignalDelegator runs in a fault handler and Emit patches into a stub.
 struct Load {
-  enum Kind { UImm, Unscaled, PreIndex, PostIndex, RegOff, Pair, PairPreIndex, PairPostIndex, Acquire, AcquireUnscaled } Form;
+  enum Kind { UImm, Unscaled, PreIndex, PostIndex, RegOff, Pair, PairPreIndex, PairPostIndex, Acquire, AcquireUnscaled, Single } Form;
   unsigned Size; // log2 of the bytes of one element
   bool Vec;
   int Sign; // 0 zero-extend, 32 or 64: sign-extend into a W or X register
   unsigned Rt, Rt2, Rn, Rm;
   int64_t Offset;         // immediate byte offset (also the writeback of the pre- and post-indexed forms)
   unsigned Option, Shift; // RegOff: extend of Rm and its left shift
+  // Single (LD1 one lane, LD1R): the vector is 128 bits wide (Q) or 64; LD1R fills every lane, LD1 only Lane.
+  bool Q, Replicate;
+  unsigned Lane;
   bool IsPair() const { return Form == Pair || Form == PairPreIndex || Form == PairPostIndex; }
   unsigned Bytes() const { return (1u << Size) * (IsPair() ? 2 : 1); }
 };
 
-// LDR/LDUR/LDAPUR/LDAR/LDAPR, register offset, pre- and post-index, LDP/LDNP; integer and FP/SIMD registers. False for
-// anything else, stores and prefetches included, and for the unpredictable writebacks into a loaded register.
+// LDR/LDUR/LDAPUR/LDAR/LDAPR, register offset, pre- and post-index, LDP/LDNP; integer and FP/SIMD registers; LD1 of one
+// lane and LD1R without writeback (FEX's MOVDDUP, VBROADCASTSS, MOVHPS, PINSR* from memory). False for anything else,
+// stores and prefetches included, and for the unpredictable writebacks into a loaded register.
 inline bool DecodeLoad(uint32_t I, Load& L) {
   const auto Imm9 = [&] { return static_cast<int64_t>(static_cast<int32_t>(I << 11) >> 23); };
   L = {};
@@ -141,6 +145,27 @@ inline bool DecodeLoad(uint32_t I, Load& L) {
     L.Form = PairClass == 0x28C00000 ? Load::PairPostIndex : PairClass == 0x29C00000 ? Load::PairPreIndex : Load::Pair;
     if (L.Form != Load::Pair && !L.Vec && L.Rn != 31 && (L.Rn == L.Rt || L.Rn == L.Rt2)) return false;
     return true;
+  }
+  if ((I & 0xBFFF0000) == 0x0D400000) {
+    // LD1 (single structure) and LD1R, no offset: 0 Q 0011010 1 0 00000 opcode S size Rn Rt
+    const unsigned Op = (I >> 13) & 7, S = (I >> 12) & 1, Sz = (I >> 10) & 3, Q = (I >> 30) & 1;
+    L.Form = Load::Single;
+    L.Vec = true;
+    L.Q = Q;
+    if (Op == 6 && !S) {
+      L.Replicate = true;
+      L.Size = Sz;
+      return true;
+    }
+    switch (Op) {
+    case 0: L.Size = 0; L.Lane = (Q << 3) | (S << 2) | Sz; return true;
+    case 2: if (Sz & 1) return false; L.Size = 1; L.Lane = (Q << 2) | (S << 1) | (Sz >> 1); return true;
+    case 4:
+      if (Sz == 0) { L.Size = 2; L.Lane = (Q << 1) | S; return true; }
+      if (Sz == 1 && !S) { L.Size = 3; L.Lane = Q; return true; }
+      return false;
+    default: return false;
+    }
   }
   if ((I & 0x3FFFFC00) == 0x08DFFC00 || (I & 0x3FFFFC00) == 0x38BFC000) {
     L.Form = Load::Acquire; // LDAR, LDAPR
@@ -218,7 +243,7 @@ inline bool Emit(uint32_t Insn, uint64_t Site, uint64_t Stub, uint32_t* Out, Lay
     AddOffset(Ld.Offset);
     Alias = (Insn & ~0x003F83E0u) | (A << 5);
     break;
-  default: // Acquire
+  default: // Acquire, Single
     AddOffset(0);
     Alias = (Insn & ~0x3E0u) | (A << 5);
     break;

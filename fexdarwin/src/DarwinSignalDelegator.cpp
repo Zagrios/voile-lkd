@@ -360,8 +360,21 @@ void ApplyGuardedLoad(ucontext_t* Uc, const GuardedLoad& D, const uint8_t* Bytes
     }
     if (Dest != 31) X[Dest] = V;
   };
-  Put(Bytes, L.Rt);
-  if (L.IsPair()) Put(Bytes + N, L.Rt2);
+  if (L.Form == GuardedLoadStub::Load::Single) {
+    // LD1R: the element in every lane of the 64 or 128 bits, the rest zero; LD1: the element in its lane, the rest kept.
+    __uint128_t V = DarwinCtx::Fprs(Uc)[L.Rt];
+    uint8_t* B = reinterpret_cast<uint8_t*>(&V);
+    if (L.Replicate) {
+      V = 0;
+      for (unsigned Off = 0; Off < (L.Q ? 16u : 8u); Off += N) memcpy(B + Off, Bytes, N);
+    } else {
+      memcpy(B + L.Lane * N, Bytes, N);
+    }
+    DarwinCtx::Fprs(Uc)[L.Rt] = V;
+  } else {
+    Put(Bytes, L.Rt);
+    if (L.IsPair()) Put(Bytes + N, L.Rt2);
+  }
   if (D.Wb == 31) DarwinCtx::SetSp(Uc, D.WbValue);
   else if (D.Wb >= 0) X[D.Wb] = D.WbValue;
   DarwinCtx::SetPc(Uc, DarwinCtx::GetPc(Uc) + 4);
