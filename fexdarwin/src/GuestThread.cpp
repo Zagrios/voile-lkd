@@ -49,23 +49,23 @@ GuestThread* CreateGuestThread(GuestThread* Parent) {
   T->State->CallRetStackBase = Base;
   Frame->State.callret_sp = reinterpret_cast<uint64_t>(Base) + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
 
-  // GDT: one flat 64-bit code segment, as the Linux frontend sets up.
+  // GDT: the flat 64-bit and 32-bit code segments of Linux. A far transfer to GUEST_USER32_CS runs 32-bit code, as
+  // Windows code does with its own 0x23, which is Linux's too.
   Frame->State.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_GDT] = &T->Gdt[0];
   Frame->State.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_LDT] = &T->Gdt[0];
   if (Parent) {
     memcpy(T->Gdt, Parent->Gdt, sizeof(T->Gdt));
     T->SigMask = Parent->SigMask;
   } else {
-    // Linux x86-64 user selectors: CS = GDT entry 6 with RPL 3 (0x33), SS = entry 5 with RPL 3 (0x2b)
-    // (arch/x86/include/asm/segment.h). FEX selects the GDT entry with Selector >> 3, so the RPL bits are safe.
-    Frame->State.cs_idx = (CPUState::DEFAULT_USER_CS << 3) | 3;
-    Frame->State.ss_idx = (5 << 3) | 3;
-    auto* Seg = CPUState::GetSegmentFromIndex(Frame->State, Frame->State.cs_idx);
-    CPUState::SetGDTBase(Seg, 0);
-    CPUState::SetGDTLimit(Seg, 0xF'FFFFU);
-    Frame->State.cs_cached = CPUState::CalculateGDTBase(*Seg);
-    Seg->L = 1; // long mode
-    Seg->D = 0;
+    // FEX selects the GDT entry with Selector >> 3, so the RPL bits are safe.
+    for (uint16_t Selector : {GUEST_USER32_CS, GUEST_USER_CS}) {
+      auto* Seg = CPUState::GetSegmentFromIndex(Frame->State, Selector);
+      CPUState::SetGDTBase(Seg, 0);
+      CPUState::SetGDTLimit(Seg, 0xF'FFFFU);
+      Seg->L = Selector == GUEST_USER_CS; // long mode
+      Seg->D = Selector == GUEST_USER32_CS;
+    }
+    LoadGuestCodeSegments(Frame->State, GUEST_USER_CS);
   }
 
   {

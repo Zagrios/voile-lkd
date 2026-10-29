@@ -109,6 +109,22 @@ inline uint32_t GuestEflags(FEXCore::Core::InternalThreadState* Th) {
   return (G->CTX->ReconstructCompactedEFLAGS(Th, false, nullptr, 0) & Defined) | 0x2;
 }
 
+// Linux x86-64 user selectors (arch/x86/include/asm/segment.h): 32-bit code, data and 64-bit code are GDT entries 4, 5
+// and 6, with RPL 3.
+constexpr uint16_t GUEST_USER32_CS = (4 << 3) | 3, GUEST_USER_DS = (5 << 3) | 3, GUEST_USER_CS = (6 << 3) | 3;
+
+// Loads the guest's CS and SS on the way back to user mode. FEXCore decodes the code that follows in the mode of CS's
+// descriptor: 32-bit code under GUEST_USER32_CS, 64-bit code under any other selector, as Windows forces its user code
+// segment into a context whose CS names none (Wine copies the CONTEXT's SegCs into the signal frame). SS is always
+// GUEST_USER_DS, the only stack segment ring 3 can load.
+inline void LoadGuestCodeSegments(FEXCore::Core::CPUState& St, uint16_t Cs) {
+  using FEXCore::Core::CPUState;
+  St.cs_idx = (Cs | 3) == GUEST_USER32_CS ? GUEST_USER32_CS : GUEST_USER_CS;
+  St.ss_idx = GUEST_USER_DS;
+  St.cs_cached = CPUState::CalculateGDTBase(*CPUState::GetSegmentFromIndex(St, St.cs_idx));
+  St.ss_cached = 0;
+}
+
 // ---- thread management (GuestThread.cpp) ----
 // Creates the FEXCore thread state for a new guest thread. The caller fills StartRip/StartRsp/... then calls RunGuestThread
 // on the host thread that will execute it.

@@ -534,6 +534,8 @@ int FrameBuild(lkd_task* t, const lkd_delivery* D) {
   St.gregs[X::REG_RDI] = static_cast<uint64_t>(D->signo);
   St.gregs[X::REG_RSI] = FrameAddr + offsetof(Linux::RtSigFrame, info);
   St.gregs[X::REG_RDX] = FrameAddr + offsetof(Linux::RtSigFrame, uc);
+  // The handler runs in 64-bit mode, even when the signal interrupted 32-bit code (setup_rt_frame).
+  LoadGuestCodeSegments(St, GUEST_USER_CS);
   St.flags[X::RFLAG_DF_RAW_LOC] = 1; // DF clear (FEX stores DF as +1/-1)
   St.flags[X::RFLAG_RF_LOC] = 0;
   St.flags[X::RFLAG_TF_RAW_LOC] = 0;
@@ -558,6 +560,8 @@ int FrameRestore(lkd_task* t, uint64_t* SavedMask, struct lx_stack_t* SavedStack
   St.gregs[X::REG_RDI] = Sc.rdi; St.gregs[X::REG_RSI] = Sc.rsi; St.gregs[X::REG_RBP] = Sc.rbp; St.gregs[X::REG_RBX] = Sc.rbx;
   St.gregs[X::REG_RDX] = Sc.rdx; St.gregs[X::REG_RAX] = Sc.rax; St.gregs[X::REG_RCX] = Sc.rcx; St.gregs[X::REG_RSP] = Sc.rsp;
   St.rip = Sc.rip;
+  // CS comes from the frame too, so a handler can resume 32-bit code (restore_sigcontext).
+  LoadGuestCodeSegments(St, Sc.cs);
   G->CTX->SetFlagsFromCompactedEFLAGS(Th, static_cast<uint32_t>(Sc.eflags));
   if (Sc.fpstate) RestoreGuestFpState(Th, &Xs);
   *SavedMask = Fr.uc.uc_sigmask;
