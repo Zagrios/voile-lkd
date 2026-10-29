@@ -220,7 +220,7 @@ static inline void mrw_wrunlock(mm_rwlock *l)
     (void)os_sync_wake_by_address_all(&l->w, sizeof l->w, OS_SYNC_WAKE_BY_ADDRESS_NONE);
 }
 
-#define MM_GUARD_GEN_SLOTS 1024u
+#define MM_GUARD_GEN_SLOTS 65536u /* hashed by host page: few collisions between the pages a game protects and its hot guarded ones */
 
 struct lkd_mm {
     _Atomic int refs;
@@ -284,6 +284,8 @@ void mm_wunlock_same(lkd_mm *mm);
 /* Guarded page generations (lkd_mm.guard_gen): the pages of [s, e), every page, the counter of host page hp. */
 void mm_guard_gen_bump(lkd_mm *mm, uint64_t s, uint64_t e);
 void mm_guard_gen_bump_all(lkd_mm *mm);
+void mm_wlock_range(lkd_mm *mm, uint64_t s, uint64_t e);   /* mm_wlock for a change confined to [s, e) */
+void mm_wunlock_range(lkd_mm *mm, uint64_t s, uint64_t e);
 _Atomic uint64_t *mm_guard_gen_of(lkd_mm *mm, uint64_t hp);
 void mm_lock(lkd_mm *mm);        /* mmap_lock */
 void mm_unlock(lkd_mm *mm);

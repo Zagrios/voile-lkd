@@ -42,6 +42,18 @@ void mm_wunlock(lkd_mm *mm)
     mm_guard_gen_bump_all(mm);
     mrw_wrunlock(&mm->vlock);
 }
+/* The same for a change confined to [s, e): only the generations of its host pages move, so the load stubs of other
+ * guarded pages stay valid (an mmap or munmap anywhere used to send every stub of the process back to the fault). */
+void mm_wlock_range(lkd_mm *mm, uint64_t s, uint64_t e)
+{
+    mrw_wrlock(&mm->vlock);
+    mm_guard_gen_bump(mm, s, e);
+}
+void mm_wunlock_range(lkd_mm *mm, uint64_t s, uint64_t e)
+{
+    mm_guard_gen_bump(mm, s, e);
+    mrw_wrunlock(&mm->vlock);
+}
 void mm_wlock_same(lkd_mm *mm) { mrw_wrlock(&mm->vlock); }
 void mm_wunlock_same(lkd_mm *mm) { mrw_wrunlock(&mm->vlock); }
 lkd_mm *mm_of(lkd_task *t) { return t ? t->mm : NULL; }
@@ -549,13 +561,13 @@ int mm_unmap_locked(lkd_mm *mm, uint64_t start, uint64_t end, struct mm_inval *i
     if (!r) r = mm_split(mm, end);
     if (r) return r;
     mm_vma *list = NULL;
-    mm_wlock(mm);
+    mm_wlock_range(mm, start, end);
     while ((v = vt_first_end_after(&mm->vt, start)) && v->start < end) {
         vt_remove(&mm->vt, v);
         v->l = list;
         list = v;
     }
-    mm_wunlock(mm);
+    mm_wunlock_range(mm, start, end);
     uint64_t pg_lo = HP_DOWN(start), pg_hi = HP_DOWN(end - 1);
     int was_lo = 0, was_hi = 0;
     while (list) {
@@ -797,9 +809,9 @@ int64_t mm_map_locked(lkd_mm *mm, struct mm_mapreq *rq, struct mm_inval *iv)
             return r;
         }
     }
-    mm_wlock(mm);
+    mm_wlock_range(mm, nv->start, nv->end);
     vt_insert(&mm->vt, nv);
-    mm_wunlock(mm);
+    mm_wunlock_range(mm, nv->start, nv->end);
     mm->map_gen++;
     if (hostshared) mm_watch_alias_sync(mm, s, e);   /* another view of these bytes holds translated code */
     if (nv->bk && nv->bk->kind == MB_SYSV) mm_shm_attach_vma(nv);

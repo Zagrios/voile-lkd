@@ -70,9 +70,9 @@ static int expand(lkd_mm *mm, mm_vma *v, uint64_t delta, struct mm_inval *iv)
             void *p = mmap(mm_h(hs), HP_UP(e) - hs, mm_host_prot_of(v->prot), MAP_SHARED | MAP_FIXED, v->bk->host_fd, (off_t)off);
             if (p == MAP_FAILED) { int64_t r = LKD_HOST_ERR(); mm_host_reset(hs, HP_UP(e) - hs); return (int)r; }
         }
-        mm_wlock(mm);
+        mm_wlock_range(mm, v->start, e);
         vt_set_end(&mm->vt, v, e);
-        mm_wunlock(mm);
+        mm_wunlock_range(mm, v->start, e);
         if (v->vflags & VF_LOCKED) mm->locked_bytes += delta;
         mm_host_refresh(mm, s, e);
         return 0;
@@ -179,9 +179,9 @@ static int64_t move_vma(lkd_task *t, lkd_mm *mm, mm_vma *v, uint64_t addr, uint6
         mm_vma_free(nv);
         return r;
     }
-    mm_wlock(mm);
+    mm_wlock_range(mm, nv->start, nv->end);
     vt_insert(&mm->vt, nv);
-    mm_wunlock(mm);
+    mm_wunlock_range(mm, nv->start, nv->end);
     if (nv->bk && nv->bk->kind == MB_SYSV) mm_shm_attach_vma(nv);
     if (nv->vflags & VF_LOCKED) {
         mm->locked_bytes += new_len;
