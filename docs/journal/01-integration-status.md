@@ -695,7 +695,7 @@ Verification (2026-10-29). THE FINALS with DXMT and D3DMetal through idle waves,
 
 ## THE FINALS: where a match spends its CPU, and what the translator changes bought (2026-10-29)
 
-Context. THE FINALS (Direct3D 12 through D3DMetal) in matches on the Linux engine, an M5, measured with the new sampler (`7cb2ed4`, `FEXDARWIN_SAMPLE`): freezes and 30 to 80 fps.
+Context. THE FINALS (Direct3D 12 through D3DMetal) in matches on the Linux engine, an M5, measured with a guest-PC sampler that suspends threads without a signal (`7cb2ed4`, reverted with the other measurement code: nothing of it stays in the engine): freezes and 30 to 80 fps.
 
 1. MEASURED: the game thread sets the frame rate, about 0.9 of a core in a match: about half in translated game code, 13 % stalled on the first instruction of blocks (code scattered over the code buffer), 5 % in host signal handling, 10 % blocked. Wine and LKD are about 8 % of it, Neptune's guest DLLs about 4 % of the translated time. The render server (Neptune and D3DMetal, x86_64 under Rosetta) takes 1 to 2.6 cores, the GPU 46 to 96 %.
 2. MEASURED on the M5: an x86-ordered store (`stlur`) costs about 2.3 plain ones; an ordered load (`ldapr`) as much as a plain one on a cache hit, 1.5 times on misses.
