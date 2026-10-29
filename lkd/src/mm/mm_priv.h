@@ -220,13 +220,19 @@ static inline void mrw_wrunlock(mm_rwlock *l)
     (void)os_sync_wake_by_address_all(&l->w, sizeof l->w, OS_SYNC_WAKE_BY_ADDRESS_NONE);
 }
 
+#define MM_GUARD_GEN_SLOTS 1024u
+
 struct lkd_mm {
     _Atomic int refs;
     pthread_mutex_t lock;        /* mmap_lock, LKD_RANK_MM */
     mm_rwlock vlock;             /* VMA leaf lock, LKD_RANK_VMA: tree readers vs writers */
-    /* Changes when a mapping or a protection may have changed (mm_wlock, mm_wunlock, mm_host_refresh): what the engine
-     * caches about guarded pages (lkd_mm_guard_aliases) is valid while it holds the value read with the cache. */
-    _Atomic uint64_t guard_gen;
+    /* What the engine caches about a guarded host page (lkd_mm_guard_aliases) is valid while the generation of that
+     * page keeps the value read with the cache. It changes when a protection in the page may have changed
+     * (mm_host_refresh over it), and for every page when a mapping may have (mm_wlock, mm_wunlock). One counter per
+     * hash slot of the host page: pages sharing a slot only invalidate each other's caches. A single counter for the
+     * whole mm made every cache of THE FINALS invalid at each of the protection changes its packer makes, a thousand a
+     * second, and each patched load then faulted again (GuardedLoadPatch in the engine). */
+    _Atomic uint64_t guard_gen[MM_GUARD_GEN_SLOTS];
     vtree vt;
     uint64_t identity;
     uint64_t start_brk, brk;     /* guest; 0 = unknown (brk then fails like an absent heap) */
@@ -271,6 +277,14 @@ int mm_host_prot_of(uint32_t lxprot);                        /* guest prot -> ho
 /* ---- mm.c internals shared with the syscall files ---------------------------------------------- */
 void mm_wlock(lkd_mm *mm);       /* VMA write lock (rank 90), held only around tree mutations */
 void mm_wunlock(lkd_mm *mm);
+/* The same lock without the generation change, for tree changes that change no page's mapping or protection (a split,
+ * a merge of pieces of one backing). */
+void mm_wlock_same(lkd_mm *mm);
+void mm_wunlock_same(lkd_mm *mm);
+/* Guarded page generations (lkd_mm.guard_gen): the pages of [s, e), every page, the counter of host page hp. */
+void mm_guard_gen_bump(lkd_mm *mm, uint64_t s, uint64_t e);
+void mm_guard_gen_bump_all(lkd_mm *mm);
+_Atomic uint64_t *mm_guard_gen_of(lkd_mm *mm, uint64_t hp);
 void mm_lock(lkd_mm *mm);        /* mmap_lock */
 void mm_unlock(lkd_mm *mm);
 lkd_mm *mm_of(lkd_task *t);

@@ -17,16 +17,33 @@ static uint64_t new_identity(void) { return ((uint64_t)getpid() << 24) | (atomic
 
 void mm_lock(lkd_mm *mm) { pthread_mutex_lock(&mm->lock); }
 void mm_unlock(lkd_mm *mm) { pthread_mutex_unlock(&mm->lock); }
+_Atomic uint64_t *mm_guard_gen_of(lkd_mm *mm, uint64_t hp)
+{
+    return &mm->guard_gen[((hp / mm_hps) * 0x9E3779B97F4A7C15ull >> 40) & (MM_GUARD_GEN_SLOTS - 1)];
+}
+void mm_guard_gen_bump_all(lkd_mm *mm)
+{
+    for (unsigned i = 0; i < MM_GUARD_GEN_SLOTS; i++) atomic_fetch_add_explicit(&mm->guard_gen[i], 1, memory_order_release);
+}
+void mm_guard_gen_bump(lkd_mm *mm, uint64_t s, uint64_t e)
+{
+    uint64_t p = HP_DOWN(s), end = HP_UP(e);
+    if (end <= p) return;
+    if ((end - p) / mm_hps >= MM_GUARD_GEN_SLOTS) { mm_guard_gen_bump_all(mm); return; }
+    for (; p < end; p += mm_hps) atomic_fetch_add_explicit(mm_guard_gen_of(mm, p), 1, memory_order_release);
+}
 void mm_wlock(lkd_mm *mm)
 {
     mrw_wrlock(&mm->vlock);
-    atomic_fetch_add_explicit(&mm->guard_gen, 1, memory_order_release);
+    mm_guard_gen_bump_all(mm);
 }
 void mm_wunlock(lkd_mm *mm)
 {
-    atomic_fetch_add_explicit(&mm->guard_gen, 1, memory_order_release);
+    mm_guard_gen_bump_all(mm);
     mrw_wrunlock(&mm->vlock);
 }
+void mm_wlock_same(lkd_mm *mm) { mrw_wrlock(&mm->vlock); }
+void mm_wunlock_same(lkd_mm *mm) { mrw_wrunlock(&mm->vlock); }
 lkd_mm *mm_of(lkd_task *t) { return t ? t->mm : NULL; }
 
 int mm_capable(lkd_task *t, int cap)
@@ -248,10 +265,12 @@ void mm_merge_around(lkd_mm *mm, uint64_t start, uint64_t end)
 {
     mm_vma *v = vt_last_start_before(&mm->vt, start);
     if (!v) v = vt_first(&mm->vt);
-    mm_wlock(mm);
+    mm_wlock_same(mm);
     while (v && v->start <= end) {
         mm_vma *n = vt_next(&mm->vt, v);
         if (n && mergeable(v, n)) {
+            /* another backing of the same file: n's goes with n, and its file view (guard_alias) with it */
+            if (n->bk != v->bk) mm_guard_gen_bump(mm, n->start, n->end);
             vt_remove(&mm->vt, n);
             vt_set_end(&mm->vt, v, n->end);
             if (n->bk && n->bk->kind == MB_SYSV) mm_shm_detach_vma(n);
@@ -260,7 +279,7 @@ void mm_merge_around(lkd_mm *mm, uint64_t start, uint64_t end)
         }
         v = n;
     }
-    mm_wunlock(mm);
+    mm_wunlock_same(mm);
 }
 
 int mm_split(lkd_mm *mm, uint64_t addr)
@@ -272,10 +291,10 @@ int mm_split(lkd_mm *mm, uint64_t addr)
     if (!n) return -LX_ENOMEM;
     n->start = addr;
     if (n->bk) n->pgoff += addr - v->start;
-    mm_wlock(mm);
+    mm_wlock_same(mm); /* the two pieces map what v mapped, with its protection and backing */
     vt_set_end(&mm->vt, v, addr);
     vt_insert(&mm->vt, n);
-    mm_wunlock(mm);
+    mm_wunlock_same(mm);
     if (n->bk && n->bk->kind == MB_SYSV) mm_shm_attach_vma(n);
     return 0;
 }
@@ -417,7 +436,7 @@ int mm_host_refresh(lkd_mm *mm, uint64_t start, uint64_t end)
         if (x && !r.err) r.err = x;
     }
     /* mprotect changes v->prot without the VMA write lock: this is where the change becomes visible */
-    atomic_fetch_add_explicit(&mm->guard_gen, 1, memory_order_release);
+    mm_guard_gen_bump(mm, start, end);
     mm_watch_unlock();
     return r.err;
 }

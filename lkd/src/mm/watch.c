@@ -529,9 +529,10 @@ int lkd_mm_guard_aliases(uint64_t gva, const void *alias[4], const uint64_t **ge
     if (!mm || !in_window(gva)) return 0;
     const uint64_t p = HP_DOWN(gva);
     const unsigned n = mm_hps / 4096 < 4 ? (unsigned)(mm_hps / 4096) : 4;
-    *gen = (const uint64_t *)&mm->guard_gen;
+    _Atomic uint64_t *g = mm_guard_gen_of(mm, p);
+    *gen = (const uint64_t *)g;
     /* before the VMAs: a change made after this load moves the generation past it */
-    *gen_now = atomic_load_explicit(&mm->guard_gen, memory_order_acquire);
+    *gen_now = atomic_load_explicit(g, memory_order_acquire);
     int r = 0;
     mrw_rdlock(&mm->vlock);
     if (mm_page_guarded(mm, p)) {
