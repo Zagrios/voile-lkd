@@ -163,6 +163,12 @@ typedef struct lkd_engine_ops {
     /* Optional (NULL = unsupported, ptrace answers honestly): enable or disable hardware single-step of
      * one guest instruction for t at its next resume. Return -LX_ENOSYS if unsupported. */
     int (*set_single_step)(lkd_task *t, int enable);
+
+    /* Optional: a syscall that syscall user dispatch is about to turn into SIGSYS (selector BLOCK, the
+     * task not traced). Return 1 when the engine has completed it the way the task's SIGSYS handler
+     * would (registers set, RIP left after the syscall instruction): no signal is sent and lkd_syscall
+     * returns LKD_CONTEXT_REPLACED. Return 0 to have SIGSYS sent. [owner] */
+    int (*sud_shortcut)(lkd_task *t, uint64_t nr);
 } lkd_engine_ops;
 
 /* ---- 4. Setup --------------------------------------------------------------------------------- */

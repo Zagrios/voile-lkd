@@ -639,6 +639,43 @@ void ForkChild(lkd_task* t) {
   HitchLog::AfterFork();
 }
 
+// Syscall user dispatch: a syscall instruction of Windows code that Wine's SIGSYS handler would send to its system call
+// dispatcher. THE FINALS (its packer) runs `syscall` with EAX = -1, about 50,000 times per second on the game thread:
+// no service has that number, and Wine's dispatcher answers STATUS_INVALID_SYSTEM_SERVICE (bad_syscall in
+// dlls/ntdll/unix/signal_x86_64.c). The answer is given here, without the signal frame, the handler and the
+// dispatcher's register and XSAVE round trip, with the registers that path leaves: RAX the status, R11 the flags, the
+// others untouched but RCX and RDX. Without an instrumentation callback, RCX is the return address and RDX 0 (the
+// restore flags). With one (ProcessInstrumentationCallback, which that packer installs), Wine returns into the callback
+// (iretq): RIP the callback, R10 the return address, RCX Wine's syscall frame, RDX RESTORE_FLAGS_INSTRUMENTATION.
+// amd64_thread_data() in the TEB holds a pointer to Wine's callback variable (+ 0x330) and the syscall frame (+ 0x378).
+// Not when the trap flag is set: Wine then returns through its CONTEXT_CONTROL path.
+int SudShortcut(lkd_task* t, uint64_t Nr) {
+  if (static_cast<uint32_t>(Nr) != 0xffffffffu) return 0;
+  auto* Th = GT(t)->State;
+  auto& St = Th->CurrentFrame->State;
+  if (St.flags[X::RFLAG_TF_RAW_LOC]) return 0;
+  const uint64_t Teb = St.gs_cached;
+  uint64_t CallbackPtr = 0, Callback = 0, SyscallFrame = 0;
+  if (lkd_user_read(Teb + 0x330, &CallbackPtr, sizeof CallbackPtr) != 0 ||
+      (CallbackPtr && lkd_user_read(CallbackPtr, &Callback, sizeof Callback) != 0) ||
+      (Callback && lkd_user_read(Teb + 0x378, &SyscallFrame, sizeof SyscallFrame) != 0)) {
+    return 0;
+  }
+  const uint64_t Return = St.rip; // already after the syscall instruction
+  St.gregs[X::REG_RAX] = 0xc000001cull; // STATUS_INVALID_SYSTEM_SERVICE
+  St.gregs[X::REG_R11] = GuestEflags(Th);
+  if (Callback) {
+    St.gregs[X::REG_R10] = Return;
+    St.gregs[X::REG_RCX] = SyscallFrame;
+    St.gregs[X::REG_RDX] = 0x10000; // RESTORE_FLAGS_INSTRUMENTATION
+    St.rip = Callback;
+  } else {
+    St.gregs[X::REG_RCX] = Return;
+    St.gregs[X::REG_RDX] = 0;
+  }
+  return 1;
+}
+
 const lkd_engine_ops Ops = {
   .size = sizeof(lkd_engine_ops),
   .get_regs = GetRegs,
@@ -655,6 +692,7 @@ const lkd_engine_ops Ops = {
   .fork_parent = ForkParent,
   .fork_child = ForkChild,
   .set_single_step = nullptr,
+  .sud_shortcut = SudShortcut,
 };
 } // namespace
 
