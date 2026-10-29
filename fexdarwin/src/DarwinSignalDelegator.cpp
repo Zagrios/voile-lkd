@@ -2,7 +2,6 @@
 #include "DarwinSignalDelegator.h"
 #include "CodeValidation.h"
 #include "CrashReport.h"
-#include "FaultStats.h"
 #include "GuardedLoadPatch.h"
 #include "GuardedLoadStub.h"
 #include "HitchLog.h"
@@ -207,9 +206,7 @@ bool DarwinSignalDelegator::RedirectFromJit(GuestThread* T, ucontext_t* Uc, uint
 void DarwinSignalDelegator::Handler(int Sig, siginfo_t* Info, void* Uctx) {
   // LKD's fault-safe user copies run on guest threads and on host-only threads: let LKD recover its own faults first
   // (contract of lkd_fault_try_recover in lkd.h; our handler is installed after lkd_init).
-  FaultStats::Note(Sig == SIGSEGV ? FaultStats::Segv : Sig == SIGBUS ? FaultStats::Bus : FaultStats::OtherSignal);
   if ((Sig == SIGSEGV || Sig == SIGBUS) && LkdEnabled() && lkd_fault_try_recover(Uctx)) {
-    FaultStats::Note(FaultStats::LkdRecovered);
     return;
   }
   auto* Self = G->Signals.get();
@@ -394,8 +391,6 @@ bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, 
   uint8_t Bytes[32];
   const uint64_t LoadAddr = Decoded ? FEXCore::H2G(reinterpret_cast<void*>(D.Addr)) : 0;
   if (Decoded && fexdarwin_lkd_guard_read(LoadAddr, Bytes, D.L.Bytes()) == 1) {
-    FaultStats::Note(FaultStats::GuardFileRead);
-    FaultStats::NoteSite(FaultStats::GuardFileRead, DarwinCtx::GetPc(Uc), LoadAddr);
     GuardedLoadPatch::NoteFileRead(DarwinCtx::GetPc(Uc), D.Insn, LoadAddr);
     ApplyGuardedLoad(Uc, D, Bytes);
     return true;
@@ -423,8 +418,6 @@ bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, 
       T->RaceLast = Now;
       if (Now - T->RaceStart < RaceMaxNs) {
         if (++T->RaceCount > 4 && !HostAllows(Addr, Write)) usleep(20);
-        FaultStats::Note(FaultStats::GuardRace);
-        FaultStats::NoteSite(FaultStats::GuardRace, DarwinCtx::GetPc(Uc), Addr);
         return true;
       }
       T->RaceAddr = 0;
@@ -432,23 +425,15 @@ bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, 
   }
   if (R != 1) return false;
   if (Write || !InJit) {
-    if (InJit) {
-      FaultStats::Note(FaultStats::GuardStore);
-      FaultStats::NoteSite(FaultStats::GuardStore, DarwinCtx::GetPc(Uc), Addr);
-    }
     return true; // retry the host instruction
   }
   // The page is open now: run the load here and close it again, or step its guest instruction.
   if (Decoded) {
-    FaultStats::Note(FaultStats::GuardLoadOpen);
-    FaultStats::NoteSite(FaultStats::GuardLoadOpen, DarwinCtx::GetPc(Uc), Addr);
     memcpy(Bytes, reinterpret_cast<const void*>(D.Addr), D.L.Bytes());
     fexdarwin_lkd_guard_close(Page);
     ApplyGuardedLoad(Uc, D, Bytes);
     return true;
   }
-  FaultStats::Note(FaultStats::GuardStep);
-  FaultStats::NoteSite(FaultStats::GuardStep, DarwinCtx::GetPc(Uc), Addr);
   return BeginGuardStep(T, Uc, Page);
 }
 
@@ -513,7 +498,6 @@ bool DarwinSignalDelegator::HandleGuestFault(GuestThread* T, int Sig, siginfo_t*
     const auto& D = Frame->SynchronousFaultData;
     if (T->GuardStepping && D.TrapNo == Linux::TRAP_DB) {
       // The one instruction that read a guarded page has run (BeginGuardStep): the single-step trap is ours.
-      FaultStats::Note(FaultStats::GuardStepEnd);
       EndGuardStep(T, Uc);
       return true;
     }
@@ -542,10 +526,7 @@ bool DarwinSignalDelegator::HandleGuestFault(GuestThread* T, int Sig, siginfo_t*
     const int Prot = GuestProtAt(Addr);
     const uint32_t Esr = DarwinCtx::GetEsr(Uc);
     const bool Write = (Esr >> 6) & 1; // WnR of a data abort syndrome
-    if (LkdEnabled() && ResolveGuardedFault(T, Uc, Addr, Write, true)) {
-      FaultStats::Note(FaultStats::GuardOpen);
-      return true;
-    }
+    if (LkdEnabled() && ResolveGuardedFault(T, Uc, Addr, Write, true)) return true;
     F.Signal = Linux::L_SIGSEGV;
     F.SiCode = Prot < 0 ? Linux::SEGV_MAPERR_ : Linux::SEGV_ACCERR_;
     F.Addr = Addr;
@@ -565,7 +546,6 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
     // 0. A stub of a load that reads a guarded page through its file (GuardedLoadPatch.h): the original load at its end
     //    is handled from its own site, any other fault there puts the load back.
     if (GuardedLoadPatch::OnFault(Uc)) {
-      FaultStats::Note(FaultStats::StubFault);
       return true;
     }
 
@@ -602,7 +582,6 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
       auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(Th, Type, PC, DarwinCtx::GPRs(Uc));
       pthread_sigmask(SIG_SETMASK, &Blocked, nullptr);
       if (Result) {
-        FaultStats::Note(FaultStats::Unaligned);
         DarwinCtx::SetPc(Uc, PC + *Result);
         return true;
       }
@@ -610,7 +589,6 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
 
     // 4. Write to a page that holds translated code (self-modifying code detection).
     if (HandleSmcWrite(T, Sig, Info, Uc)) {
-      FaultStats::Note(FaultStats::SmcWrite);
       return true;
     }
   }
@@ -624,10 +602,7 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
     const uint32_t Esr = DarwinCtx::GetEsr(Uc);
     const uint64_t GuestAddr = FEXCore::H2G(Info->si_addr);
     const bool Write = (Esr >> 6) & 1;
-    if (ResolveGuardedFault(T, Uc, GuestAddr, Write, false)) {
-      FaultStats::Note(FaultStats::DecoderGuard);
-      return true;
-    }
+    if (ResolveGuardedFault(T, Uc, GuestAddr, Write, false)) return true;
     // 7. The decoder reading code whose page lost its execute permission after the decoder checked it: LKD changes
     //    the protection first and drops the translations after, so a compilation on another thread can read the page
     //    in between. THEIA does this to its code pages (THE FINALS' "Foreground Work" and "Background Work" threads,
@@ -637,7 +612,6 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
       const int GProt = GuestProtAt(GuestAddr);
       GuardedLoad D {};
       if ((GProt < 0 || !(GProt & Linux::PROT_EXEC_)) && DecodeGuardedLoad(Uc, reinterpret_cast<uint64_t>(Info->si_addr), D)) {
-        FaultStats::Note(FaultStats::DecoderNoExec);
         G->CTX->StopDecodeAtNonExecutable(Th);
         const uint8_t Zero[32] {};
         ApplyGuardedLoad(Uc, D, Zero);

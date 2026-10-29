@@ -41,7 +41,6 @@ add_executable(fexdarwin-run
   src/GuestThread.cpp
   src/GuardedLoadPatch.cpp
   src/HitchLog.cpp
-  src/Sampler.cpp
   src/LkdGlue.cpp
   src/LkdLoader.cpp
   src/LkdShim.c)
@@ -57,8 +56,6 @@ target_include_directories(fexdarwin-run PRIVATE
   ${FEX_SOURCE_DIR}/CodeEmitter
   ${LKD_DIR}/include)
 # LkdShim.c alone uses LKD internal headers.
-# The sampler reads FEXCore's JIT block header, tail and RIP entries (internal headers).
-set_source_files_properties(src/Sampler.cpp PROPERTIES INCLUDE_DIRECTORIES ${FEX_SOURCE_DIR}/FEXCore/Source)
 set_source_files_properties(src/LkdShim.c PROPERTIES INCLUDE_DIRECTORIES ${LKD_DIR}/src/include COMPILE_OPTIONS -std=c11)
 
 # These must match the definitions FEXCore itself was compiled with: several public structs change layout with them.

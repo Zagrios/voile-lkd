@@ -10,7 +10,6 @@
 #include "GuestSignalAbi.h"
 #include "Host.h"
 #include "LkdGlue.h"
-#include "Sampler.h"
 #include "LkdLoader.h"
 
 #include <FEXCore/Core/X86Enums.h>
@@ -573,7 +572,6 @@ int FrameRestore(lkd_task* t, uint64_t* SavedMask, struct lx_stack_t* SavedStack
 // image in this host process and give the thread the register state of a fresh Linux process.
 int ExecImage(lkd_task* t, const struct lkd_exec_image* Img) {
   HitchLog::LogProfileNow("exec");
-  Sampler::NoteExec();
   auto* T = GT(t);
   auto* Th = T->State;
   // Nothing translated from the old image may run again.
@@ -639,7 +637,6 @@ void ForkChild(lkd_task* t) {
   StartKickRetryThread();
   StartSupervisorWatch(); // threads do not survive a host fork
   HitchLog::AfterFork();
-  Sampler::Start();
 }
 
 // Syscall user dispatch: a syscall instruction of Windows code that Wine's SIGSYS handler would send to its system call
@@ -734,7 +731,6 @@ int LkdSetup() {
   }
   StartSupervisorWatch(); // the first process watches itself only through the region guard (kill(self) succeeds)
   StartKickRetryThread();
-  Sampler::Start();
   // A host pipe or socket the engine keeps must never kill the runtime; LKD sets F_SETNOSIGPIPE on guest ones.
   signal(SIGPIPE, SIG_IGN);
   return lkd_init(&Ops);
