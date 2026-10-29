@@ -12,6 +12,7 @@
 #include "DarwinSyscallHandler.h"
 #include "GuestSignalAbi.h"
 
+#include <FEXCore/Core/CodeInvalidation.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXCore/Utils/LongJump.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -163,6 +164,8 @@ void DarwinSignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread,
 
 void DarwinSignalDelegator::InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Len,
                                                      FEXCore::Context::CodeRangeInvalidationFn After) {
+  // Before any lock: a compilation that runs now must not record its bytes for ReviveTranslations.
+  FEXCore::Context::CodeInvalidations.Note(Start, Len);
   std::lock_guard<std::mutex> ThreadsLk(G->ThreadsLock);
   auto Lk = FEXCore::GuardSignalDeferringSectionWithFallback(G->CTX->GetCodeInvalidationMutex(), CallingThread);
   G->CTX->InvalidateCodeBuffersCodeRange(Start, Len);

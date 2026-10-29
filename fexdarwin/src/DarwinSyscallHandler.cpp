@@ -199,6 +199,20 @@ extern "C" int fexdarwin_lkd_vma_at(uint64_t gva, uint64_t* start, uint64_t* end
 extern "C" int fexdarwin_lkd_watch_code(uint64_t gva, uint64_t len);
 extern "C" void fexdarwin_lkd_guard_close_all(void);
 
+extern "C" int fexdarwin_lkd_guard_aliases(uint64_t gva, const void* alias[4], const uint64_t** gen, uint64_t* gen_now);
+
+// A guarded host page (LKD mm, mm_page_guarded) is PROT_NONE on the host: reading it opens it for the whole host page.
+bool DarwinSyscallHandler::CanReadGuestCode(uint64_t Start, uint64_t Length) {
+  if (!LkdEnabled() || !Length) return true;
+  for (uint64_t P = Start & ~(FEXCore::Utils::FEX_HOST_PAGE_SIZE - 1); P < Start + Length; P += FEXCore::Utils::FEX_HOST_PAGE_SIZE) {
+    const void* Alias[4];
+    const uint64_t* Gen;
+    uint64_t GenNow;
+    if (fexdarwin_lkd_guard_aliases(P, Alias, &Gen, &GenNow) != 0) return false;
+  }
+  return true;
+}
+
 // Host faults on guest memory from now to PostCompile are the decoder's (DarwinSignalDelegator::HandleFault, step 7).
 void DarwinSyscallHandler::PreCompile() {
   if (CurrentGuestThread) CurrentGuestThread->Compiling = true;

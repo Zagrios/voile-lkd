@@ -21,6 +21,7 @@ public:
     return std::nullopt;
   }
   void SleepThread(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) override;
+  bool CanReadGuestCode(uint64_t Start, uint64_t Length) override;
   void PreCompile() override;
   void PostCompile() override;
 

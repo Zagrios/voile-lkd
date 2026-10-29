@@ -389,6 +389,8 @@ int main(int argc, char** argv) {
   FEXCore::Config::Load();
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
   FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, Opt.SmcMode == "none" ? "0" : Opt.SmcMode == "mtrack" ? "1" : "2");
+  // FEXDARWIN_REVIVE=0: translate code again after every invalidation, as FEX does (for A/B measurements).
+  if (const char* R = getenv("FEXDARWIN_REVIVE"); R && !strcmp(R, "0")) FEXCore::Config::Set(FEXCore::Config::CONFIG_REVIVETRANSLATIONS, "0");
   {
     static const std::pair<const char*, FEXCore::Config::ConfigOption> Lookup[] = {
 #define OPT_BASE(type, group, enum, json, default) {#enum, FEXCore::Config::ConfigOption::CONFIG_##enum},
