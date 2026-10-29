@@ -193,13 +193,20 @@ int mm_alias_pages(lkd_mm *mm, uint64_t p, uint64_t *out, int cap)
         return n;
     }
     uint64_t ho = host_off_of(v, p);
-    for (mm_vma *w = vt_first(&mm->vt); w && n < cap; w = vt_next(&mm->vt, w)) {
-        if (!(w->vflags & VF_HOSTSHARED) || !mm_same_object(w->bk, v->bk)) continue;
-        uint64_t q = w->start - (w->pgoff + w->bk->hbias) + ho;   /* where ho would be in w (may be outside) */
+    /* Each placement of the object (vt_view), then its VMAs in the host page where ho would be: walking every VMA
+     * here cost about 1 ms per write fault once THE FINALS's packer had cut its image into some 50,000 VMAs. */
+    const vtree *t = &mm->vt;
+    for (uint32_t i = 0; i < t->nviews && n < cap; i++) {
+        const struct vt_view *e = &t->views[i];
+        if (!vt_view_same_object(e, v->bk)) continue;
+        uint64_t q = e->base + ho;   /* where ho would be in this placement (may be outside its VMAs) */
         if (q & (mm_hps - 1)) continue;
-        if (q < HP_DOWN(w->start) || q >= HP_UP(w->end)) continue;
+        int hit = 0;
+        for (mm_vma *w = vt_first_end_after(t, q); w && w->start < q + mm_hps && !hit; w = vt_next(t, w))
+            hit = (w->vflags & VF_HOSTSHARED) && w->bk && mm_same_object(w->bk, v->bk) && vt_view_base(w) == e->base;
+        if (!hit) continue;
         int dup = 0;
-        for (int i = 0; i < n; i++) if (out[i] == q) dup = 1;
+        for (int j = 0; j < n; j++) if (out[j] == q) dup = 1;
         if (!dup) out[n++] = q;
     }
     mrw_rdunlock(&mm->vlock);

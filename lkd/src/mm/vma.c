@@ -6,6 +6,8 @@
  * path and label strings live in the shared backing object (HyperLinux kept a 4 KiB path in every
  * entry of a sorted array and moved the array on each insertion).
  */
+#include <stdlib.h>
+
 #include "mm_priv.h"
 
 static int ht(const mm_vma *x) { return x ? x->h : 0; }
@@ -100,6 +102,64 @@ static void refresh(mm_vma *n, uint64_t key)
 
 void vt_init(vtree *t, uint64_t lo) { *t = (vtree){ .lo = lo }; }
 
+/* ---- Views of shared objects (struct vt_view) ------------------------------------------------- */
+
+uint64_t vt_view_base(const mm_vma *v) { return v->start - (v->pgoff + v->bk->hbias); }
+
+int vt_view_same_object(const struct vt_view *e, const struct mm_backing *bk)
+{
+    if (e->bk == bk) return 1;
+    if (e->kind != bk->kind) return 0;
+    if (bk->kind == MB_FILE) return e->file == bk->file || (e->ino == bk->ino && e->dev_major == bk->dev_major && e->dev_minor == bk->dev_minor);
+    if (bk->kind == MB_SYSV) return e->shm_id == bk->shm_id;
+    return 0;
+}
+
+void vt_views_clear(vtree *t) { t->nviews = t->views_live = 0; }
+
+static void views_push(vtree *t, const mm_vma *v, uint64_t base)
+{
+    if (t->nviews == t->views_cap) {
+        uint32_t cap = t->views_cap ? t->views_cap * 2 : 16;
+        struct vt_view *nv = realloc(t->views, cap * sizeof *nv);
+        if (!nv) return;
+        t->views = nv;
+        t->views_cap = cap;
+    }
+    const struct mm_backing *b = v->bk;
+    t->views[t->nviews++] = (struct vt_view){ .base = base, .bk = b, .file = b->file, .ino = b->ino,
+                                              .dev_major = b->dev_major, .dev_minor = b->dev_minor,
+                                              .kind = b->kind, .shm_id = b->shm_id };
+}
+
+static int views_find(vtree *t, const mm_vma *v, uint64_t base)
+{
+    uint32_t l = t->views_last;   /* the pieces of one mapping come one after the other (mprotect splits) */
+    if (l < t->nviews && t->views[l].base == base && vt_view_same_object(&t->views[l], v->bk)) return 1;
+    for (uint32_t i = 0; i < t->nviews; i++)
+        if (t->views[i].base == base && vt_view_same_object(&t->views[i], v->bk)) { t->views_last = i; return 1; }
+    return 0;
+}
+
+/* Entries of unmapped placements stay until the list has doubled since it was last built from the tree. */
+static void views_add(vtree *t, const mm_vma *v)
+{
+    if (!(v->vflags & VF_HOSTSHARED) || !v->bk) return;
+    uint64_t base = vt_view_base(v);
+    if (views_find(t, v, base)) return;
+    if (t->nviews >= 64 && t->nviews >= 2 * t->views_live) {
+        t->nviews = 0;
+        for (mm_vma *w = vt_first(t); w; w = vt_next(t, w)) {
+            if (w == v || !(w->vflags & VF_HOSTSHARED) || !w->bk) continue;
+            uint64_t b = vt_view_base(w);
+            if (!views_find(t, w, b)) views_push(t, w, b);
+        }
+        t->views_live = t->nviews;
+        if (views_find(t, v, base)) return;
+    }
+    views_push(t, v, base);
+}
+
 /* vm_stat_account with is_stack_mapping, is_exec_mapping and is_data_mapping (mm/internal.h): a VMA counts in
  * one class at most, the stack first. */
 static uint64_t *class_of(vtree *t, const mm_vma *v)
@@ -186,6 +246,7 @@ void vt_insert(vtree *t, mm_vma *v)
     t->root = ins(t->root, v);
     t->n++;
     vt_account(t, v, 1);
+    views_add(t, v);
     if (succ) {
         succ->prev_end = v->end;
         refresh(t->root, succ->start);

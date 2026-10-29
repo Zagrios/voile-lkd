@@ -165,6 +165,7 @@ static void mm_destroy(lkd_mm *mm)
         mm_win.owner = NULL;
     }
     pthread_mutex_destroy(&mm->lock);
+    free(mm->vt.views);
     free(mm);
 }
 
@@ -223,6 +224,7 @@ void lkd_mm_reset_for_exec(lkd_mm *mm)
     mm->rss_ns = 0;
     mm->rss_anon = mm->rss_file = mm->rss_shmem = 0;
     mm->mmap_base = default_mmap_base();
+    vt_views_clear(&mm->vt);
     mm_watch_clear_all();
     mm_unlock(mm);
     mm_inval_flush(&iv);

@@ -107,7 +107,27 @@ typedef struct vtree {
      * of walking tens of thousands of VMAs (Dead by Daylight). The stack here is the [stack] label only; the VMA
      * holding start_stack moves to it at read time (lkd_mm_stats). */
     uint64_t total, stack, exec, data;
+    /* Views of shared objects (vt_view): one entry per object and placement, see vt_views_add. */
+    struct vt_view *views;
+    uint32_t nviews, views_cap, views_live, views_last;
 } vtree;
+
+/* A placement of a shared object in the address space: every VF_HOSTSHARED VMA of the object whose host offset 0
+ * would sit at `base` belongs to it (the pieces mprotect cuts out of one mapping share it). The identity fields are
+ * a copy of the backing's (mm_same_object) so that an entry may outlive its VMAs: entries are only added, by
+ * vt_insert, and dropped when the list is rebuilt from the tree; a reader checks the VMAs of a placement before
+ * using it (watch.c mm_alias_pages). */
+struct vt_view {
+    uint64_t base;
+    const struct mm_backing *bk;
+    const void *file;
+    uint64_t ino;
+    uint32_t dev_major, dev_minor;
+    int kind, shm_id;
+};
+uint64_t vt_view_base(const mm_vma *v);
+int vt_view_same_object(const struct vt_view *e, const struct mm_backing *bk);
+void vt_views_clear(vtree *t);
 
 /* ---- vma.c: AVL tree --------------------------------------------------------------------------- */
 void vt_init(vtree *t, uint64_t lo);
