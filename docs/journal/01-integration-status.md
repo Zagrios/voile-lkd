@@ -692,3 +692,26 @@ Rejected: skipping FEX's invalidation of code on the packer's writes, no gain.
 Remaining. The frame time still grows over a session (8.3 to about 10.9 ms in 5 min of menu; 10.6 to 14 before these changes) while the game's memory grows by about 50 MB a minute: likely guest objects never released, still hot in `npt_com_get_or_wrap`. Hitches during the first 30 s of a map, when the packer decrypts the new code (17,000 write faults, about 3.6 code invalidations each). The packer's instrumentation callback takes about 25 % of the game thread. The user still sees some stutters in matches.
 
 Verification (2026-10-29). THE FINALS with DXMT and D3DMetal through idle waves, and in the practice range. Rocket League 120 fps against the display, and 180 to 230 fps on the user's 240 Hz display (not split by change); Fall Guys 120 fps; Dead by Daylight 60 fps (its cap); HELLDIVERS 2 as before. LKD tests 43 of 44 (`test_fs_glibc` skips without its sysroot). Installed by hand in the dev runtime `v26.3.0-21-dev2`: `engine/fexdarwin-run`, `graphics/dxmt-native.framework`, `windows/{d3d11,dxgi,d3d12}.dll` (originals in `Voile-backups/finals-freeze-20261029`).
+
+## THE FINALS: where a match spends its CPU, and what the translator changes bought (2026-10-29)
+
+Context. THE FINALS (Direct3D 12 through D3DMetal) in matches on the Linux engine, an M5, measured with the new sampler (`7cb2ed4`, `FEXDARWIN_SAMPLE`): freezes and 30 to 80 fps.
+
+1. MEASURED: the game thread sets the frame rate, about 0.9 of a core in a match: about half in translated game code, 13 % stalled on the first instruction of blocks (code scattered over the code buffer), 5 % in host signal handling, 10 % blocked. Wine and LKD are about 8 % of it, Neptune's guest DLLs about 4 % of the translated time. The render server (Neptune and D3DMetal, x86_64 under Rosetta) takes 1 to 2.6 cores, the GPU 46 to 96 %.
+2. MEASURED on the M5: an x86-ordered store (`stlur`) costs about 2.3 plain ones; an ordered load (`ldapr`) as much as a plain one on a cache hit, 1.5 times on misses.
+3. The freezes in a match came from translation: the 128 MiB code buffer filled every one to two minutes and each clear translated the working set again, and the packer's re-encryption and protection changes invalidated unchanged code. Fixes: FEX `91cce7c9f` (512 MiB in 128 MiB zones), `f2efdbdc0` (ReviveTranslations: a dropped translation is mapped again when its bytes come back unchanged; the gaps between rendered frames halved).
+4. MEASURED: block mapping took about a fifth of compile time (an ordered page map, a write lock per entry point, the clock read at each L2/L3 hit). FEX `ecabe89a5`.
+5. MEASURED: each mmap or munmap moved the guarded page generation of every host page, so every guarded load stub went back to the fault. `da78465`: 5,438 to 1,771 guarded faults a second.
+6. MEASURED: the add of the guest base was 7 to 12 % of the game's host instructions. FEX `b41a030fb` (one per guest register, at most four live): 3.3 % fewer instructions on the hottest blocks.
+
+The user felt the whole set a little better; no single step was perceptible on its own.
+
+Rejected:
+- Plain stores for the game's own code (no x86 store order outside locked instructions and fences): match loading froze, Unreal's task system needs the order.
+- Translating the hottest blocks again to pack them together (a native test gives 8 to 22 % for scattered against contiguous hot code): the new copies were scattered again by the compilations of the other threads, over 175 MiB, and the frame rate did not move. A real packer would have to compile them in one pass into a zone of their own.
+- DXMT with `--dx11`: worse, in stutters and in frame rate.
+- Direct3D 11 through D3DMetal (`-dx11`; `--dx11` is not an Unreal option and kept Direct3D 12): Unreal's hang detector after 42 s, the RHI thread looping between the game and Neptune's `d3d11.dll`, probably a query that never completes. No game used that path before.
+
+Remaining. Without a hardware TSO mode or a low guest base, both of which macOS keeps to Rosetta, each further translator change is worth a few percent. The render server's share between Neptune and D3DMetal is not measured (`sample` gives wrong stacks under Rosetta).
+
+Verification (2026-10-29). THE FINALS in matches on the final engine; witnesses `w02` to `w32` and the arithmetic bench give the same results as before; LKD tests 43 of 44 (`test_fs_glibc` skips without its sysroot). Rocket League, Dead by Daylight and HELLDIVERS 2 were not played on this engine.
