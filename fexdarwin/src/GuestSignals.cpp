@@ -8,6 +8,7 @@
 #include "DarwinContext.h"
 #include <FEXCore/Utils/GuestBase.h>
 #include "DarwinSignalDelegator.h"
+#include "FaultStats.h"
 #include "GuestSignalAbi.h"
 #include "Host.h"
 #include "LkdGlue.h"
@@ -96,6 +97,7 @@ void ResetGuestFpForHandler(FEXCore::Core::InternalThreadState* Th) {
 }
 
 bool DarwinSignalDelegator::DeliverGuestSignal(GuestThread* T, ucontext_t* Uc, const GuestFault& F, bool StateIsSpilled) {
+  FaultStats::Note(FaultStats::GuestSignal);
   auto* Th = T->State;
   auto* Frame = Th->CurrentFrame;
   auto& St = Frame->State;
