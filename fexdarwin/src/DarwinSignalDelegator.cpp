@@ -85,6 +85,34 @@ void Say(const char* Fmt, ...) {
   va_end(Ap);
   if (N > 0) WriteErr(Buf, std::min<size_t>(N, sizeof Buf - 1));
 }
+
+// Whether restarting the guest instruction that holds the faulting host store would apply it twice. FEXCore's RIP
+// reconstruction returns the start of the guest instruction, and the translation of `pop m` (8F /0) has already moved RSP
+// when it stores: x86 computes a destination address based on RSP after the increment, so FEX commits RSP first. A restart
+// then pops the next stack slot and moves RSP twice. The store is retried as it is instead, which finishes the pop.
+// ELDEN RING's and Halloween's EAC modules keep a virtual machine's registers in the same host page as its code, and use
+// `pop [rbx]` to write them.
+bool RestartReplaysPop(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) {
+  uint64_t Boundary;
+  if (G->CTX->IsHostPCAtGuestInstructionBoundary(Thread, HostPC, &Boundary)) {
+    return false; // nothing of the guest instruction has run
+  }
+  const uint64_t Rip = G->CTX->RestoreRIPFromHostPC(Thread, HostPC);
+  const uint8_t* Code = reinterpret_cast<const uint8_t*>(FEXCore::G2H(Rip));
+  size_t I = 0;
+  for (; I < 14; ++I) { // legacy prefixes, at most one REX right before the opcode
+    const uint8_t B = Code[I];
+    if (B == 0x26 || B == 0x2e || B == 0x36 || B == 0x3e || B == 0x64 || B == 0x65 || B == 0x66 || B == 0x67 || B == 0xf0 ||
+        B == 0xf2 || B == 0xf3) {
+      continue;
+    }
+    if ((B & 0xf0) == 0x40) {
+      ++I;
+    }
+    break;
+  }
+  return I < 14 && Code[I] == 0x8f && ((Code[I + 1] >> 3) & 7) == 0;
+}
 } // namespace
 
 void DarwinSignalDelegator::Install() {
@@ -268,6 +296,9 @@ bool DarwinSignalDelegator::HandleSmcWrite(GuestThread* T, int Sig, siginfo_t* I
   if (CTX->IsAddressInCodeBuffer(Th, PC) && !CTX->IsCurrentBlockSingleInst(Th) && CTX->IsAddressInCurrentBlock(Th, PageBase, GuestMemory::PageSize)) {
     // The write may have changed the code of the block that is running right now. Rebuild the guest state and restart at
     // the faulting instruction as a one-instruction block so the change takes effect immediately.
+    if (RestartReplaysPop(Th, PC)) {
+      return true;
+    }
     SpillSRA(Th, Uc, Th->CurrentFrame->InSyscallInfo & 0xFFFF);
     DarwinCtx::SetPc(Uc, Config.AbsoluteLoopTopAddressFillSRA);
     DarwinCtx::SetReg(Uc, 1, 1); // ENTRY_FILL_SRA_SINGLE_INST_REG (TMP2 = x1): force a single step
