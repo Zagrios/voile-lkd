@@ -31,7 +31,7 @@ rules that the header cannot express.
 
 | type | name | payload | effect |
 | --- | --- | --- | --- |
-| 1 | HELLO | `wsd_hello` | replies `EV_HELLO` with the size in pixels, max refresh and backing scale of the screen with the menu bar (the origin of window coordinates, whichever screen has the key window), and its work area (without the menu bar and the Dock; zero from older servers) |
+| 1 | HELLO | `wsd_hello` | replies `EV_HELLO` with the size in pixels, max refresh and effective scale (see Render percent) of the screen with the menu bar (the origin of window coordinates, whichever screen has the key window), and its work area (without the menu bar and the Dock; zero from older servers) |
 | 2 | WINDOW_CREATE | `wsd_window_create` + UTF-8 title | NSWindow + layer-backed view with an opaque black `CAMetalLayer`; size in pixels; ids are client-chosen, max 16. `WSD_STYLE_TITLED` gives the macOS title bar (with close, minimize and zoom buttons as `CLOSABLE`, `MINIATURIZABLE`, `RESIZABLE` ask), `BORDERLESS` none; `TOPMOST` floats above the windows that are not, `NOACTIVATE` never becomes the key window |
 | 3 | WINDOW_DESTROY | `wsd_window` | releases a pending frame, restores relative mode, closes |
 | 4 | WINDOW_SHOW | `wsd_window_flag` | 1: activate app, in front of the server's windows as the key window, then one `EV_RESIZE`; 2: in front without becoming key and without activating the app (Win32 `SWP_NOACTIVATE`); 0: `orderOut` |
@@ -52,7 +52,7 @@ rules that the header cannot express.
 | 27 | APP_ICON | `wsd_app_icon` + 1 fd | BGRA8 pixels with straight alpha, at most 1024x1024, read once (`pread`): the application icon of the server (Dock, Cmd-Tab) |
 | 28 | OPEN_URL | UTF-8 address | an `http` or `https` address with a host, opened in the Mac's default browser (`NSWorkspace openURL:`); any other is rejected with `-EINVAL`. The guest's `xdg-open` sends it for the links a game opens |
 | 29 | CURSOR_WARP | `wsd_cursor_pos` | the pointer goes to x,y screen pixels (`CGWarpMouseCursorPosition`, without the 0.25 s macOS holds it still afterwards); mouse moves queued before it are dropped. Ignored while the server is not the active app and in relative mode |
-| 30 | CURSOR_DEFINE | `wsd_cursor_define` + 1 fd | BGRA8 pixels with straight alpha, at most 256x256, read once (`pread`): a cursor of the client, shown at the backing scale, set later by its id (`WSD_CURSOR_FIRST_DEFINED` and up, at most 64 per client; defining an id again replaces it) |
+| 30 | CURSOR_DEFINE | `wsd_cursor_define` + 1 fd | BGRA8 pixels with straight alpha, at most 256x256, read once (`pread`): a cursor of the client, shown at the effective scale (see Render percent), set later by its id (`WSD_CURSOR_FIRST_DEFINED` and up, at most 64 per client; defining an id again replaces it) |
 | 31 | CURSOR_SET | `wsd_cursor_set` | the cursor over the content of the server's windows: one of the Mac's (`WSD_CURSOR_*`) or a defined one; `-ENOENT` for an unknown id. CURSOR_VISIBLE still hides it |
 | 32 | WINDOW_FOCUS | `wsd_window` | the client activated the window: it comes in front as the key window. While another app is active it becomes key once the server is active again; the server activates itself this way only before it was ever active (a game's start). Ignored for a `NOACTIVATE` window |
 | 33 | SCREEN_SAVER | `wsd_window_flag` (window ignored) | 0: the display does not sleep on its own (`PreventUserIdleDisplaySleep`) until 1 or the client leaves |
@@ -71,7 +71,7 @@ rules that the header cannot express.
 | 105 | EV_RELATIVE | `wsd_ev_relative` raw deltas (relative mode only) |
 | 106 | EV_WHEEL | `wsd_ev_wheel`: `scrollingDeltaX/Y`, bit 0 of `precise` = trackpad-precise |
 | 107 | EV_FOCUS | `wsd_window_flag`: 1 key window gained, 0 lost |
-| 108 | EV_RESIZE | `wsd_ev_resize`: content size in pixels and backing scale |
+| 108 | EV_RESIZE | `wsd_ev_resize`: content size in pixels and the effective scale (see Render percent) |
 | 109 | EV_CLOSE | `wsd_window`: close button pressed; the window stays open until WINDOW_DESTROY |
 | 110 | EV_PRESENTED | `wsd_ev_presented`: echo of the client timestamp, server receive time, display-link encode time and `CAMetalDrawable.presentedTime` (0 when the drawable was never shown, for example while the window is occluded) |
 | 111 | EV_RELEASE | `wsd_ev_release`: the GPU finished reading the buffer for that serial (`shown=1`) or it was replaced unshown (`shown=0`); the client may write it again |
@@ -96,6 +96,24 @@ gone, and is refused if a client is still there after 30 seconds. App Nap is off
 Coming back to the server (Cmd-Tab, the Dock) with none of its windows visible brings back the largest window in the
 Dock or minimized out of sight, which its client hears as `EV_MINIMIZE` 0: a game in exclusive fullscreen minimizes
 itself when it goes to the background.
+
+## Render percent
+
+`wsd --render-percent N` lets the server tell its clients of a smaller screen, for the whole run. N is a whole number
+from 1 to 100; a value outside it is held at 1 or 100, and anything that is not made of digits only is ignored (100,
+the default). Every pixel quantity on the wire is a pixel at the effective scale, the pixels per point wsd uses to
+convert to AppKit's points: `min(backing, max(backing * N / 100, min_scale))`, where `backing` is the screen's backing
+scale and `min_scale` is `max(640 / width, 480 / height)` for the width and height in points of the screen with the
+menu bar. The reported screen is therefore never below 640x480 pixels (a game cannot run on less; a screen that is
+smaller itself keeps its size), and the scale is never above the backing scale. `backing_scale_x1000` (`EV_HELLO`,
+`EV_DISPLAY`, `EV_RESIZE`) is the effective scale; at 100 it is the backing scale itself.
+
+On a 2x screen of 1512x982 points, 50 gives a scale of 1.0: the client sees a 1512x982 screen instead of 3024x1964,
+renders those pixels, and macOS stretches the picture to the screen; 25 gives 0.5 (756x491), and 1 is held at 0.489
+(739x480). At 50 or less on a 2x screen a window of 1280x720 pixels is 1280x720 points or more, not 640x360, so
+windowed games come out larger; this suits borderless and fullscreen windows. On a 1x screen the percent lowers the
+scale below 1 in the same way. The option has no protocol message: a server from before it ignores the flag and keeps
+the backing scale.
 
 ## Levels
 

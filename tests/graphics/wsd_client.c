@@ -1,5 +1,5 @@
 /*
- * wsd_client.c - owned native witness for the window server (EXP/src/wsd).
+ * wsd_client.c - owned native witness for the window server (wsd/).
  *
  * 1. HELLO, window create/show, three BGRA8 shm buffers (shm_open + unlink) attached by SCM_RIGHTS.
  * 2. Pacing: animates a pattern at each requested rate (default 60 and 120 Hz) for a fixed number of
@@ -7,10 +7,15 @@
  *    CAMetalDrawable presentedTime values and submit->presented latency (p50/p95/p99).
  * 3. Protocol checks: synthetic input (DEBUG_INJECT), relative mouse mode, cursor clip, cursor
  *    visibility, fullscreen toggle, title, ping latency.
+ * 4. --render-check: what wsd tells a client and what macOS makes of a window, for the render percent wsd runs with.
  * Single-threaded, bounded loops, ends with "RESULT PASS|FAIL".
  *
  * Usage: wsd_client <socket> [seconds_per_rate<=10] [rates e.g. 60,120] [--no-pointer]
  *   --no-pointer skips the relative-mouse step (it really disassociates the pointer for ~0.3 s).
+ *   or: wsd_client <socket> --render-check <percent> [--fullscreen]
+ *   runs only the render check (run-wsd-render-percent.sh). percent, 1..100, is what wsd must have applied: its
+ *   --render-percent after clamping, 100 without one or with a value that is not an integer. --fullscreen also toggles
+ *   fullscreen, which covers the screen for a moment.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -26,7 +31,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../../src/wsd/wsd_protocol.h"
+#include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
+
+#include "../../wsd/wsd_protocol.h"
 
 #define WIN 1u
 #define NBUF 3
@@ -336,8 +344,151 @@ static void ping_check(void) {
   pct("ping round trip (main-thread server)", rt, 200, NULL);
 }
 
+/* ---- render percent ---- */
+
+static int near_to(double a, double b, double tol) { return fabs(a - b) <= tol; }
+
+/* The bounds in points of the first window of process pid that macOS lists on screen. Window geometry needs no screen
+ * recording permission. */
+static int window_points(pid_t pid, CGRect *out) {
+  CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+                                               kCGNullWindowID);
+  if (!list) return 0;
+  int found = 0;
+  for (CFIndex i = 0; i < CFArrayGetCount(list) && !found; i++) {
+    CFDictionaryRef d = CFArrayGetValueAtIndex(list, i);
+    CFNumberRef owner = CFDictionaryGetValue(d, kCGWindowOwnerPID);
+    CFDictionaryRef b = CFDictionaryGetValue(d, kCGWindowBounds);
+    int p = 0;
+    CGRect r;
+    if (owner && b && CFNumberGetValue(owner, kCFNumberIntType, &p) && p == pid &&
+        CGRectMakeWithDictionaryRepresentation(b, &r) && r.size.width > 1) {
+      *out = r;
+      found = 1;
+    }
+  }
+  CFRelease(list);
+  return found;
+}
+
+/* Waits up to 1.5 s for the window of pid to be listed with the given width in points (+-1 pt); *r has the last bounds. */
+static int window_width_points(pid_t pid, double width, CGRect *r) {
+  uint64_t end = now_ns() + 1500000000ull;
+  while (now_ns() < end) {
+    if (window_points(pid, r) && near_to(r->size.width, width, 1)) return 1;
+    usleep(50000);
+  }
+  return 0;
+}
+
+/* Prints the EV_RESIZE e under `what`, checks its size against the size asked for (within tol pixels) and notes a size
+ * that is not exact. Returns the payload of e. */
+static const struct wsd_ev_resize *check_resize(const struct event *e, const char *what, uint32_t want_w, uint32_t want_h,
+                                                double tol) {
+  const struct wsd_ev_resize *r = (const void *)e->data;
+  printf("%s: %ux%u px scale %.3f (asked %ux%u)\n", what, r->width_px, r->height_px, r->backing_scale_x1000 / 1000.0, want_w,
+         want_h);
+  CHECK(near_to(r->width_px, want_w, tol) && near_to(r->height_px, want_h, tol), "%s gave %ux%u px, asked %ux%u", what,
+        r->width_px, r->height_px, want_w, want_h);
+  if (r->width_px != want_w || r->height_px != want_h)
+    printf("note: %s did not round trip exactly (%ux%u for %ux%u)\n", what, r->width_px, r->height_px, want_w, want_h);
+  return r;
+}
+
+/* wsd runs with --render-percent (or without), `percent` being what it must have applied (1..100). The expected values
+ * come from CoreGraphics and the formula of PROTOCOL.md (Render percent), not from wsd. */
+static void render_check(const struct wsd_hello_reply *hr, int percent, int fullscreen) {
+  struct event e;
+  CGDisplayModeRef mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+  if (!mode) die("no display mode for the main display");
+  double pts_w = (double)CGDisplayModeGetWidth(mode), pts_h = (double)CGDisplayModeGetHeight(mode);
+  double native_w = (double)CGDisplayModeGetPixelWidth(mode), native_h = (double)CGDisplayModeGetPixelHeight(mode);
+  CGDisplayModeRelease(mode);
+  double real = native_w / pts_w;
+  double min_scale = fmax(640.0 / pts_w, 480.0 / pts_h);
+  double eff = percent < 100 ? fmin(real, fmax(real * percent / 100.0, min_scale)) : real;
+  int guarded = percent < 100 && real * percent / 100.0 < min_scale && min_scale < real;
+  printf("render check: percent %d, main display %.0fx%.0f pt = %.0fx%.0f px (scale %.3f), min scale %.3f, effective scale "
+         "%.3f%s\n",
+         percent, pts_w, pts_h, native_w, native_h, real, min_scale, eff, guarded ? " (held by the 640x480 guard)" : "");
+
+  CHECK(hr->backing_scale_x1000 == (uint32_t)lround(eff * 1000), "HELLO scale %u, expected %ld", hr->backing_scale_x1000,
+        lround(eff * 1000));
+  CHECK(near_to(hr->display_width_px, pts_w * eff, 1) && near_to(hr->display_height_px, pts_h * eff, 1),
+        "HELLO display %ux%u px, expected %.0fx%.0f", hr->display_width_px, hr->display_height_px, pts_w * eff,
+        pts_h * eff);
+  if (native_w >= 640 && native_h >= 480)
+    CHECK(hr->display_width_px + 1 >= 640 && hr->display_height_px + 1 >= 480,
+          "HELLO display %ux%u px is smaller than 640x480", hr->display_width_px, hr->display_height_px);
+  CHECK(hr->work_width > 0 && hr->work_width <= hr->display_width_px && hr->work_height > 0 &&
+            hr->work_height <= hr->display_height_px,
+        "HELLO work area %ux%u in a display of %ux%u", hr->work_width, hr->work_height, hr->display_width_px,
+        hr->display_height_px);
+
+  /* A window of win_w x win_h px, then moved and resized with SET_FRAME. Its size in pixels must come back with the
+   * effective scale, and macOS must give it width / eff points. macOS rounds a window to whole points, and a point is
+   * eff pixels, so the size is right within ceil(eff) pixels. Below 1 pixel per point a pixel is more than a point, so
+   * the windows are small enough to fit the screen in points. */
+  double size_tol = ceil(eff);
+  uint32_t win_w = eff < 1 ? 200 : g_w, win_h = eff < 1 ? 150 : g_h;
+  struct wsd_window_create wc = {WIN, win_w, win_h, WSD_STYLE_TITLED | WSD_STYLE_CLOSABLE | WSD_STYLE_RESIZABLE};
+  send_msg(WSD_WINDOW_CREATE, &wc, sizeof(wc), "wsd_client", 10, -1);
+  struct wsd_window_flag show = {WIN, 1};
+  send_msg(WSD_WINDOW_SHOW, &show, sizeof(show), NULL, 0, -1);
+  if (!wait_type(WSD_EV_RESIZE, &e, 2000)) die("no RESIZE after show");
+  const struct wsd_ev_resize *rs = check_resize(&e, "window shown", win_w, win_h, size_tol);
+  CHECK(rs->backing_scale_x1000 == hr->backing_scale_x1000, "RESIZE scale %u, HELLO scale %u", rs->backing_scale_x1000,
+        hr->backing_scale_x1000);
+
+  struct wsd_window_frame fr = {WIN, WSD_FRAME_MOVE | WSD_FRAME_SIZE, 200, 200, 800, 450};
+  if (eff < 1) fr = (struct wsd_window_frame){WIN, WSD_FRAME_MOVE | WSD_FRAME_SIZE, 100, 100, 300, 200};
+  send_msg(WSD_WINDOW_SET_FRAME, &fr, sizeof(fr), NULL, 0, -1);
+  if (!wait_type(WSD_EV_RESIZE, &e, 2000)) die("no RESIZE after SET_FRAME");
+  check_resize(&e, "set frame", fr.width, fr.height, size_tol);
+
+  CGRect b = {{0, 0}, {0, 0}};
+  int listed = window_width_points((pid_t)hr->server_pid, fr.width / eff, &b);
+  printf("window on screen: %.1f pt wide at x %.1f (expected %.1f pt wide at x %.1f)\n", b.size.width, b.origin.x,
+         fr.width / eff, fr.x / eff);
+  CHECK(listed, "macOS lists no window of wsd %.1f pt wide", fr.width / eff);
+  CHECK(near_to(b.origin.x, fr.x / eff, 1), "window at x %.1f pt, expected %.1f", b.origin.x, fr.x / eff);
+
+  if (fullscreen) {
+    struct wsd_window_flag fs = {WIN, 1};
+    send_msg(WSD_WINDOW_FULLSCREEN, &fs, sizeof(fs), NULL, 0, -1);
+    int ok = wait_type(WSD_EV_RESIZE, &e, 1500);
+    CHECK(ok, "no RESIZE after fullscreen");
+    if (ok) check_resize(&e, "fullscreen on", hr->display_width_px, hr->display_height_px, 0);
+    /* Leaving fullscreen is not checked: here (wsd not the active app) it gives the window back the size of the screen's
+     * visible frame instead of its own, as the wsd built before the render percent does. */
+    fs.value = 0;
+    send_msg(WSD_WINDOW_FULLSCREEN, &fs, sizeof(fs), NULL, 0, -1);
+    if (wait_type(WSD_EV_RESIZE, &e, 1500)) {
+      const struct wsd_ev_resize *off = (const void *)e.data;
+      printf("fullscreen off: %ux%u px (not checked)\n", off->width_px, off->height_px);
+    }
+  }
+
+  /* The server handles messages in order: an error for any of them arrives before the PONG. */
+  struct wsd_window wd = {WIN};
+  send_msg(WSD_WINDOW_DESTROY, &wd, sizeof(wd), NULL, 0, -1);
+  struct wsd_ping p = {0, now_ns()};
+  send_msg(WSD_PING, &p, sizeof(p), NULL, 0, -1);
+  CHECK(wait_type(WSD_EV_PONG, &e, 500), "no PONG after WINDOW_DESTROY");
+  CHECK(g_errors == 0, "%d server errors", g_errors);
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) { fprintf(stderr, "usage: %s <socket> [seconds] [rates] [--no-pointer]\n", argv[0]); return 2; }
+  int render_percent = -1, render_fullscreen = 0; /* render_percent: the --render-check value, -1 without the option */
+  for (int i = 2; i < argc; i++) {
+    if (!strcmp(argv[i], "--render-check")) render_percent = i + 1 < argc ? atoi(argv[++i]) : 0;
+    else if (!strcmp(argv[i], "--fullscreen")) render_fullscreen = 1;
+  }
+  if (render_percent >= 0 && (render_percent < 1 || render_percent > 100)) {
+    fprintf(stderr, "usage: %s <socket> --render-check <percent 1..100> [--fullscreen]\n", argv[0]);
+    return 2;
+  }
   setvbuf(stdout, NULL, _IOLBF, 0);
   double seconds = argc > 2 ? atof(argv[2]) : 4.0;
   if (seconds <= 0 || seconds > 10) seconds = 4.0;
@@ -361,6 +512,13 @@ int main(int argc, char **argv) {
   memcpy(&hr, e.data, sizeof(hr));
   printf("hello: version=%u server_pid=%u display=%ux%u px max_refresh=%u Hz scale=%.3f\n", hr.version, hr.server_pid,
          hr.display_width_px, hr.display_height_px, hr.max_refresh_hz, hr.backing_scale_x1000 / 1000.0);
+
+  if (render_percent >= 0) {
+    render_check(&hr, render_percent, render_fullscreen);
+    close(g_sock);
+    printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
+    return g_fail;
+  }
 
   struct wsd_window_create wc = {WIN, g_w, g_h, WSD_STYLE_TITLED | WSD_STYLE_CLOSABLE | WSD_STYLE_RESIZABLE | WSD_STYLE_TOPMOST};
   send_msg(WSD_WINDOW_CREATE, &wc, sizeof(wc), "wsd_client", 10, -1);

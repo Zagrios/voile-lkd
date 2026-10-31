@@ -715,3 +715,20 @@ Rejected:
 Remaining. Without a hardware TSO mode or a low guest base, both of which macOS keeps to Rosetta, each further translator change is worth a few percent. The render server's share between Neptune and D3DMetal is not measured (`sample` gives wrong stacks under Rosetta).
 
 Verification (2026-10-29). THE FINALS in matches on the final engine; witnesses `w02` to `w32` and the arithmetic bench give the same results as before; LKD tests 43 of 44 (`test_fs_glibc` skips without its sysroot). Rocket League, Dead by Daylight and HELLDIVERS 2 were not played on this engine.
+
+## Rocket League: what the game's resolution does in fullscreen, borderless and windowed (2026-10-31)
+
+Context. Obelisk issue #53, a render resolution per game on the Linux engine. Rocket League (Epic, Linux engine, DXMT) on a 14-inch MacBook Pro M5 Max, its Retina panel (3024x1964 pixels, 1512x982 points) the only display.
+
+1. MEASURED: `TASystemSettings.ini` at 2560x1440 fullscreen. Neptune logs `guest swapchain: created 2560x1440`, then `entered fullscreen: window -> 3024x1964 (mode_switch=1, modeset=1)`: the emulated mode switch leaves the monitor rectangle at 3024x1964. wsd's buffers are 2560x1440 and its window fills the screen (`frame=(0,0 1512x982)`), so the picture is stretched. Changing the resolution in game at run time recreates the buffers (3024x1964, then 1280x720).
+2. MEASURED: Borderless and Windowed at 1280x720 give a 1280x720 pixel window, which is 640x360 points (a very small window): wsd reports the screen to the guest in backing pixels, so a game pixel is a Retina pixel.
+3. MEASURED, what the pixels cost: Neptune's wsi fence wait has a median of 3.5 ms (up to 5.2 in 60-frame averages) at 3024x1964, against 1.4 ms at 1280x720 in fullscreen; presents per second, about 220 against about 403. The scenes were not matched: an order of magnitude only.
+
+Conclusion. Exclusive fullscreen needs no help: the swapchain follows the game's resolution and wsd stretches it. What `wsd --render-percent` is for is Borderless, Windowed and the games with no resolution picker, which render the whole Retina size. The option makes wsd convert pixels and points at the effective scale (the screen's backing scale times the percent, from 1 to 100, held up where the desktop would fall under 640x480 pixels), so the guest sees a smaller desktop and macOS stretches the picture.
+
+Guest mode list. voile-wine's `wineobelisk.drv` (`obelisk.c`) and `nptunix` (`npt_display_wsd.c`) skip any extra display mode that exceeds the desktop in either dimension (they used to skip one only when it was at least as large in both), so under a lower percent the guest no longer offers 1600x900 on a 1512x982 desktop. On the Retina panel above the list does not change. On other desktops it changes even without the option: a 1366x768 desktop loses 1280x800, a 1728x1117 one loses 1920x1080.
+
+Verification (2026-10-31, `tests/graphics/run-wsd-render-percent.sh`, wsd built from the working tree, the display above; 16 cases pass, the expected values coming from CoreGraphics and the formula of `wsd/PROTOCOL.md`, not from wsd). A wsd built before the option ignores it and fails the same checks, as expected. Surprising parts:
+- Window sizes come back 1 to 2 px over at fractional scales (641x360 for 640x360 at 75, 642x360 at 99): macOS rounds a window to whole points, and a point is more than 1 pixel there. The harness accepts ceil(scale) pixels.
+- Leaving fullscreen is not checked: with wsd not the active app it gives the window back the size of the screen's visible frame, as before the option.
+- Values 1 to 24 all give the same 739x480 desktop on the 1512x982 point MacBook, because of the 640x480 guard (`max(640/1512, 480/982)` = 0.489).

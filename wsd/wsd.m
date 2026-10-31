@@ -8,7 +8,7 @@
  * Present path: shm fd -> mmap(MAP_SHARED) -> newBufferWithBytesNoCopy -> linear MTLTexture
  * (no CPU pixel copy) -> one render pass per display-link tick into the CAMetalLayer drawable.
  *
- * Usage: wsd --dir <private-dir> [--exit-on-disconnect]
+ * Usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N]
  */
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
@@ -38,6 +38,7 @@ static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
 static id<MTLRenderPipelineState> g_pipe;
 static BOOL g_exit_on_disconnect;
+static int g_render_percent = 100; /* --render-percent, 1 to 100 (PROTOCOL.md, "Render percent") */
 static BOOL g_injecting;       /* set while DEBUG_INJECT feeds synthetic events */
 static BOOL g_relative_global; /* CGAssociateMouseAndMouseCursorPosition(false) in effect */
 static BOOL g_cursor_hide_wanted; /* the client asked for no cursor (WSD_CURSOR_VISIBLE 0) */
@@ -507,9 +508,18 @@ static NSScreen *primary_screen(void) {
   return NSScreen.screens.firstObject ?: NSScreen.mainScreen;
 }
 
+/* The effective scale, in pixels per point: the real backing scale lowered by the render percent, never below what keeps
+ * the desktop at 640x480 pixels and never above the real scale. See PROTOCOL.md, "Render percent". */
 static double backing_scale(NSWindow *w) {
-  double s = w ? w.backingScaleFactor : primary_screen().backingScaleFactor;
-  return s > 0 ? s : 1.0;
+  NSScreen *primary = (!w || g_render_percent < 100) ? primary_screen() : nil;
+  double s = w ? w.backingScaleFactor : primary.backingScaleFactor;
+  s = s > 0 ? s : 1.0;
+  if (g_render_percent < 100) {
+    NSSize pt = primary.frame.size;
+    double min_scale = MAX(640.0 / pt.width, 480.0 / pt.height);
+    s = MIN(s, MAX(s * g_render_percent / 100.0, min_scale));
+  }
+  return s;
 }
 
 /* What HELLO and EV_DISPLAY give a client: the screen with the menu bar in pixels, and its work area. */
@@ -1004,8 +1014,8 @@ static CAMetalLayer *make_metal_layer(void) {
   [cb commit];
 }
 
-/* Moves and/or resizes the content area. Pixels are converted with the backing scale; y counts down from the top of
- * the main screen (Cocoa counts up from its bottom). One EV_RESIZE follows a size change. */
+/* Moves and/or resizes the content area. Pixels are converted with the effective scale (backing_scale()); y counts
+ * down from the top of the main screen (Cocoa counts up from its bottom). One EV_RESIZE follows a size change. */
 - (void)setFramePx:(const struct wsd_window_frame *)f {
   NSWindow *w = self.window;
   double s = backing_scale(w);
@@ -1339,7 +1349,7 @@ static CAMetalLayer *make_metal_layer(void) {
   });
 }
 /* A cursor image (SetCursor with a cursor that is not one of the Mac's): pixels are the game's, which the screen
- * shows at the backing scale. At most 64 per client. */
+ * shows at the effective scale (backing_scale()). At most 64 per client. */
 - (void)defineCursor:(const struct wsd_cursor_define *)c {
   if (!self.fdQueue.count) { [self error:WSD_CURSOR_DEFINE code:-EBADF]; return; }
   int fd = self.fdQueue.firstObject.intValue;
@@ -2127,15 +2137,32 @@ static void accept_one(int ls) {
   LOG("client pid %d uid %d accepted", pid, (int)uid);
 }
 
+/* --render-percent N: a whole number kept between 1 and 100; anything not made of digits only is ignored (100). */
+static int parse_render_percent(const char *arg) {
+  char *end = NULL;
+  long v = strtol(arg, &end, 10);
+  if (*arg < '0' || *arg > '9' || *end) {
+    LOG("--render-percent \"%s\" is not an integer, ignored", arg);
+    return 100;
+  }
+  return (int)MIN(MAX(v, 1L), 100L);
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
-    const char *dir = NULL;
+    const char *dir = NULL, *render_percent = NULL;
     for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--dir") && i + 1 < argc) dir = argv[++i];
       else if (!strcmp(argv[i], "--exit-on-disconnect")) g_exit_on_disconnect = YES;
+      else if (!strcmp(argv[i], "--render-percent")) /* a following option is not its value */
+        render_percent = i + 1 < argc && strncmp(argv[i + 1], "--", 2) ? argv[++i] : "(no value)";
     }
-    if (!dir) { fprintf(stderr, "usage: wsd --dir <private-dir> [--exit-on-disconnect]\n"); return 2; }
+    if (!dir) {
+      fprintf(stderr, "usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N]\n");
+      return 2;
+    }
     setvbuf(stderr, NULL, _IOLBF, 0);
+    if (render_percent) g_render_percent = parse_render_percent(render_percent);
     g_probe_enabled = getenv("WSD_LATENCY_PROBE") != NULL;
 
     g_dev = MTLCreateSystemDefaultDevice();
@@ -2222,6 +2249,10 @@ int main(int argc, char **argv) {
 
     LOG("listening on %s (pid %d, device %s, max %ld Hz)", path, getpid(), g_dev.name.UTF8String,
         (long)primary_screen().maximumFramesPerSecond);
+    struct wsd_hello_reply shown = display_info();
+    LOG("render percent: requested %s, applied %d; the screen's scale %.3f reaches the clients as %.3f (desktop %ux%u px)",
+        render_percent ?: "none", g_render_percent, primary_screen().backingScaleFactor, backing_scale(nil),
+        shown.display_width_px, shown.display_height_px);
     [NSApp run];
   }
   return 0;

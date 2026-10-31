@@ -101,10 +101,10 @@ enum { WSD_KEY_DOWN = 1u << 0, WSD_KEY_REPEAT = 1u << 1, WSD_KEY_ISO = 1u << 2, 
 struct wsd_hello { uint32_t version, client_pid; };
 struct wsd_hello_reply {
   uint32_t version, server_pid;
-  uint32_t display_width_px, display_height_px; /* main screen, backing pixels */
+  uint32_t display_width_px, display_height_px; /* main screen, pixels at the effective scale */
   uint32_t max_refresh_hz;                      /* NSScreen.maximumFramesPerSecond */
-  uint32_t backing_scale_x1000;
-  int32_t work_x, work_y;                       /* main screen without the menu bar and the Dock, backing pixels, */
+  uint32_t backing_scale_x1000;                 /* the effective scale, see PROTOCOL.md (Render percent) */
+  int32_t work_x, work_y;                       /* main screen without the menu bar and the Dock, same pixels, */
   uint32_t work_width, work_height;             /* origin top-left of the main screen (0x0 from older servers) */
 };
 struct wsd_window_create {
@@ -227,6 +227,7 @@ struct wsd_ev_button {
 struct wsd_ev_motion { uint32_t window_id; uint32_t flags; float x, y; uint64_t time_ns; };
 struct wsd_ev_relative { uint32_t window_id; uint32_t flags; float dx, dy; uint64_t time_ns; };
 struct wsd_ev_wheel { uint32_t window_id; uint32_t precise; float dx, dy; uint64_t time_ns; };
+/* backing_scale_x1000: the effective scale, see PROTOCOL.md (Render percent) */
 struct wsd_ev_resize { uint32_t window_id; uint32_t width_px, height_px; uint32_t backing_scale_x1000; };
 struct wsd_ev_presented {
   uint32_t window_id, buffer_id;

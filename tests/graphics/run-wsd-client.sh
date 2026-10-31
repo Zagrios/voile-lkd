@@ -2,13 +2,14 @@
 # Start wsd on a private 0700 directory, run a client against it, stop wsd. All under timeouts.
 # Usage: run-wsd-client.sh <client-binary> [client args...]
 # The socket path replaces an argument spelled @SOCK@; without one it is passed as the first argument.
+# WSD_ARGS, if set, holds more arguments for wsd (split on spaces), e.g. WSD_ARGS="--render-percent 50".
 set -u
 W=$(cd "$(dirname "$0")" && pwd)
 EXP=$(cd "$W/../.." && pwd)
-TO="$EXP/src/fexdarwin/scripts/run-with-timeout.sh"
+TO="$EXP/fexdarwin/scripts/run-with-timeout.sh"
 D=$(mktemp -d "${TMPDIR:-/tmp}/wsd.XXXXXX")
 echo "dir=$D mode=$(stat -f %Lp "$D") socket_len=$(printf %s "$D/wsd.sock" | wc -c | tr -d ' ')"
-"$TO" 90 "$EXP/src/wsd/bin/wsd" --dir "$D" --exit-on-disconnect > "$D/wsd.log" 2>&1 &
+"$TO" 90 "$EXP/wsd/bin/wsd" --dir "$D" --exit-on-disconnect ${WSD_ARGS:-} > "$D/wsd.log" 2>&1 &
 SPID=$!
 i=0; while [ ! -S "$D/wsd.sock" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
 echo "socket mode=$(stat -f %Lp "$D/wsd.sock")"
