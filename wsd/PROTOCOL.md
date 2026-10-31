@@ -57,6 +57,7 @@ rules that the header cannot express.
 | 32 | WINDOW_FOCUS | `wsd_window` | the client activated the window: it comes in front as the key window. While another app is active it becomes key once the server is active again; the server activates itself this way only before it was ever active (a game's start). Ignored for a `NOACTIVATE` window |
 | 33 | SCREEN_SAVER | `wsd_window_flag` (window ignored) | 0: the display does not sleep on its own (`PreventUserIdleDisplaySleep`) until 1 or the client leaves |
 | 34 | AUDIO_OPEN_INPUT | `wsd_audio_open` + 1 fd | like the audio output open (type 20, see `wsd_protocol.h`), for the default microphone: wsd fills the shared ring, the client reads it and publishes `read_frames`. The frames arrive in the open request's rate, channels and sample format (CoreAudio converts them). START, STOP and CLOSE as for output; RESET is refused with `-EINVAL`, the client resets the ring itself. macOS asks the user for microphone access when the first stream starts |
+| 35 | SET_DISPLAY_MODE | `wsd_display_mode` | the client's game switched the display to width x height pixels (`ChangeDisplaySettings`, a Direct3D mode switch): the screen the clients see takes that size, as under a lower render percent (see Display mode). A side of the native screen or more is not lowered, 0x0 gives the native screen back; so does the client that asked going away. Every client hears `EV_DISPLAY` when the screen changes, and the one that asked always hears it, even when nothing changed. A server from before it answers `EV_ERROR` `-ENOSYS` |
 | 18 | PRESENT_REGION | `wsd_present_region` | like PRESENT, but into an overlay plane (a `CAMetalLayer` sublayer) placed at x,y width x height window pixels; used for a D3D swapchain in the client area while the base plane keeps the GDI surface (frame, title). 0x0 removes the plane. `EV_PRESENTED`/`EV_RELEASE` as for PRESENT |
 | 17 | WINDOW_SET_FRAME | `wsd_window_frame` | moves (`WSD_FRAME_MOVE`: content top-left at x,y screen pixels, origin top-left of the screen with the menu bar) and/or resizes (`WSD_FRAME_SIZE`: content width x height pixels, 1..16384). A size change sends exactly one `EV_RESIZE`. When AppKit places the window elsewhere (a title bar is kept below the menu bar and on screen), an `EV_FRAME` gives the frame it got. Rejected with `-EINVAL` while fullscreen |
 
@@ -64,7 +65,7 @@ rules that the header cannot express.
 
 | type | name | payload |
 | --- | --- | --- |
-| 101 | EV_HELLO | `wsd_hello_reply` |
+| 101 | EV_HELLO | `wsd_hello_reply`; `native_width_px` x `native_height_px` is the screen without a game's display mode (the render percent still applies), zero from older servers |
 | 102 | EV_KEY | `wsd_ev_key` + UTF-8 `NSEvent.characters` (empty for modifiers). `mac_keycode` is the `kVK_*` virtual keycode; modifier keys arrive through `flagsChanged` with `WSD_KEY_DOWN` computed from the modifier bit, except Caps Lock, a toggle: a press and a release for each change, and one more pair when a window becomes key if it changed meanwhile. `WSD_KEY_ISO`: the key comes from an ISO keyboard, where `kVK_ISO_Section` and `kVK_ANSI_Grave` swap places. No IME/text-input composition yet |
 | 103 | EV_BUTTON | `wsd_ev_button`: 0 left, 1 right, 2+ `buttonNumber`; position in window pixels, top-left origin |
 | 104 | EV_MOTION | `wsd_ev_motion` absolute, window pixels; bit 0 = clamped by the clip rectangle |
@@ -80,7 +81,7 @@ rules that the header cannot express.
 | 114 | EV_FRAME | `wsd_window_frame` (MOVE and SIZE set): the user moved or resized the window, or AppKit placed it (content, screen pixels). Not sent for WINDOW_SET_FRAME that lands where asked, nor while fullscreen or in the Dock |
 | 115 | EV_MINIMIZE | `wsd_window_flag`: 1 the window went into the Dock, 0 it came back (also after WINDOW_MINIMIZE: the client ignores a state it already has) |
 | 116 | EV_ZOOM | `wsd_window`: the zoom (green) button; the client maximizes or restores and sets the frame itself |
-| 117 | EV_DISPLAY | `wsd_hello_reply`: the screen with the menu bar changed size, scale or refresh rate (not sent for its work area alone) |
+| 117 | EV_DISPLAY | `wsd_hello_reply`: the screen with the menu bar changed size, scale or refresh rate, or a client set a display mode (not sent for its work area alone) |
 | 118 | EV_APP_DEACTIVATED | no payload: another app became the active one (Cmd-Tab, a click elsewhere, a link opened in the browser); the client puts the game in the background |
 
 All times are `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` nanoseconds, the same timebase as
@@ -114,6 +115,24 @@ renders those pixels, and macOS stretches the picture to the screen; 25 gives 0.
 windowed games come out larger; this suits borderless and fullscreen windows. On a 1x screen the percent lowers the
 scale below 1 in the same way. The option has no protocol message: a server from before it ignores the flag and keeps
 the backing scale.
+
+## Display mode
+
+A game that switches the display to a smaller mode draws in the pixels of that mode and reads the pointer in them, as on
+Windows. wsd has no mode to switch, so the client tells it the size (`SET_DISPLAY_MODE`) and wsd lowers the effective
+scale the way a render percent does, on each axis: `min(scale, max(width / screen_width_in_points, 640 / screen_width_in_points))`
+for x and the same with the height and 480 for y, where `scale` is the one the render percent gave. The reported screen
+then has exactly the size of the mode, whatever its aspect ratio, and never less than 640x480; a side of the native
+screen or more is not lowered. Every pixel quantity on the wire, the pointer included, is in those pixels, and the
+fullscreen window, which keeps covering the screen in points, is stretched by macOS (a 4:3 mode on a 16:9 screen is
+stretched, not pillarboxed). With two different scales, `backing_scale_x1000` (`EV_HELLO`, `EV_DISPLAY`, `EV_RESIZE`)
+is the one of the x axis. The native size (`native_width_px`, `native_height_px` in `EV_HELLO` and `EV_DISPLAY`) is
+what the mode list is made from: a game that switched to 1280x720 can switch back.
+
+The mode belongs to the client that set it: it ends with the connection, or with a mode of the native size or more
+(the restore a Wine process makes when it ends), or 0x0. A window that is not fullscreen keeps its size and place in
+pixels when the scale changes (it takes other points); the client hears `EV_RESIZE` for fullscreen windows, whose
+points do not change, as the scale changes.
 
 ## Levels
 

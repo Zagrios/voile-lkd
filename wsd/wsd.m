@@ -38,7 +38,10 @@ static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
 static id<MTLRenderPipelineState> g_pipe;
 static BOOL g_exit_on_disconnect;
+typedef struct { double x, y; } WsdScale; /* pixels per point on each axis, see scale_at() */
 static int g_render_percent = 100; /* --render-percent, 1 to 100 (PROTOCOL.md, "Render percent") */
+static uint32_t g_mode_width_px, g_mode_height_px; /* SET_DISPLAY_MODE: the size a game switched the display to, 0: that side is not lowered */
+static __weak id g_mode_owner;          /* the client that set it, which takes it back when it goes (a WsdClient) */
 static BOOL g_injecting;       /* set while DEBUG_INJECT feeds synthetic events */
 static BOOL g_relative_global; /* CGAssociateMouseAndMouseCursorPosition(false) in effect */
 static BOOL g_cursor_hide_wanted; /* the client asked for no cursor (WSD_CURSOR_VISIBLE 0) */
@@ -213,7 +216,8 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 - (BOOL)floatsForActive:(BOOL)active;
 - (void)orderInFront:(BOOL)activate;
 - (void)syncCapsLock:(BOOL)on;
-- (void)fitScreen;
+- (void)fitScreen:(BOOL)rescaled;
+- (void)keepPixelsFromScale:(WsdScale)old;
 @end
 
 static __weak WsdWindow *g_focus_wanted; /* WINDOW_FOCUS while wsd was not active: made key once it is */
@@ -451,6 +455,7 @@ static dispatch_queue_t g_audio_queue;
 - (void)send:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
 - (void)close;
 @end
+static void set_display_mode(WsdClient *client, uint32_t width, uint32_t height);
 
 /* The cursor is hidden while the client asks for it, unless one of its windows stopped showing frames. */
 static void sync_cursor(void) {
@@ -508,30 +513,44 @@ static NSScreen *primary_screen(void) {
   return NSScreen.screens.firstObject ?: NSScreen.mainScreen;
 }
 
-/* The effective scale, in pixels per point: the real backing scale lowered by the render percent, never below what keeps
- * the desktop at 640x480 pixels and never above the real scale. See PROTOCOL.md, "Render percent". */
-static double backing_scale(NSWindow *w) {
-  NSScreen *primary = (!w || g_render_percent < 100) ? primary_screen() : nil;
+/* The effective scale, in pixels per point on each axis: the real backing scale lowered by the render percent, then
+ * by the display mode a game chose (SET_DISPLAY_MODE) so that the desktop has the size of that mode, whatever its
+ * aspect ratio (the picture is stretched to the screen). Never below what keeps the desktop at 640x480 pixels, never
+ * above the real scale; the two axes differ only under a display mode. See PROTOCOL.md, "Render percent" and "Display
+ * mode". with_mode NO leaves the game's mode out: the native screen as the render percent shows it. */
+static WsdScale scale_at(NSWindow *w, BOOL with_mode) {
+  BOOL moded = with_mode && (g_mode_width_px || g_mode_height_px);
+  BOOL lowered = g_render_percent < 100 || moded;
+  NSScreen *primary = (!w || lowered) ? primary_screen() : nil;
   double s = w ? w.backingScaleFactor : primary.backingScaleFactor;
   s = s > 0 ? s : 1.0;
-  if (g_render_percent < 100) {
+  WsdScale r = {s, s};
+  if (lowered) {
     NSSize pt = primary.frame.size;
-    double min_scale = MAX(640.0 / pt.width, 480.0 / pt.height);
-    s = MIN(s, MAX(s * g_render_percent / 100.0, min_scale));
+    if (g_render_percent < 100) {
+      double min_scale = MAX(640.0 / pt.width, 480.0 / pt.height);
+      r.x = r.y = MIN(s, MAX(s * g_render_percent / 100.0, min_scale));
+    }
+    if (g_mode_width_px && moded) r.x = MIN(r.x, MAX(g_mode_width_px / pt.width, 640.0 / pt.width));
+    if (g_mode_height_px && moded) r.y = MIN(r.y, MAX(g_mode_height_px / pt.height, 480.0 / pt.height));
   }
-  return s;
+  return r;
 }
+static WsdScale backing_scale_xy(NSWindow *w) { return scale_at(w, YES); }
+/* For what has no axes: the scale of a cursor image, a layer. */
+static double backing_scale(NSWindow *w) { return scale_at(w, YES).x; }
 
 /* What HELLO and EV_DISPLAY give a client: the screen with the menu bar in pixels, and its work area. */
 static struct wsd_hello_reply display_info(void) {
   NSScreen *sc = primary_screen();
-  double s = backing_scale(nil);
+  WsdScale s = backing_scale_xy(nil), n = scale_at(nil, NO);
   NSRect vf = sc.visibleFrame; /* without the menu bar and the Dock */
-  struct wsd_hello_reply r = {WSD_PROTOCOL_VERSION, getpid(), (uint32_t)lround(sc.frame.size.width * s),
-                              (uint32_t)lround(sc.frame.size.height * s), (uint32_t)sc.maximumFramesPerSecond,
-                              (uint32_t)lround(s * 1000), (int32_t)lround((vf.origin.x - sc.frame.origin.x) * s),
-                              (int32_t)lround((NSMaxY(sc.frame) - NSMaxY(vf)) * s),
-                              (uint32_t)lround(vf.size.width * s), (uint32_t)lround(vf.size.height * s)};
+  struct wsd_hello_reply r = {WSD_PROTOCOL_VERSION, getpid(), (uint32_t)lround(sc.frame.size.width * s.x),
+                              (uint32_t)lround(sc.frame.size.height * s.y), (uint32_t)sc.maximumFramesPerSecond,
+                              (uint32_t)lround(s.x * 1000), (int32_t)lround((vf.origin.x - sc.frame.origin.x) * s.x),
+                              (int32_t)lround((NSMaxY(sc.frame) - NSMaxY(vf)) * s.y),
+                              (uint32_t)lround(vf.size.width * s.x), (uint32_t)lround(vf.size.height * s.y),
+                              (uint32_t)lround(sc.frame.size.width * n.x), (uint32_t)lround(sc.frame.size.height * n.y)};
   return r;
 }
 static struct wsd_hello_reply g_display; /* the screen the clients were last told of */
@@ -612,9 +631,9 @@ static CAMetalLayer *make_metal_layer(void) {
 - (uint64_t)evNs:(NSEvent *)e { return (uint64_t)(e.timestamp * 1e9); }
 - (void)pixelPoint:(NSEvent *)e x:(float *)x y:(float *)y {
   NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-  double s = backing_scale(self.window);
-  *x = (float)(p.x * s);
-  *y = (float)((self.bounds.size.height - p.y) * s);
+  WsdScale s = backing_scale_xy(self.window);
+  *x = (float)(p.x * s.x);
+  *y = (float)((self.bounds.size.height - p.y) * s.y);
 }
 /* WSD_KEY_ISO for a key of an ISO keyboard. The type comes with each key event: a MacBook's keyboard and an external
  * one may differ. */
@@ -683,8 +702,8 @@ static CAMetalLayer *make_metal_layer(void) {
       m.flags |= 1; /* clamped */
       if (!g_injecting && !w.stalled) {
         /* Real pointer left the clip rect: warp it back (global, top-left display coordinates). */
-        double s = backing_scale(self.window);
-        NSPoint vp = NSMakePoint(cx / s, self.bounds.size.height - cy / s);
+        WsdScale s = backing_scale_xy(self.window);
+        NSPoint vp = NSMakePoint(cx / s.x, self.bounds.size.height - cy / s.y);
         NSPoint sp = [self.window convertPointToScreen:[self convertPoint:vp toView:nil]];
         CGFloat top = primary_screen().frame.size.height;
         CGWarpMouseCursorPosition(CGPointMake(sp.x, top - sp.y));
@@ -716,9 +735,9 @@ static CAMetalLayer *make_metal_layer(void) {
 }
 - (void)sendResize {
   NSSize sz = self.view.bounds.size;
-  double s = backing_scale(self.window);
-  struct wsd_ev_resize r = {self.windowId, (uint32_t)lround(sz.width * s), (uint32_t)lround(sz.height * s),
-                            (uint32_t)lround(s * 1000)};
+  WsdScale s = backing_scale_xy(self.window);
+  struct wsd_ev_resize r = {self.windowId, (uint32_t)lround(sz.width * s.x), (uint32_t)lround(sz.height * s.y),
+                            (uint32_t)lround(s.x * 1000)};
   [self sendEvent:WSD_EV_RESIZE payload:&r len:sizeof(r) extra:nil];
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender {
@@ -833,12 +852,12 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)sendFrame {
   if (self.transitioning || self.fullscreen || self.window.miniaturized) return;
   NSWindow *w = self.window;
-  double s = backing_scale(w);
+  WsdScale s = backing_scale_xy(w);
   NSRect content = [w contentRectForFrameRect:w.frame];
   double top = NSMaxY(primary_screen().frame);
-  struct wsd_window_frame f = {self.windowId, WSD_FRAME_MOVE | WSD_FRAME_SIZE, (int32_t)lround(content.origin.x * s),
-                               (int32_t)lround((top - NSMaxY(content)) * s), (uint32_t)lround(content.size.width * s),
-                               (uint32_t)lround(content.size.height * s)};
+  struct wsd_window_frame f = {self.windowId, WSD_FRAME_MOVE | WSD_FRAME_SIZE, (int32_t)lround(content.origin.x * s.x),
+                               (int32_t)lround((top - NSMaxY(content)) * s.y), (uint32_t)lround(content.size.width * s.x),
+                               (uint32_t)lround(content.size.height * s.y)};
   [self sendEvent:WSD_EV_FRAME payload:&f len:sizeof(f) extra:nil];
 }
 - (void)windowDidMove:(NSNotification *)n {
@@ -1018,12 +1037,12 @@ static CAMetalLayer *make_metal_layer(void) {
  * down from the top of the main screen (Cocoa counts up from its bottom). One EV_RESIZE follows a size change. */
 - (void)setFramePx:(const struct wsd_window_frame *)f {
   NSWindow *w = self.window;
-  double s = backing_scale(w);
+  WsdScale s = backing_scale_xy(w);
   NSRect content = [w contentRectForFrameRect:w.frame];
-  if (f->flags & WSD_FRAME_SIZE) content.size = NSMakeSize(f->width / s, f->height / s);
+  if (f->flags & WSD_FRAME_SIZE) content.size = NSMakeSize(f->width / s.x, f->height / s.y);
   if (f->flags & WSD_FRAME_MOVE) {
     double top = NSMaxY(primary_screen().frame);
-    content.origin = NSMakePoint(f->x / s, top - f->y / s - content.size.height);
+    content.origin = NSMakePoint(f->x / s.x, top - f->y / s.y - content.size.height);
   } else {
     content.origin.y += [w contentRectForFrameRect:w.frame].size.height - content.size.height; /* keep the top edge */
   }
@@ -1059,14 +1078,31 @@ static CAMetalLayer *make_metal_layer(void) {
   return self.topmost && (active || !self.fullscreen);
 }
 
-/* A fullscreen window keeps covering its screen when that screen changes (resolution, scale). */
-- (void)fitScreen {
+/* A fullscreen window keeps covering its screen when that screen changes (resolution, scale). The client hears of the
+ * size in pixels when the frame moved, or when the scale did (rescaled): the same points are other pixels then. */
+- (void)fitScreen:(BOOL)rescaled {
   NSRect want = (self.window.screen ?: primary_screen()).frame;
-  if (!self.fullscreen || NSEqualRects(self.window.frame, want)) return;
-  self.transitioning = YES;
-  [self.window setFrame:want display:YES];
-  self.transitioning = NO;
-  [self sendResize];
+  if (!self.fullscreen) return;
+  BOOL moved = !NSEqualRects(self.window.frame, want);
+  if (moved) {
+    self.transitioning = YES;
+    [self.window setFrame:want display:YES];
+    self.transitioning = NO;
+  }
+  if (moved || rescaled) [self sendResize];
+}
+
+/* The scale changed from old to the effective one (a game's display mode): a window that is not fullscreen keeps its
+ * size and place in pixels, which are the client's, and takes other points. */
+- (void)keepPixelsFromScale:(WsdScale)old {
+  if (self.fullscreen || self.window.miniaturized) return;
+  NSWindow *w = self.window;
+  NSRect content = [w contentRectForFrameRect:w.frame];
+  double top = NSMaxY(primary_screen().frame);
+  struct wsd_window_frame f = {self.windowId, WSD_FRAME_MOVE | WSD_FRAME_SIZE, (int32_t)lround(content.origin.x * old.x),
+                               (int32_t)lround((top - NSMaxY(content)) * old.y), (uint32_t)lround(content.size.width * old.x),
+                               (uint32_t)lround(content.size.height * old.y)};
+  [self setFramePx:&f];
 }
 
 - (void)setFullscreenMode:(BOOL)on {
@@ -1109,7 +1145,7 @@ static CAMetalLayer *make_metal_layer(void) {
 /* Places the overlay plane at a rectangle of the content view given in pixels (top-left origin). */
 - (WsdWindow *)overlayAt:(NSRect)px {
   WsdWindow *o = self.overlay;
-  double s = backing_scale(self.window);
+  WsdScale s = backing_scale_xy(self.window);
   BOOL created = NO;
   if (!o) {
     created = YES;
@@ -1120,7 +1156,7 @@ static CAMetalLayer *make_metal_layer(void) {
     o.client = self.client;
     o.window = self.window;
     o.layer = make_metal_layer();
-    o.layer.contentsScale = s;
+    o.layer.contentsScale = s.x;
     [self.view.layer addSublayer:o.layer];
     self.overlay = o;
     LOG("window %u: overlay plane created", self.windowId);
@@ -1131,8 +1167,8 @@ static CAMetalLayer *make_metal_layer(void) {
     NSSize vs = self.view.bounds.size;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    o.layer.frame = CGRectMake(px.origin.x / s, vs.height - (px.origin.y + px.size.height) / s, px.size.width / s,
-                               px.size.height / s);
+    o.layer.frame = CGRectMake(px.origin.x / s.x, vs.height - (px.origin.y + px.size.height) / s.y, px.size.width / s.x,
+                               px.size.height / s.y);
     [CATransaction commit];
     self.overlayPx = px;
     LOG("window %u: overlay at px (%.0f,%.0f %.0fx%.0f)", self.windowId, px.origin.x, px.origin.y, px.size.width, px.size.height);
@@ -1233,6 +1269,7 @@ static CAMetalLayer *make_metal_layer(void) {
   close(self.fd);
   LOG("client %d disconnected", self.pid);
   [g_clients removeObject:self];
+  if (g_mode_owner == self) set_display_mode(nil, 0, 0); /* the game that switched the display is gone */
   if (g_terminate_pending && g_clients.count == 0) {
     g_terminate_pending = NO;
     LOG("the game is gone, the logout, restart or shutdown goes on");
@@ -1257,8 +1294,8 @@ static CAMetalLayer *make_metal_layer(void) {
     return;
   }
   NSWindowStyleMask style = style_mask(c->style);
-  double s = backing_scale(nil);
-  NSRect r = NSMakeRect(120, 120, c->width_px / s, c->height_px / s);
+  WsdScale s = backing_scale_xy(nil);
+  NSRect r = NSMakeRect(120, 120, c->width_px / s.x, c->height_px / s.y);
   WsdWindow *w = [WsdWindow new];
   w.windowId = c->window_id;
   w.client = self;
@@ -1461,10 +1498,10 @@ static CAMetalLayer *make_metal_layer(void) {
 
 - (void)debugInject:(WsdWindow *)w scenario:(uint32_t)sc {
   NSWindow *nw = w.window;
-  double s = backing_scale(nw);
+  WsdScale s = backing_scale_xy(nw);
   NSInteger wn = nw.windowNumber;
   NSTimeInterval t = NSProcessInfo.processInfo.systemUptime;
-  NSPoint p = NSMakePoint(10 / s, w.view.bounds.size.height - 20 / s); /* pixel (10,20) */
+  NSPoint p = NSMakePoint(10 / s.x, w.view.bounds.size.height - 20 / s.y); /* pixel (10,20) */
   g_injecting = YES;
   if (sc == 1) {
     NSEvent *kd = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:t
@@ -1726,8 +1763,8 @@ static CAMetalLayer *make_metal_layer(void) {
                  charactersIgnoringModifiers:@"" isARepeat:NO keyCode:(unsigned short)m->a];
       [nw sendEvent:e];
     } else if (m->kind == 2) {
-      double sc = backing_scale(nw);
-      NSPoint p = NSMakePoint(m->a / sc, best.view.bounds.size.height - m->b / sc);
+      WsdScale sc = backing_scale_xy(nw);
+      NSPoint p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
       for (int i = 0; i < 2; i++) {
         NSEvent *e = [NSEvent mouseEventWithType:i ? NSEventTypeLeftMouseUp : NSEventTypeLeftMouseDown location:p
                                    modifierFlags:0 timestamp:t windowNumber:nw.windowNumber context:nil
@@ -1832,6 +1869,14 @@ static CAMetalLayer *make_metal_layer(void) {
     if (![NSWorkspace.sharedWorkspace openURL:url]) [self error:type code:-EIO];
     break;
   }
+  case WSD_SET_DISPLAY_MODE: {
+    NEED(wsd_display_mode);
+    /* ChangeDisplaySettings of a game: wsd has no display mode to switch, it lowers the scale it converts between pixels
+     * and points with, as --render-percent does, so the picture the game renders at that size is stretched to the
+     * screen and the pointer comes back in the pixels of that size. See PROTOCOL.md, "Display mode". */
+    set_display_mode(self, m->width_px, m->height_px);
+    break;
+  }
   case WSD_CURSOR_WARP: {
     NEED(wsd_cursor_pos);
     /* SetCursorPos, only while wsd is the active app (a game behind another app must not move the user's pointer) and
@@ -1839,9 +1884,9 @@ static CAMetalLayer *make_metal_layer(void) {
      * (-[WineApplicationController setCursorPosition:]), without the 0.25 s after a warp during which macOS keeps the
      * pointer still, then the mouse moves already queued are dropped (-motion:). */
     if (!NSApp.active || g_relative_global) break;
-    double s = backing_scale(nil);
+    WsdScale s = backing_scale_xy(nil);
     CGSetLocalEventsSuppressionInterval(0);
-    CGError e = CGWarpMouseCursorPosition(CGPointMake(m->x / s, m->y / s));
+    CGError e = CGWarpMouseCursorPosition(CGPointMake(m->x / s.x, m->y / s.y));
     CGSetLocalEventsSuppressionInterval(0.25);
     if (e != kCGErrorSuccess) { [self error:type code:-EIO]; break; }
     g_warp_time = NSProcessInfo.processInfo.systemUptime;
@@ -1948,17 +1993,48 @@ static CAMetalLayer *make_metal_layer(void) {
  * new frame and the clients hear of it (EV_DISPLAY), as Wine's Mac driver tells Wine
  * (-applicationDidChangeScreenParameters:). A work area alone (the Dock shown or hidden) is not news: the client
  * gives the game the whole screen. */
-static void screens_changed(void) {
-  for (WsdClient *c in g_clients)
-    for (WsdWindow *w in c.windows.allValues) [w fitScreen];
+static BOOL screens_changed(void) {
   struct wsd_hello_reply r = display_info();
+  BOOL rescaled = r.backing_scale_x1000 != g_display.backing_scale_x1000 ||
+                  r.display_width_px != g_display.display_width_px || r.display_height_px != g_display.display_height_px;
+  for (WsdClient *c in g_clients)
+    for (WsdWindow *w in c.windows.allValues) [w fitScreen:rescaled];
   if (r.display_width_px == g_display.display_width_px && r.display_height_px == g_display.display_height_px &&
-      r.max_refresh_hz == g_display.max_refresh_hz && r.backing_scale_x1000 == g_display.backing_scale_x1000)
-    return;
+      r.max_refresh_hz == g_display.max_refresh_hz && r.backing_scale_x1000 == g_display.backing_scale_x1000 &&
+      r.native_width_px == g_display.native_width_px && r.native_height_px == g_display.native_height_px)
+    return NO;
   g_display = r;
-  LOG("main screen now %ux%u px at %u Hz, scale %.2f", r.display_width_px, r.display_height_px, r.max_refresh_hz,
-      r.backing_scale_x1000 / 1000.0);
+  LOG("main screen now %ux%u px at %u Hz, scale %.2f (native %ux%u)", r.display_width_px, r.display_height_px,
+      r.max_refresh_hz, r.backing_scale_x1000 / 1000.0, r.native_width_px, r.native_height_px);
   for (WsdClient *c in g_clients) [c send:WSD_EV_DISPLAY payload:&r len:sizeof(r) extra:nil];
+  return YES;
+}
+
+/* SET_DISPLAY_MODE, or its owner going away (client nil, 0x0): the screen the clients see takes the size a game
+ * chose, whatever its aspect ratio, or goes back to the native one. A side of the native screen or more is not lowered.
+ * The client that asked always hears the screen as it is now (EV_DISPLAY), even when nothing changed: the driver
+ * waits for it. */
+static void set_display_mode(WsdClient *client, uint32_t width, uint32_t height) {
+  WsdScale base = scale_at(nil, NO);
+  NSSize pt = primary_screen().frame.size;
+  uint32_t native_w = (uint32_t)lround(pt.width * base.x), native_h = (uint32_t)lround(pt.height * base.y);
+  uint32_t want_w = width && width < native_w ? width : 0, want_h = height && height < native_h ? height : 0;
+  WsdScale old = backing_scale_xy(nil);
+  if (want_w != g_mode_width_px || want_h != g_mode_height_px) {
+    LOG("display mode %ux%u: %s", width, height,
+        want_w || want_h ? "the clients see that size" : "back to the native screen");
+    g_mode_width_px = want_w;
+    g_mode_height_px = want_h;
+  }
+  g_mode_owner = want_w || want_h ? client : nil;
+  WsdScale now = backing_scale_xy(nil);
+  if (fabs(now.x - old.x) > 1e-9 || fabs(now.y - old.y) > 1e-9)
+    for (WsdClient *c in g_clients)
+      for (WsdWindow *w in c.windows.allValues) [w keepPixelsFromScale:old];
+  if (!screens_changed() && client && !client.dead) {
+    struct wsd_hello_reply r = display_info();
+    [client send:WSD_EV_DISPLAY payload:&r len:sizeof(r) extra:nil];
+  }
 }
 
 /* Back in wsd (Cmd-Tab, the Dock) with none of its windows visible: the largest of those in the Dock or minimized out

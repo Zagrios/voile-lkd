@@ -57,6 +57,7 @@ enum {
   WSD_WINDOW_FOCUS = 32,   /* wsd_window: the client activated this window, which becomes the key window */
   WSD_SCREEN_SAVER = 33,   /* wsd_window_flag (window ignored, value: 1 the display may sleep, 0 it stays on) */
   WSD_AUDIO_OPEN_INPUT = 34, /* wsd_audio_open + 1 fd: an input stream (the default microphone) writing a shared ring */
+  WSD_SET_DISPLAY_MODE = 35, /* wsd_display_mode: the size the client's game switched the display to, see PROTOCOL.md */
 };
 
 /* server -> client */
@@ -106,7 +107,12 @@ struct wsd_hello_reply {
   uint32_t backing_scale_x1000;                 /* the effective scale, see PROTOCOL.md (Render percent) */
   int32_t work_x, work_y;                       /* main screen without the menu bar and the Dock, same pixels, */
   uint32_t work_width, work_height;             /* origin top-left of the main screen (0x0 from older servers) */
+  uint32_t native_width_px, native_height_px;   /* the screen as it is without a game's display mode (SET_DISPLAY_MODE), */
+                                                /* at the effective scale of the render percent (0x0 from older servers) */
 };
+/* The display mode a game chose: width and height in pixels of the screen it wants. A side of the native screen or
+ * more is not lowered; 0x0 restores the native one. */
+struct wsd_display_mode { uint32_t width_px, height_px; };
 struct wsd_window_create {
   uint32_t window_id; /* chosen by the client, nonzero */
   uint32_t width_px, height_px;
@@ -250,7 +256,8 @@ struct wsd_ev_error { uint32_t request_type; int32_t code; };
 #define WSD_ASSERT_SIZE(t, n)
 #endif
 WSD_ASSERT_SIZE(wsd_hdr, 8);
-WSD_ASSERT_SIZE(wsd_hello_reply, 40);
+WSD_ASSERT_SIZE(wsd_hello_reply, 48);
+WSD_ASSERT_SIZE(wsd_display_mode, 8);
 WSD_ASSERT_SIZE(wsd_window_create, 16);
 WSD_ASSERT_SIZE(wsd_cursor_clip, 24);
 WSD_ASSERT_SIZE(wsd_buffer_attach, 40);

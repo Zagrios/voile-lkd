@@ -478,12 +478,157 @@ static void render_check(const struct wsd_hello_reply *hr, int percent, int full
   CHECK(g_errors == 0, "%d server errors", g_errors);
 }
 
+/* ---- display mode (SET_DISPLAY_MODE) ---- */
+
+/* Waits for the EV_DISPLAY that follows a SET_DISPLAY_MODE and returns it in *out. */
+static int wait_display(struct wsd_hello_reply *out, int ms) {
+  struct event e;
+  if (!wait_type(WSD_EV_DISPLAY, &e, ms)) return 0;
+  memset(out, 0, sizeof(*out));
+  memcpy(out, e.data, e.len < sizeof(*out) ? e.len : sizeof(*out));
+  return 1;
+}
+
+/* One SET_DISPLAY_MODE and its EV_DISPLAY, checked against the formula of PROTOCOL.md (Display mode): each side of the
+ * mode that is under the native screen's is the desktop's (held at 640x480 pixels), whatever the aspect ratio, and a
+ * side of the native screen or more leaves it; the native size is unchanged. Returns the display. */
+static struct wsd_hello_reply set_mode(const struct wsd_hello_reply *hr, uint32_t w, uint32_t h) {
+  struct wsd_display_mode m = {w, h};
+  struct wsd_hello_reply d;
+  uint32_t nw = hr->native_width_px, nh = hr->native_height_px;
+  uint32_t ew = w && w < nw ? (w > 640 ? w : 640) : nw, eh = h && h < nh ? (h > 480 ? h : 480) : nh;
+  send_msg(WSD_SET_DISPLAY_MODE, &m, sizeof(m), NULL, 0, -1);
+  int ok = wait_display(&d, 1500);
+  CHECK(ok, "no EV_DISPLAY after SET_DISPLAY_MODE %ux%u", w, h);
+  if (!ok) return *hr;
+  printf("display mode %ux%u: display %ux%u px, scale %.3f, native %ux%u (expected %ux%u)\n", w, h, d.display_width_px,
+         d.display_height_px, d.backing_scale_x1000 / 1000.0, d.native_width_px, d.native_height_px, ew, eh);
+  CHECK(near_to(d.display_width_px, ew, 1) && near_to(d.display_height_px, eh, 1),
+        "display %ux%u px for mode %ux%u, expected %ux%u", d.display_width_px, d.display_height_px, w, h, ew, eh);
+  CHECK(d.native_width_px == nw && d.native_height_px == nh, "native size %ux%u changed from %ux%u", d.native_width_px,
+        d.native_height_px, nw, nh);
+  return d;
+}
+
+static void mode_check(const struct wsd_hello_reply *hr, const char *socket_path) {
+  struct event e;
+  uint32_t nw = hr->native_width_px, nh = hr->native_height_px;
+  printf("mode check: display %ux%u px, native %ux%u px, scale %.3f\n", hr->display_width_px, hr->display_height_px, nw,
+         nh, hr->backing_scale_x1000 / 1000.0);
+  CHECK(nw > 0 && nh > 0, "HELLO has no native size");
+  CHECK(hr->display_width_px == nw && hr->display_height_px == nh, "HELLO display %ux%u is not the native %ux%u",
+        hr->display_width_px, hr->display_height_px, nw, nh);
+  if (nw < 1000) { printf("note: native screen narrower than 1000 px, nothing to lower\n"); return; }
+
+  /* A second client watches the screen, as the explorer of a prefix does. */
+  int main_sock = g_sock;
+  size_t main_inlen = g_inlen;
+  struct sockaddr_un sa = {.sun_family = AF_UNIX};
+  strncpy(sa.sun_path, socket_path, sizeof(sa.sun_path) - 1);
+  int watcher = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (watcher < 0 || connect(watcher, (struct sockaddr *)&sa, sizeof(sa))) die("connect (watcher)");
+  struct wsd_hello wh = {WSD_PROTOCOL_VERSION, (uint32_t)getpid()};
+  g_sock = watcher;
+  g_inlen = 0;
+  send_msg(WSD_HELLO, &wh, sizeof(wh), NULL, 0, -1);
+  CHECK(wait_type(WSD_EV_HELLO, &e, 2000), "no HELLO for the watcher");
+  g_sock = main_sock;
+  g_inlen = main_inlen;
+
+  struct wsd_window_create wc = {WIN, 400, 300, WSD_STYLE_TITLED | WSD_STYLE_CLOSABLE | WSD_STYLE_RESIZABLE};
+  send_msg(WSD_WINDOW_CREATE, &wc, sizeof(wc), "wsd_client", 10, -1);
+  struct wsd_window_flag show = {WIN, 1};
+  send_msg(WSD_WINDOW_SHOW, &show, sizeof(show), NULL, 0, -1);
+  CHECK(wait_type(WSD_EV_RESIZE, &e, 2000), "no RESIZE after show");
+
+  /* the usual game: 1280 wide on a wider screen, then fullscreen, as Rocket League at 720p */
+  uint32_t half = nw / 2;
+  struct wsd_hello_reply d = set_mode(hr, half, nh / 2);
+  while (wait_type(WSD_EV_RESIZE, &e, 300)) {} /* the windowed window keeps its pixels and may hear them again */
+  struct wsd_window_flag fs = {WIN, 1};
+  send_msg(WSD_WINDOW_FULLSCREEN, &fs, sizeof(fs), NULL, 0, -1);
+  int ok = wait_type(WSD_EV_RESIZE, &e, 1500);
+  CHECK(ok, "no RESIZE after fullscreen");
+  if (ok) check_resize(&e, "fullscreen on at half", d.display_width_px, d.display_height_px, 1);
+
+  /* a mode set while fullscreen: the window keeps covering the screen and hears the new pixels */
+  uint32_t quarter3 = nw * 3 / 4;
+  struct wsd_display_mode mm = {quarter3, nh * 3 / 4};
+  send_msg(WSD_SET_DISPLAY_MODE, &mm, sizeof(mm), NULL, 0, -1);
+  int got_resize = 0, got_display = 0;
+  struct wsd_ev_resize rz = {0};
+  for (uint64_t end = now_ns() + 1500000000ull; now_ns() < end && !(got_resize && got_display);) {
+    if (!next_event(&e, 20)) continue;
+    if (e.type == WSD_EV_RESIZE) { memcpy(&rz, e.data, sizeof(rz)); got_resize = 1; }
+    else if (e.type == WSD_EV_DISPLAY) got_display = 1;
+    else handle_async(&e);
+  }
+  CHECK(got_display, "no EV_DISPLAY after the mode changed while fullscreen");
+  CHECK(got_resize, "no RESIZE for the fullscreen window after the mode changed");
+  if (got_resize) {
+    printf("fullscreen window after the mode: %ux%u px scale %.3f\n", rz.width_px, rz.height_px,
+           rz.backing_scale_x1000 / 1000.0);
+    CHECK(near_to(rz.width_px, quarter3, 1), "the fullscreen window is %ux%u px, expected %u wide", rz.width_px,
+          rz.height_px, quarter3);
+  }
+
+  /* the same mode again: nothing changes, the requester still hears the screen */
+  set_mode(hr, quarter3, nh * 3 / 4);
+  /* the guard: a game cannot go under 640x480 (set_mode checks it; the width is not asked for) */
+  set_mode(hr, 200, 100);
+  /* other aspect ratios than the screen's: 4:3 and 16:10 modes keep their size, the picture is stretched */
+  set_mode(hr, 800, 600);
+  set_mode(hr, 1024, 768);
+  set_mode(hr, 1280, 800);
+  set_mode(hr, 640, 480);
+  /* one side only under the native screen's */
+  set_mode(hr, nw, nh * 3 / 4);
+  set_mode(hr, nw * 3 / 4, nh);
+  /* back to the native screen: 0x0, then a mode as wide as the screen or wider */
+  d = set_mode(hr, 0, 0);
+  CHECK(d.backing_scale_x1000 == hr->backing_scale_x1000, "native scale %u, expected %u", d.backing_scale_x1000,
+        hr->backing_scale_x1000);
+  set_mode(hr, quarter3, nh * 3 / 4);
+  set_mode(hr, nw + 500, nh + 500);
+  set_mode(hr, quarter3, nh * 3 / 4);
+  set_mode(hr, nw, nh);
+
+  /* the client that switched the display goes away: the others see the native screen again */
+  set_mode(hr, half, nh / 2);
+  struct wsd_window wd = {WIN};
+  send_msg(WSD_WINDOW_DESTROY, &wd, sizeof(wd), NULL, 0, -1);
+  struct wsd_ping p = {0, now_ns()};
+  send_msg(WSD_PING, &p, sizeof(p), NULL, 0, -1);
+  CHECK(wait_type(WSD_EV_PONG, &e, 500), "no PONG");
+  CHECK(g_errors == 0, "%d server errors", g_errors);
+  /* the watcher heard each change: the last EV_DISPLAY it gets after this client leaves is the native screen */
+  close(main_sock);
+  g_sock = watcher;
+  g_inlen = 0;
+  struct wsd_hello_reply last = {0};
+  int heard = 0;
+  uint64_t end = now_ns() + 2000000000ull;
+  while (now_ns() < end) {
+    struct wsd_hello_reply x;
+    if (!wait_display(&x, 200)) { if (heard) break; continue; }
+    last = x;
+    heard++;
+    if (x.display_width_px == nw && x.display_height_px == nh) break;
+  }
+  printf("watcher: %d display events, the last %ux%u px\n", heard, last.display_width_px, last.display_height_px);
+  CHECK(heard > 0 && last.display_width_px == nw && last.display_height_px == nh, "the watcher did not see the native screen again (%ux%u px)",
+        last.display_width_px, last.display_height_px);
+  g_sock = watcher; /* closed by main's close */
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) { fprintf(stderr, "usage: %s <socket> [seconds] [rates] [--no-pointer]\n", argv[0]); return 2; }
   int render_percent = -1, render_fullscreen = 0; /* render_percent: the --render-check value, -1 without the option */
+  int mode_check_only = 0;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--render-check")) render_percent = i + 1 < argc ? atoi(argv[++i]) : 0;
     else if (!strcmp(argv[i], "--fullscreen")) render_fullscreen = 1;
+    else if (!strcmp(argv[i], "--mode-check")) mode_check_only = 1;
   }
   if (render_percent >= 0 && (render_percent < 1 || render_percent > 100)) {
     fprintf(stderr, "usage: %s <socket> --render-check <percent 1..100> [--fullscreen]\n", argv[0]);
@@ -512,6 +657,12 @@ int main(int argc, char **argv) {
   memcpy(&hr, e.data, sizeof(hr));
   printf("hello: version=%u server_pid=%u display=%ux%u px max_refresh=%u Hz scale=%.3f\n", hr.version, hr.server_pid,
          hr.display_width_px, hr.display_height_px, hr.max_refresh_hz, hr.backing_scale_x1000 / 1000.0);
+
+  if (mode_check_only) {
+    mode_check(&hr, argv[1]);
+    printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
+    return g_fail;
+  }
 
   if (render_percent >= 0) {
     render_check(&hr, render_percent, render_fullscreen);
