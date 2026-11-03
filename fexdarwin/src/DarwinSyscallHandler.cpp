@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "DarwinSyscallHandler.h"
+#include "GuardAlias.h"
 #include "CodeValidation.h"
 #include <FEXCore/Utils/GuestBase.h>
 #include "DarwinSignalDelegator.h"
@@ -209,6 +210,31 @@ bool DarwinSyscallHandler::CanReadGuestCode(uint64_t Start, uint64_t Length) {
     const uint64_t* Gen;
     uint64_t GenNow;
     if (fexdarwin_lkd_guard_aliases(P, Alias, &Gen, &GenNow) != 0) return false;
+  }
+  return true;
+}
+
+// The decoder reads a guarded host page's code through views, so that no compilation opens the page: an open page lets
+// every other thread read the 4 KiB pieces the guest forbids. A shared file piece is read through the read-only view of
+// its file (lkd_mm_guard_aliases); the other pieces, which are private (Wine maps most modules that way), through an
+// alias of the host page's memory (GuardAlias). The decoder only reads the pieces the guest lets it execute.
+bool DarwinSyscallHandler::GuardedCodeViews(uint64_t HostPage, const uint8_t* Views[4]) {
+  if (!LkdEnabled()) return false;
+  const void* Alias[4];
+  const uint64_t* Gen;
+  uint64_t GenNow;
+  if (fexdarwin_lkd_guard_aliases(HostPage, Alias, &Gen, &GenNow) != 1) return false;
+  bool Missing = false;
+  for (int i = 0; i < 4; i++) {
+    Views[i] = static_cast<const uint8_t*>(Alias[i]);
+    Missing |= Views[i] == nullptr;
+  }
+  if (Missing) {
+    if (const uint8_t* Mem = GuardAlias::Map(0, HostPage)) {
+      for (int i = 0; i < 4; i++) {
+        if (!Views[i]) Views[i] = Mem + i * 4096;
+      }
+    }
   }
   return true;
 }

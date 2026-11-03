@@ -438,7 +438,9 @@ void lkd_mm_file_written(struct lkd_fdobj *file, uint64_t off, uint64_t len)
  * (lkd_mm_watch.h has the return values). A page opened for a store stays open until something sets its host
  * protection again (a protection change, a translation of its code, another thread's close): a packer writes the
  * decrypted bytes of a page it has just made writable, one store at a time, and stepping each store would be too slow.
- * Meanwhile its PROT_NONE neighbours are open too. A page opened for a read is closed again by the caller after one
+ * Meanwhile its PROT_NONE neighbours are open too: the engine avoids it for the loads, stores and code reads it can run
+ * through an alias of the page (lkd_mm_guard_store, lkd_mm_guard_aliases) and opens a page only for the rest. A page
+ * opened for a read is closed again by the caller after one
  * instruction (lkd_mm_guard_close) or, for the LKD and the translator, by lkd_mm_guard_close_all at the end of the
  * operation: the PROT_NONE neighbours must not be readable meanwhile, or the guest reads the encrypted bytes.
  * The decision looks at the 4 KiB of the faulting address only: an access that runs from an allowed 4 KiB into a
@@ -525,6 +527,7 @@ int lkd_mm_guard_read(uint64_t gva, void *dst, unsigned len)
 
 int lkd_mm_guard_aliases(uint64_t gva, const void *alias[4], const uint64_t **gen, uint64_t *gen_now)
 {
+    if (!atomic_load_explicit(&mm_any_guarded, memory_order_relaxed)) return 0; /* the decoder asks for every host page */
     lkd_mm *mm = cur_mm();
     if (!mm || !in_window(gva)) return 0;
     const uint64_t p = HP_DOWN(gva);
@@ -573,6 +576,26 @@ int lkd_mm_guard_fault(uint64_t gva, int write, uint64_t *page_out)
     if (page_out) *page_out = p;
     if (write) return 1;
     guard_note_open(p);
+    return 1;
+}
+
+/* A store the engine runs through an alias of the host page, which stays PROT_NONE: nothing opens it for the other threads.
+ * The same decision as lkd_mm_guard_fault for a store, without opening the page; the translations of code the store
+ * changes are dropped here, which the engine asks again after the store for a thread that translated the page in
+ * between. */
+int lkd_mm_guard_store(uint64_t gva)
+{
+    lkd_mm *mm = cur_mm();
+    if (!mm || !in_window(gva)) return 0;
+    uint64_t p = HP_DOWN(gva);
+    mrw_rdlock(&mm->vlock);
+    int guarded = mm_page_guarded(mm, p);
+    mm_vma *v = guarded ? vt_find(&mm->vt, gva) : NULL;
+    int allowed = v && (v->prot & LX_PROT_WRITE);
+    mrw_rdunlock(&mm->vlock);
+    if (!guarded) return 0;
+    if (!allowed) return -1;
+    if (mm_watched(p)) mm_unwatch_for_write(mm, gva, 0, NULL); /* translated code: drop it */
     return 1;
 }
 

@@ -2,8 +2,10 @@
 #include "DarwinSignalDelegator.h"
 #include "CodeValidation.h"
 #include "CrashReport.h"
+#include "GuardAlias.h"
 #include "GuardedLoadPatch.h"
 #include "GuardedLoadStub.h"
+#include "GuardedStore.h"
 #include "HitchLog.h"
 #include "LkdGlue.h"
 #include <FEXCore/Utils/GuestBase.h>
@@ -18,6 +20,7 @@
 #include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <csignal>
@@ -34,8 +37,10 @@ extern "C" int fexdarwin_lkd_code_write_fault(uint64_t gva);
 extern "C" int fexdarwin_lkd_code_watched(uint64_t gva);
 extern "C" int fexdarwin_lkd_guard_fault(uint64_t gva, int write, uint64_t* page);
 extern "C" void fexdarwin_lkd_guard_close(uint64_t page);
+extern "C" int fexdarwin_lkd_guard_store(uint64_t gva);
 extern "C" int fexdarwin_lkd_guard_read(uint64_t gva, void* dst, unsigned len);
 extern "C" void fexdarwin_lkd_guard_close_all(void);
+extern "C" int fexdarwin_lkd_guard_aliases(uint64_t gva, const void* alias[4], const uint64_t** gen, uint64_t* gen_now);
 extern "C" void fexdarwin_kick_trampoline();
 
 namespace {
@@ -308,11 +313,14 @@ bool DarwinSignalDelegator::HandleSmcWrite(GuestThread* T, int Sig, siginfo_t* I
 
 // A guarded host page (LKD mm, mm_page_guarded) is PROT_NONE on the host because some of its 4 KiB guest pages are
 // PROT_NONE next to accessible ones. A fault in one decides per 4 KiB: forbidden accesses stay guest page faults (the
-// caller delivers them), allowed ones go through. A store opens the page until its protection changes. A load of
-// translated code runs here (DecodeGuardedLoad), read from the file of the page or while it is open; one it cannot run opens the page
-// for ONE guest instruction: the guest restarts at that instruction with the trap flag, which FEX turns into a single
-// step, and the trap closes the page again (EndGuardStep). Otherwise the neighbours, which must fault, would be readable.
-// In translator code (the decoder reading guest code) the page stays open until the end of the compilation (PostCompile).
+// caller delivers them), allowed ones go through. The page is never opened for the accessing thread, because an open
+// host page is open for every thread: another one would read the 4 KiB pieces the guest forbids (a packer's encrypted
+// code) without the fault the packer waits for, and jump to its ciphertext. A load of translated code is read from the
+// file of the page or through an alias of the host page (GuardAlias), a store of translated code is stored through the
+// alias (DecodeGuardedStore), and the decoder reads the code through views (DarwinSyscallHandler::GuardedCodeViews).
+// What it cannot decode (an atomic, a store of one vector lane) opens the page as before: a load for ONE guest
+// instruction (the guest restarts at that instruction with the trap flag, which FEX turns into a single step, and the
+// trap closes the page again, EndGuardStep), a store until its protection changes.
 namespace {
 // Whether the host page of a guest address allows the access right now.
 bool HostAllows(uint64_t GuestAddr, bool Write) {
@@ -413,6 +421,81 @@ void ApplyGuardedLoad(ucontext_t* Uc, const GuardedLoad& D, const uint8_t* Bytes
   else if (D.Wb >= 0) X[D.Wb] = D.WbValue;
   DarwinCtx::SetPc(Uc, DarwinCtx::GetPc(Uc) + 4);
 }
+
+// The store of translated code that faulted on a guarded host page, run here through an alias of the page (GuardAlias)
+// instead of opening the page. Handles the stores FEX emits (GuardedStore::DecodeStore) when the access stays in the
+// 4 KiB guest page that faulted; anything else opens the page as before.
+struct GuardedStoreOp {
+  GuardedStore::Store S;
+  uint64_t Addr;    // host address of the first element
+  int Wb = -1;      // base register of a pre- or post-indexed store, which gets WbValue
+  uint64_t WbValue = 0;
+};
+
+bool DecodeGuardedStore(ucontext_t* Uc, uint64_t FaultHost, GuardedStoreOp& D) {
+  const uint32_t Insn = *reinterpret_cast<const uint32_t*>(DarwinCtx::GetPc(Uc));
+  if (!GuardedStore::DecodeStore(Insn, D.S)) return false;
+  const auto& S = D.S;
+  const uint64_t* X = DarwinCtx::GPRs(Uc);
+  const uint64_t Base = X[S.Rn]; // 31 is SP as a base register
+  const uint64_t Offset = static_cast<uint64_t>(S.Offset);
+  switch (S.Form) {
+  case GuardedStore::Store::RegOff: {
+    uint64_t Off = S.Rm == 31 ? 0 : X[S.Rm]; // XZR
+    if (S.Option == 2) Off = static_cast<uint32_t>(Off);
+    else if (S.Option == 6) Off = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(Off)));
+    D.Addr = Base + (Off << S.Shift);
+    break;
+  }
+  case GuardedStore::Store::Release: D.Addr = Base; break;
+  case GuardedStore::Store::PostIndex:
+  case GuardedStore::Store::PairPostIndex: D.Addr = Base; break;
+  default: D.Addr = Base + Offset; break;
+  }
+  D.Wb = -1;
+  if (S.Form == GuardedStore::Store::PreIndex || S.Form == GuardedStore::Store::PostIndex ||
+      S.Form == GuardedStore::Store::PairPreIndex || S.Form == GuardedStore::Store::PairPostIndex) {
+    D.Wb = static_cast<int>(S.Rn);
+    D.WbValue = Base + Offset;
+  }
+  return (D.Addr & ~0xfffull) == (FaultHost & ~0xfffull) &&
+         ((D.Addr + S.Bytes() - 1) & ~0xfffull) == (FaultHost & ~0xfffull);
+}
+
+// Stores the registers to Dst, the alias of D.Addr, and moves past the store.
+void ApplyGuardedStore(ucontext_t* Uc, const GuardedStoreOp& D, uint8_t* Dst) {
+  const uint64_t* X = DarwinCtx::GPRs(Uc);
+  const auto& S = D.S;
+  const unsigned N = 1u << S.Size;
+  uint8_t Data[32];
+  auto Get = [&](unsigned Reg, uint8_t* Out) {
+    if (S.Vec) {
+      const __uint128_t V = DarwinCtx::Fprs(Uc)[Reg];
+      memcpy(Out, &V, N);
+    } else {
+      const uint64_t V = Reg == 31 ? 0 : X[Reg]; // XZR
+      memcpy(Out, &V, N);
+    }
+  };
+  Get(S.Rt, Data);
+  if (S.IsPair()) Get(S.Rt2, Data + N);
+  const unsigned Elements = S.IsPair() ? 2 : 1;
+  if (S.IsRelease()) __atomic_thread_fence(__ATOMIC_RELEASE);
+  for (unsigned E = 0; E < Elements; E++) {
+    uint8_t* To = Dst + E * N;
+    const uint8_t* From = Data + E * N;
+    switch (N) { // one access of the element's width, as the guest's store is
+    case 1: __atomic_store_n(To, *From, __ATOMIC_RELAXED); break;
+    case 2: __atomic_store_n(reinterpret_cast<uint16_t*>(To), *reinterpret_cast<const uint16_t*>(From), __ATOMIC_RELAXED); break;
+    case 4: __atomic_store_n(reinterpret_cast<uint32_t*>(To), *reinterpret_cast<const uint32_t*>(From), __ATOMIC_RELAXED); break;
+    case 8: __atomic_store_n(reinterpret_cast<uint64_t*>(To), *reinterpret_cast<const uint64_t*>(From), __ATOMIC_RELAXED); break;
+    default: memcpy(To, From, N); break;
+    }
+  }
+  if (D.Wb == 31) DarwinCtx::SetSp(Uc, D.WbValue);
+  else if (D.Wb >= 0) DarwinCtx::GPRs(Uc)[D.Wb] = D.WbValue;
+  DarwinCtx::SetPc(Uc, DarwinCtx::GetPc(Uc) + 4);
+}
 } // namespace
 
 bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, uint64_t Addr, bool Write, bool InJit) {
@@ -421,10 +504,44 @@ bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, 
   const bool Decoded = InJit && !Write && DecodeGuardedLoad(Uc, reinterpret_cast<uint64_t>(FEXCore::G2H(Addr)), D);
   uint8_t Bytes[32];
   const uint64_t LoadAddr = Decoded ? FEXCore::H2G(reinterpret_cast<void*>(D.Addr)) : 0;
-  if (Decoded && fexdarwin_lkd_guard_read(LoadAddr, Bytes, D.L.Bytes()) == 1) {
-    GuardedLoadPatch::NoteFileRead(DarwinCtx::GetPc(Uc), D.Insn, LoadAddr);
-    ApplyGuardedLoad(Uc, D, Bytes);
-    return true;
+  if (Decoded) {
+    const int Read = fexdarwin_lkd_guard_read(LoadAddr, Bytes, D.L.Bytes());
+    if (Read == 1) {
+      GuardedLoadPatch::NoteFileRead(DarwinCtx::GetPc(Uc), D.Insn, LoadAddr);
+      ApplyGuardedLoad(Uc, D, Bytes);
+      return true;
+    }
+    if (Read == 0) {
+      // A guarded page the guest allows that has no file view (a private piece): read it through an alias of the host
+      // page instead of opening it, which would let every other thread read the pieces the guest forbids.
+      const void* Alias[4];
+      const uint64_t* Gen;
+      uint64_t GenNow;
+      constexpr uint64_t HostPageSize = FEXCore::Utils::FEX_HOST_PAGE_SIZE;
+      if (fexdarwin_lkd_guard_aliases(LoadAddr, Alias, &Gen, &GenNow) == 1) {
+        if (const uint8_t* Mem = GuardAlias::Map(1, LoadAddr & ~(HostPageSize - 1))) {
+          memcpy(Bytes, Mem + (LoadAddr & (HostPageSize - 1)), D.L.Bytes());
+          ApplyGuardedLoad(Uc, D, Bytes);
+          return true;
+        }
+      }
+    }
+  }
+  if (InJit && Write) {
+    // A store of translated code to an allowed piece of a guarded page: through an alias of the host page, which stays
+    // closed for the other threads (their loads of the pieces the guest forbids must fault).
+    GuardedStoreOp St {};
+    if (DecodeGuardedStore(Uc, reinterpret_cast<uint64_t>(FEXCore::G2H(Addr)), St)) {
+      const uint64_t StoreAddr = FEXCore::H2G(reinterpret_cast<void*>(St.Addr));
+      constexpr uint64_t HostPageSize = FEXCore::Utils::FEX_HOST_PAGE_SIZE;
+      if (fexdarwin_lkd_guard_store(StoreAddr) == 1) {
+        if (uint8_t* Mem = GuardAlias::Map(1, StoreAddr & ~(HostPageSize - 1))) {
+          ApplyGuardedStore(Uc, St, Mem + (StoreAddr & (HostPageSize - 1)));
+          fexdarwin_lkd_guard_store(StoreAddr); // a thread that translated the page meanwhile: drop it again
+          return true;
+        }
+      }
+    }
   }
   uint64_t Page = 0;
   const int R = fexdarwin_lkd_guard_fault(Addr, Write, &Page);

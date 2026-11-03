@@ -22,6 +22,7 @@ public:
   }
   void SleepThread(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) override;
   bool CanReadGuestCode(uint64_t Start, uint64_t Length) override;
+  bool GuardedCodeViews(uint64_t HostPage, const uint8_t* Views[4]) override;
   void PreCompile() override;
   void PostCompile() override;
 

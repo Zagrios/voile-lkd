@@ -46,6 +46,10 @@ int lkd_mm_guard_read(uint64_t gva, void *dst, unsigned len);
  * shared file piece; 0 when the page is not guarded. The views stay valid while *gen holds gen_now: *gen changes
  * whenever a mapping or a protection of the address space may change. Callable from a SIGSEGV/SIGBUS handler. */
 int lkd_mm_guard_aliases(uint64_t gva, const void *alias[4], const uint64_t **gen, uint64_t *gen_now);
+/* A store at gva in a guarded host page that the engine runs through an alias of the page, leaving it PROT_NONE: 1 the guest
+ * allows it (the translations of the code it changes are dropped: call it before the store and again after it), -1 the
+ * guest forbids it, 0 not guarded. Callable from a SIGSEGV/SIGBUS handler of a guest thread. */
+int lkd_mm_guard_store(uint64_t gva);
 void lkd_mm_guard_close(uint64_t page);
 void lkd_mm_guard_close_all(void);
 

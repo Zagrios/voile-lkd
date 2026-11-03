@@ -99,6 +99,7 @@ int lkd_mm_code_write_fault(uint64_t gva);
 int lkd_mm_guard_fault(uint64_t gva, int write, uint64_t *page_out);
 int lkd_mm_guard_read(uint64_t gva, void *dst, unsigned len);
 int lkd_mm_guard_aliases(uint64_t gva, const void *alias[4], const uint64_t **gen, uint64_t *gen_now);
+int lkd_mm_guard_store(uint64_t gva);
 void lkd_mm_guard_close(uint64_t page);
 void lkd_mm_guard_close_all(void);
 

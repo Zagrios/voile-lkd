@@ -113,6 +113,9 @@ int fexdarwin_lkd_guard_read(uint64_t gva, void* dst, unsigned len) {
 int fexdarwin_lkd_guard_aliases(uint64_t gva, const void* alias[4], const uint64_t** gen, uint64_t* gen_now) {
   return lkd_mm_guard_aliases(gva, alias, gen, gen_now);
 }
+int fexdarwin_lkd_guard_store(uint64_t gva) {
+  return lkd_mm_guard_store(gva);
+}
 void fexdarwin_lkd_guard_close(uint64_t page) {
   lkd_mm_guard_close(page);
 }
