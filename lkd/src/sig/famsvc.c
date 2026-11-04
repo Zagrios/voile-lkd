@@ -244,7 +244,8 @@ static void gc_stale_dirs(const char *base)
         int keep = 0;
         struct dirent *f;
         while ((f = readdir(x)) && !keep) {
-            if (!strcmp(f->d_name, ".") || !strcmp(f->d_name, "..") || !strcmp(f->d_name, "futex.shm")) continue;
+            if (!strcmp(f->d_name, ".") || !strcmp(f->d_name, "..") || !strcmp(f->d_name, "futex.shm") ||
+                !strcmp(f->d_name, "sem.shm")) continue;
             size_t n = strlen(f->d_name);
             if (n < 3 || strcmp(f->d_name + n - 2, ".s") != 0) { keep = 1; break; }
             int pid = atoi(f->d_name);
@@ -565,6 +566,8 @@ static void sweep_dir(void)
     if (!live) {
         char p[PATH_MAX];
         snprintf(p, sizeof p, "%s/futex.shm", d);
+        unlink(p);
+        snprintf(p, sizeof p, "%s/sem.shm", d);
         unlink(p);
         rmdir(d);
     }

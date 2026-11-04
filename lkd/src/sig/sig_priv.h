@@ -94,6 +94,10 @@ void sig_shared_sleeper_put(struct fx_sleeper *s);
 void sig_spin_lock(_Atomic uint32_t *l);
 void sig_spin_unlock(_Atomic uint32_t *l);
 
+/* ---- sem.c ------------------------------------------------------------------------------------ */
+void sig_sem_register(void);
+void sig_sem_proc_exit(lkd_task *t); /* the guest process of t exits: apply its SEM_UNDO adjustments */
+
 /* ---- ntsync.c --------------------------------------------------------------------------------- */
 void sig_ntsync_host_exit(void);  /* last guest process of this host process: release its ntsync slots */
 void sig_ntsync_fork_child(void);

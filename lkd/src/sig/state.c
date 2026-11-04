@@ -202,6 +202,7 @@ void lkd_sig_task_exit(lkd_task *t)
 
 void lkd_sig_proc_exit(lkd_task *t)
 {
+    sig_sem_proc_exit(t);
     struct lkd_sigproc *sp = sig_proc_peek(t->proc);
     if (sp) {
         sig_lock(sp);
@@ -303,6 +304,7 @@ void lkd_sig_init(void)
     sig_syscalls_register();
     sig_futex_register();
     sig_sfd_register();
+    sig_sem_register();
     sig_send_init();
     int e = lkd_famsvc_start();
     if (e < 0) lkd_log("sig: family service not started (%d): cross-process signals answer ESRCH", e);
