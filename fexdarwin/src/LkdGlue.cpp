@@ -603,6 +603,7 @@ int ExecImage(lkd_task* t, const struct lkd_exec_image* Img) {
   St.gregs[X::REG_RSP] = T->StartRsp;
   St.fs_cached = 0;
   St.gs_cached = 0;
+  ClearIa32TlsEntries(T); // flush_thread: the new image starts without the old one's TLS entries
   G->CTX->SetFlagsFromCompactedEFLAGS(Th, 0x202);
   ResetGuestFpForHandler(Th); // FCW 0x37f, MXCSR 0x1f80, clean x87/SSE/AVX registers
   St.callret_sp = reinterpret_cast<uint64_t>(Th->CallRetStackBase) + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
@@ -707,6 +708,19 @@ extern "C" uint64_t fexdarwin_kick_safepoint(GuestThread* T) {
   if (G->Opt.TraceSignals) {
     fprintf(stderr, "[fexdarwin] tid %d stopped in translated code at rip %#llx for LKD signal delivery\n", T->Tid,
             (unsigned long long)T->State->CurrentFrame->State.rip);
+  }
+  if (T->PendingIa32Syscall) {
+    T->PendingIa32Syscall = false;
+    HandleIa32Syscall(T);
+  }
+  if (T->PendingUd) {
+    T->PendingUd = false;
+    if (!EmulateFsLoad(T)) {
+      T->FaultErr = 0;
+      T->FaultTrapNo = Linux::TRAP_UD;
+      T->FaultAddr = T->PendingUdAddr;
+      lkd_fault(T->Task, Linux::L_SIGILL, T->PendingUdSiCode, T->PendingUdAddr, 0, Linux::TRAP_UD);
+    }
   }
   DeliverPendingSignals(T);
   T->InLkd.store(false);
