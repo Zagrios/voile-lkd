@@ -42,6 +42,7 @@ add_executable(fexdarwin-run
   src/GuardAlias.cpp
   src/GuardedLoadPatch.cpp
   src/HitchLog.cpp
+  src/Ia32Syscall.cpp
   src/LkdGlue.cpp
   src/LkdLoader.cpp
   src/LkdShim.c)
