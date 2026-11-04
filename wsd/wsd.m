@@ -213,6 +213,7 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 - (void)sendEvent:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
 - (void)noteKey:(uint32_t)code down:(BOOL)down;
 - (NSWindowLevel)levelForActive:(BOOL)active;
+- (WsdScale)pointerScale;
 - (BOOL)floatsForActive:(BOOL)active;
 - (void)orderInFront:(BOOL)activate;
 - (void)syncCapsLock:(BOOL)on;
@@ -631,7 +632,7 @@ static CAMetalLayer *make_metal_layer(void) {
 - (uint64_t)evNs:(NSEvent *)e { return (uint64_t)(e.timestamp * 1e9); }
 - (void)pixelPoint:(NSEvent *)e x:(float *)x y:(float *)y {
   NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-  WsdScale s = backing_scale_xy(self.window);
+  WsdScale s = [self.ww pointerScale];
   *x = (float)(p.x * s.x);
   *y = (float)((self.bounds.size.height - p.y) * s.y);
 }
@@ -702,7 +703,7 @@ static CAMetalLayer *make_metal_layer(void) {
       m.flags |= 1; /* clamped */
       if (!g_injecting && !w.stalled) {
         /* Real pointer left the clip rect: warp it back (global, top-left display coordinates). */
-        WsdScale s = backing_scale_xy(self.window);
+        WsdScale s = [w pointerScale];
         NSPoint vp = NSMakePoint(cx / s.x, self.bounds.size.height - cy / s.y);
         NSPoint sp = [self.window convertPointToScreen:[self convertPoint:vp toView:nil]];
         CGFloat top = primary_screen().frame.size.height;
@@ -739,6 +740,20 @@ static CAMetalLayer *make_metal_layer(void) {
   struct wsd_ev_resize r = {self.windowId, (uint32_t)lround(sz.width * s.x), (uint32_t)lround(sz.height * s.y),
                             (uint32_t)lround(s.x * 1000)};
   [self sendEvent:WSD_EV_RESIZE payload:&r len:sizeof(r) extra:nil];
+}
+/* Client pixels per view point, per axis, for the pointer: the scale, unless the view shows a frame of another size.
+ * The layer stretches the client's last frame over the view (kCAGravityResize), and a window can have another size
+ * than the client's: AppKit shortens a window taller than the screen to fit below the menu bar while the client keeps
+ * its size (2026-11-05: Killing Floor windowed at 2560x1418 px in a 2560x1359 window, and at 2560x1418 in a 2560x1440
+ * fullscreen one). The pointer must land where the frame shows things: Killing Floor selected menu items up to 59 px
+ * above the pointer. An overlay plane is placed at the scale itself (-overlayAt:), so a window with one keeps it. */
+- (WsdScale)pointerScale {
+  WsdScale s = backing_scale_xy(self.window);
+  WsdBuffer *b = self.lastBuffer;
+  NSSize v = self.view.bounds.size;
+  if (!b || self.overlay || v.width < 1 || v.height < 1) return s;
+  if (fabs(b.width - v.width * s.x) < 1 && fabs(b.height - v.height * s.y) < 1) return s;
+  return (WsdScale){b.width / v.width, b.height / v.height};
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender {
   struct wsd_window w = {self.windowId};
@@ -1748,7 +1763,7 @@ static CAMetalLayer *make_metal_layer(void) {
     if (!g_probe_enabled) {
       g_probe_enabled = YES;
       LOG("latency probe on (first test input)");
-    } else if (m->kind != 3 && (m->kind == 2 || m->b)) probe_arm(m->kind == 1 ? "key" : "click");
+    } else if (m->kind != 3 && m->kind != 5 && (m->kind == 2 || m->b)) probe_arm(m->kind == 1 ? "key" : "click");
     g_injecting = YES;
     if (m->kind == 3) {
       /* raw mouse motion (relative mode test): delta x = a - 10000, delta y = b - 10000, through the view as a real
@@ -1766,6 +1781,17 @@ static CAMetalLayer *make_metal_layer(void) {
                                modifierFlags:0 timestamp:t windowNumber:nw.windowNumber context:nil characters:@""
                  charactersIgnoringModifiers:@"" isARepeat:NO keyCode:(unsigned short)m->a];
       [nw sendEvent:e];
+    } else if (m->kind == 5) {
+      /* pointer motion at view pixels (a, b) (view points at the backing scale), into the view: unlike a click it
+       * neither activates wsd nor makes the window key */
+      WsdScale sc = backing_scale_xy(nw);
+      NSPoint p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
+      NSEvent *e = [NSEvent mouseEventWithType:NSEventTypeMouseMoved location:p modifierFlags:0 timestamp:t
+                                windowNumber:nw.windowNumber context:nil eventNumber:0 clickCount:0 pressure:0];
+      [best.view mouseMoved:e];
+      WsdScale ps = [best pointerScale];
+      LOG("debug hover: view %.0fx%.0f pt, frame shown %ux%u px, pointer scale %.4f x %.4f", best.view.bounds.size.width,
+          best.view.bounds.size.height, best.lastBuffer.width, best.lastBuffer.height, ps.x, ps.y);
     } else if (m->kind == 2) {
       WsdScale sc = backing_scale_xy(nw);
       NSPoint p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
