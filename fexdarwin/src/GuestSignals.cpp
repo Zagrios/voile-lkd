@@ -110,6 +110,11 @@ bool DarwinSignalDelegator::DeliverGuestSignal(GuestThread* T, ucontext_t* Uc, c
     // IDT vector 0x80, which no other instruction produces. The kick safe point serves it (Ia32Syscall.cpp).
     if (F.Signal == Linux::L_SIGSEGV && F.TrapNo == Linux::TRAP_GP && F.Err == ((0x80u << 3) | 2)) {
       T->PendingIa32Syscall = true;
+    } else if (F.Signal == Linux::L_SIGILL && F.TrapNo == Linux::TRAP_UD) {
+      // Possibly a mov to %fs in 64-bit code, which FEXCore rejects: the safe point emulates it or delivers SIGILL.
+      T->PendingUd = true;
+      T->PendingUdSiCode = F.SiCode;
+      T->PendingUdAddr = F.Addr;
     } else {
       T->FaultErr = F.Err;
       T->FaultTrapNo = F.TrapNo;

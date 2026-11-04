@@ -60,6 +60,11 @@ struct GuestThread {
   std::atomic<bool> InLkd {false};         // inside lkd_syscall/lkd_signal_next: LKD checks pending signals on its way out
   uint64_t FaultErr {}, FaultTrapNo {}, FaultAddr {}; // sigcontext err/trapno/cr2 of the pending synchronous fault
   bool PendingIa32Syscall {}; // an int $0x80 to serve at the kick safe point (Ia32Syscall.cpp)
+  // A #UD of FEXCore's held for the kick safe point, which emulates a mov to %fs in 64-bit code (SegmentLoad.cpp) or
+  // delivers SIGILL with this si_code and si_addr.
+  bool PendingUd {};
+  int PendingUdSiCode {};
+  uint64_t PendingUdAddr {};
   // Profile (FEXDARWIN_PROFILE): system calls of this thread, in all and per number. SysNr holds the counts of each
   // number, then their nanoseconds inside LKD; the thread allocates it on its first profiled call.
   std::atomic<uint64_t> SysCount {0}, SysNs {0};
@@ -148,6 +153,9 @@ void PrepareGuestWrite(GuestThread* T, uint64_t P, uint64_t L);
 void HandleIa32Syscall(GuestThread* T);
 // Empties the thread's set_thread_area entries, as execve does (Ia32Syscall.cpp).
 void ClearIa32TlsEntries(GuestThread* T);
+// Performs the mov to %fs in 64-bit code at the thread's RIP, which FEXCore rejects, and moves RIP past it; false when
+// the instruction is something else (SegmentLoad.cpp).
+bool EmulateFsLoad(GuestThread* T);
 
 // ---- tracing ----
 void TraceLog(const char* Fmt, ...) __attribute__((format(printf, 1, 2)));

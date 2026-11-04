@@ -3,7 +3,9 @@
 // (iretq, ljmp through memory, lcall through memory as in CrossOver's Rosetta thunk, lretq), x87 code in 32-bit mode,
 // and int $0x80 set_thread_area from 64-bit code, which gives each thread's 32-bit TEB a GDT TLS selector for %fs
 // (alloc_fs_sel). Also get_thread_area, an entry cleared, ENOSYS for a 32-bit call the engine does not serve, the entry
-// kept by a forked child and gone after an execve (flush_thread).
+// kept by a forked child and gone after an execve (flush_thread). And the mov to %fs Wine makes in 64-bit code before
+// each return to 32-bit code (register, base plus displacement through r13, and RIP-relative forms), after which the
+// 32-bit code reads its TEB without loading %fs itself.
 // Build with EXEC=1: the 32-bit code, its stack and the user_desc must be below 4 GiB.
 #include "rt.h"
 
@@ -13,8 +15,9 @@
 // leaves for good with ljmp.
 extern u32 call32(u64 entry);
 extern u32 call32_ljmp(void);
-extern char c32_x87[], c32_fs[];
+extern char c32_x87[], c32_fs[], c32_fs_noload[];
 u32 sel32;
+u16 sel_mem[8];
 u32 result32;
 __asm__(
   ".text\n"
@@ -64,6 +67,11 @@ __asm__(
   "  movl %eax, result32\n"
   "  xor %eax, %eax\n"
   "  mov %ax, %fs\n"
+  "  ljmp *far_ret64\n"
+  ".globl c32_fs_noload\n"
+  "c32_fs_noload:\n"                       // %fs:0 through whatever %fs the 64-bit side loaded
+  "  movl %fs:0, %eax\n"
+  "  movl %eax, result32\n"
   "  ljmp *far_ret64\n"
   "c32_lcall:\n"
   "  movl $7, result32\n"
@@ -164,6 +172,21 @@ static int run(void) {
   desc = (struct user_desc){(u32)-1, (u32)(u64)&teb_a, 0xffffffffu, 0x41};
   int80(IA32_set_thread_area, (u32)(u64)&desc);
   g_entry = desc.entry_number;
+
+  // The loads Wine's 64-bit code makes before returning to 32-bit code.
+  u16 sel = (u16)((g_entry << 3) | 3);
+  __asm__ volatile("movw %0, %%fs" : : "r"(sel) : "memory");
+  check64("mov %reg to %fs in 64-bit code, then %fs:0 in 32-bit code", call32((u64)c32_fs_noload), teb_a);
+  desc = (struct user_desc){g_entry, (u32)(u64)&teb_b, 0xffffffffu, 0x41};
+  int80(IA32_set_thread_area, (u32)(u64)&desc);
+  sel_mem[4] = sel;
+  __asm__ volatile("leaq sel_mem(%%rip), %%r13\n\tmovw 8(%%r13), %%fs" : : : "r13", "memory");
+  check64("mov 8(%r13) to %fs in 64-bit code reloads the base", call32((u64)c32_fs_noload), teb_b);
+  desc = (struct user_desc){g_entry, (u32)(u64)&teb_a, 0xffffffffu, 0x41};
+  int80(IA32_set_thread_area, (u32)(u64)&desc);
+  __asm__ volatile("movw sel_mem+8(%%rip), %%fs" : : : "memory");
+  check64("RIP-relative mov to %fs in 64-bit code", call32((u64)c32_fs_noload), teb_a);
+
   check64("a forked child keeps the TLS entry", (u64)child_status(forked_child), 7);
   check64("after execve no TLS entry is left", (u64)child_status(0), 7);
   return finish("w29_wow64");

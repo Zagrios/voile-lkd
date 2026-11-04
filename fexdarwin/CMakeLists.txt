@@ -45,6 +45,7 @@ add_executable(fexdarwin-run
   src/Ia32Syscall.cpp
   src/LkdGlue.cpp
   src/LkdLoader.cpp
+  src/SegmentLoad.cpp
   src/LkdShim.c)
 
 target_include_directories(fexdarwin-run PRIVATE

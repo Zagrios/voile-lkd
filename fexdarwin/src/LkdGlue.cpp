@@ -713,6 +713,15 @@ extern "C" uint64_t fexdarwin_kick_safepoint(GuestThread* T) {
     T->PendingIa32Syscall = false;
     HandleIa32Syscall(T);
   }
+  if (T->PendingUd) {
+    T->PendingUd = false;
+    if (!EmulateFsLoad(T)) {
+      T->FaultErr = 0;
+      T->FaultTrapNo = Linux::TRAP_UD;
+      T->FaultAddr = T->PendingUdAddr;
+      lkd_fault(T->Task, Linux::L_SIGILL, T->PendingUdSiCode, T->PendingUdAddr, 0, Linux::TRAP_UD);
+    }
+  }
   DeliverPendingSignals(T);
   T->InLkd.store(false);
   return G->Signals->LoopTopFillSRA();
