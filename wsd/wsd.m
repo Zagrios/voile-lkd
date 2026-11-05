@@ -196,6 +196,9 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property uint64_t statLastNs, statSumNs, statMaxNs, statMinNs;
 @property uint32_t statCount;
 @property BOOL relative, clip, fullscreen, transitioning;
+/* a hide waiting HIDE_DELAY_NS for a show that would cancel it (-hideSoon), and its generation */
+@property BOOL hidePending;
+@property uint64_t hideGeneration;
 @property NSRect clipPx;
 /* when the window last showed a new frame on either plane, and whether it has held the pointer without one for
  * STALL_NS since (the pointer and the cursor are then the user's) */
@@ -948,6 +951,24 @@ static CAMetalLayer *make_metal_layer(void) {
   self.transitioning = NO;
   LOG("window %u style 0x%x", self.windowId, style);
 }
+/* A hide a show follows within HIDE_DELAY_NS does not reach macOS. A game that changes its window's style hides
+ * it, restyles it and shows it again without activation (Unreal Engine 2's SetRes, within a few milliseconds):
+ * ordered out at once, the key window took the app's focus with it, macOS made another app active, and the client
+ * heard APP_DEACTIVATED in the middle of its start. Killing Floor then left fullscreen while starting and died
+ * reopening its window (DirectInput "Couldn't set cooperative level", 2026-11-05). */
+#define HIDE_DELAY_NS (100 * NSEC_PER_MSEC)
+- (void)hideSoon {
+  self.hidePending = YES;
+  uint64_t gen = ++self.hideGeneration;
+  __weak WsdWindow *ww = self;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, HIDE_DELAY_NS), dispatch_get_main_queue(), ^{
+    WsdWindow *w = ww;
+    if (!w || !w.hidePending || w.hideGeneration != gen) return;
+    w.hidePending = NO;
+    [w.window orderOut:nil];
+    adjust_levels(NSApp.active);
+  });
+}
 - (void)minimize:(BOOL)on {
   NSWindow *w = self.window;
   if (on && !w.miniaturized && !self.minimizedOut) {
@@ -1613,6 +1634,11 @@ static CAMetalLayer *make_metal_layer(void) {
     WsdWindow *w = [self win:m->window_id req:type];
     if (!w) break;
     w.minimizedOut = NO;
+    if (m->value && w.hidePending) {
+      w.hidePending = NO; /* still on screen: the hide never happened */
+      LOG("window %u: hidden and shown again within %llu ms, kept on screen", w.windowId,
+          (unsigned long long)(HIDE_DELAY_NS / NSEC_PER_MSEC));
+    }
     if (m->value) {
       if (m->value == 1) [NSApp activate];
       [w orderInFront:m->value == 1];
@@ -1621,8 +1647,7 @@ static CAMetalLayer *make_metal_layer(void) {
       __weak WsdWindow *ww = w;
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000000000), dispatch_get_main_queue(), ^{ [ww logState:"show+1s"]; });
     } else {
-      [w.window orderOut:nil];
-      adjust_levels(NSApp.active);
+      [w hideSoon];
     }
     break;
   }
