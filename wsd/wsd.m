@@ -49,6 +49,10 @@ static int g_cursor_hidden;       /* [NSCursor hide] in effect */
 static NSMutableSet *g_clients;
 static BOOL g_caps_told;           /* the Caps Lock state the clients were brought to (-syncCapsLock:) */
 static NSTimeInterval g_warp_time; /* uptime of the last CURSOR_WARP: the mouse moves queued before it are dropped */
+/* The jump of the last CURSOR_WARP, in points, until the first mouse move after it: macOS reports the warp in that
+ * move's delta (SDL's Cocoa backend and Wine's Mac driver make up for it too). */
+static double g_warp_dx, g_warp_dy;
+static BOOL g_warp_delta_pending;
 static NSCursor *g_cursor;         /* the cursor over the windows (CURSOR_SET), nil for the arrow */
 static BOOL g_ever_active;         /* wsd has been the active app since it started */
 static BOOL g_terminate_pending;   /* a logout, restart or shutdown waits for the clients to leave */
@@ -682,9 +686,23 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)otherMouseUp:(NSEvent *)e { [self button:e which:(uint32_t)e.buttonNumber down:NO]; }
 - (void)motion:(NSEvent *)e {
   WsdWindow *w = self.ww;
+  /* The first move after a CURSOR_WARP carries the warp's jump in its delta, whatever mode it arrives in. A game that
+   * centers the pointer and then turns on relative mode (Killing Floor on entering a map or leaving the shop: a warp
+   * from (1847,227) to (1284,739), then a first delta of (-563,512)) took the jump for a mouse movement and looked
+   * straight down or up. The jump is taken out of that delta, unless that would make it larger (a move that did not
+   * carry it). */
+  BOOL after_warp = g_warp_delta_pending && e.timestamp > g_warp_time;
+  if (after_warp) g_warp_delta_pending = NO;
   if (w.relative) {
     if (w.stalled) return; /* the user's pointer, not the game's camera: a stopped game would get it all at once */
-    struct wsd_ev_relative r = {w.windowId, [self synth], (float)e.deltaX, (float)e.deltaY, [self evNs:e]};
+    double dx = e.deltaX, dy = e.deltaY;
+    if (after_warp && fabs(dx - g_warp_dx) + fabs(dy - g_warp_dy) < fabs(dx) + fabs(dy)) {
+      LOG("window %u: first move after a pointer warp (%.0f,%.0f) taken as (%.0f,%.0f)", w.windowId, dx, dy,
+          dx - g_warp_dx, dy - g_warp_dy);
+      dx -= g_warp_dx;
+      dy -= g_warp_dy;
+    }
+    struct wsd_ev_relative r = {w.windowId, [self synth], (float)dx, (float)dy, [self evNs:e]};
     [w sendEvent:WSD_EV_RELATIVE payload:&r len:sizeof(r) extra:nil];
     return;
   }
@@ -1915,11 +1933,18 @@ static CAMetalLayer *make_metal_layer(void) {
      * pointer still, then the mouse moves already queued are dropped (-motion:). */
     if (!NSApp.active || g_relative_global) break;
     WsdScale s = backing_scale_xy(nil);
+    CGPoint to = CGPointMake(m->x / s.x, m->y / s.y);
+    CGEventRef now_ev = CGEventCreate(NULL);
+    CGPoint from = now_ev ? CGEventGetLocation(now_ev) : to;
+    if (now_ev) CFRelease(now_ev);
     CGSetLocalEventsSuppressionInterval(0);
-    CGError e = CGWarpMouseCursorPosition(CGPointMake(m->x / s.x, m->y / s.y));
+    CGError e = CGWarpMouseCursorPosition(to);
     CGSetLocalEventsSuppressionInterval(0.25);
     if (e != kCGErrorSuccess) { [self error:type code:-EIO]; break; }
     g_warp_time = NSProcessInfo.processInfo.systemUptime;
+    g_warp_dx = to.x - from.x;
+    g_warp_dy = to.y - from.y;
+    g_warp_delta_pending = fabs(g_warp_dx) + fabs(g_warp_dy) >= 1;
     CGAssociateMouseAndMouseCursorPosition(true);
     break;
   }
