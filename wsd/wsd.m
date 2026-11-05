@@ -2271,6 +2271,20 @@ int main(int argc, char **argv) {
       sigsrc[i] = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)sigs[i], 0, dispatch_get_main_queue());
       int sn = sigs[i];
       dispatch_source_set_event_handler(sigsrc[i], ^{
+        /* Ended while a game still has windows (Force Quit of the game's app, which is wsd): the game would run on
+         * without a window or input, unseen, and whoever started it would keep waiting for it (2026-11-05: Killing
+         * Floor kept a core busy after each Force Quit, which the player took for Quit never working). The parent,
+         * the launcher, ends the game and its helpers as Obelisk's Stop does. After the game ended there is no window
+         * left, so the launcher's own SIGTERM at the end of a session changes nothing; SIGALRM is the test wrapper's
+         * timeout and leaves the parent alone. */
+        NSUInteger windows = 0;
+        for (WsdClient *c in g_clients) windows += c.windows.count;
+        pid_t parent = getppid();
+        if (windows && sn != SIGALRM && parent > 1) {
+          LOG("signal %d with %lu window(s) open: asking the launcher (pid %d) to end the game", sn,
+              (unsigned long)windows, (int)parent);
+          kill(parent, SIGTERM);
+        }
         LOG("signal %d, restoring input state and exiting", sn);
         restore_input_state();
         unlink(path);
