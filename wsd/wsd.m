@@ -713,7 +713,10 @@ static CAMetalLayer *make_metal_layer(void) {
   }
   struct wsd_ev_motion m = {w.windowId, [self synth], 0, 0, [self evNs:e]};
   [self pixelPoint:e x:&m.x y:&m.y];
-  if (w.clip) {
+  /* The clip rectangle holds the pointer only while the game's window has the focus: after Cmd-Tab, a drag that
+   * began in the game (a held fire button) still sent moves here, and the pointer was warped back into the game
+   * while the user was in another app (Killing Floor, windowed, in a map). */
+  if (w.clip && NSApp.active && self.window.isKeyWindow) {
     NSRect c = w.clipPx;
     float cx = fminf(fmaxf(m.x, c.origin.x), c.origin.x + c.size.width - 1);
     float cy = fminf(fmaxf(m.y, c.origin.y), c.origin.y + c.size.height - 1);
