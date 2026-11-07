@@ -426,7 +426,7 @@ static void render_sfile(int sub, struct pbuf *b)
         break;
     }
     case SF_OVERCOMMIT: pb_puts(b, "1\n"); break;                     /* mm does no commit accounting: always */
-    case SF_MAX_MAP_COUNT: pb_puts(b, LKD_MAX_MAP_COUNT_STR "\n"); break; /* mm.h */
+    case SF_MAX_MAP_COUNT: pb_printf(b, "%d\n", LKD_MAX_MAP_COUNT); break; /* the limit mm enforces (mm.h) */
     case SF_MMAP_MIN_ADDR: pb_puts(b, "65536\n"); break;              /* mm window.c min_addr */
     case SF_INOTIFY_INSTANCES: case SF_INOTIFY_WATCHES: case SF_INOTIFY_QUEUED: {
         struct lkd_inotify_limits il;   /* the limits net enforces (request procfs-4 point 3) */

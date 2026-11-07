@@ -15,6 +15,12 @@
 
 #include "task.h"
 
+/* vm.max_map_count: the VMAs one address space may hold. Linux's default, 65530 (DEFAULT_MAX_MAP_COUNT), is reached
+ * by games that keep remapping and reprotecting (HELLDIVERS 2 after about 80 minutes: the split of an mprotect failed
+ * with ENOMEM, Wine kept the new protection in its own table and the next jump into the page was a DEP fault).
+ * Fedora 39+, Ubuntu and Arch ship 1048576, SteamOS 2147483642. /proc/sys/vm/max_map_count shows it. */
+#define LKD_MAX_MAP_COUNT 1048576
+
 struct lkd_fdobj;
 struct lkd_mm; /* private to mm; one per address space, refcounted, shared by CLONE_VM threads */
 typedef struct lkd_mm lkd_mm;
@@ -158,12 +164,5 @@ int lkd_mm_futex_key(lkd_task *t, uint64_t gva, int private_hint, struct lkd_fut
  * mmap lock and the VMA lock, the host fork copies private anonymous memory copy-on-write, shared
  * mappings stay shared (shared anonymous memory is backed by a shared memory object), parent releases,
  * child releases and re-identifies the mm. */
-
-/* vm.max_map_count. Linux's default 65530 (DEFAULT_MAX_MAP_COUNT) is reached by games that remap and reprotect
- * for an hour (HELLDIVERS 2 after 80 minutes: mprotect splits fail with ENOMEM, Wine keeps its own view of the
- * protection, the next jump into such a page is a DEP fault); SteamOS and Arch set 1048576 (mm.c MAX_MAP_COUNT,
- * /proc/sys/vm/max_map_count). */
-#define LKD_MAX_MAP_COUNT 1048576
-#define LKD_MAX_MAP_COUNT_STR "1048576"
 
 #endif /* LKD_MM_H */

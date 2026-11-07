@@ -10,9 +10,6 @@
 #include "mm_priv.h"
 #include "lkd_fs.h"
 
-#define MAX_MAP_COUNT LKD_MAX_MAP_COUNT /* sysctl vm.max_map_count (mm.h) */
-#define MAP_COUNT_REFUSED "mm: %zu mappings: vm.max_map_count reached, %s refused with ENOMEM"
-
 static _Atomic uint64_t id_counter;
 static uint64_t new_identity(void) { return ((uint64_t)getpid() << 24) | (atomic_fetch_add(&id_counter, 1) + 1); }
 
@@ -295,11 +292,18 @@ void mm_merge_around(lkd_mm *mm, uint64_t start, uint64_t end)
     mm_wunlock_same(mm);
 }
 
+int mm_map_count_over(lkd_mm *mm, size_t more)
+{
+    if (mm->vt.n + more <= LKD_MAX_MAP_COUNT) return 0;
+    lkd_log_once("mm: %zu mappings: vm.max_map_count (%d) reached, ENOMEM", mm->vt.n, LKD_MAX_MAP_COUNT);
+    return 1;
+}
+
 int mm_split(lkd_mm *mm, uint64_t addr)
 {
     mm_vma *v = vt_find(&mm->vt, addr);
     if (!v || v->start == addr) return 0;
-    if (mm->vt.n >= MAX_MAP_COUNT) { lkd_log_once(MAP_COUNT_REFUSED, mm->vt.n, "a split"); return -LX_ENOMEM; }
+    if (mm_map_count_over(mm, 1)) return -LX_ENOMEM;
     mm_vma *n = mm_vma_clone(v);
     if (!n) return -LX_ENOMEM;
     n->start = addr;
@@ -557,10 +561,7 @@ int mm_unmap_locked(lkd_mm *mm, uint64_t start, uint64_t end, struct mm_inval *i
     hiwater_before_unmap(mm, start, end);
     mm->map_gen++;
     /* Splitting in the middle of one VMA needs one more slot (do_vmi_align_munmap). */
-    if (v->start < start && v->end > end && mm->vt.n >= MAX_MAP_COUNT) {
-        lkd_log_once(MAP_COUNT_REFUSED, mm->vt.n, "an unmap inside a mapping");
-        return -LX_ENOMEM;
-    }
+    if (v->start < start && v->end > end && mm_map_count_over(mm, 1)) return -LX_ENOMEM;
     int r = mm_split(mm, start);
     if (!r) r = mm_split(mm, end);
     if (r) return r;
@@ -742,7 +743,7 @@ int64_t mm_map_locked(lkd_mm *mm, struct mm_mapreq *rq, struct mm_inval *iv)
                      rq->bk && rq->bk->name ? rq->bk->name : rq->bk ? "a shared object" : "anonymous memory");
         return -LX_EINVAL;
     }
-    if (mm->vt.n + 1 > MAX_MAP_COUNT) { lkd_log_once(MAP_COUNT_REFUSED, mm->vt.n, "a new mapping"); return -LX_ENOMEM; }
+    if (mm_map_count_over(mm, 1)) return -LX_ENOMEM;
     mm_vma *nv = calloc(1, sizeof *nv);
     if (!nv) return -LX_ENOMEM;
     nv->start = s;

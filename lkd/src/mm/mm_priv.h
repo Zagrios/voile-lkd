@@ -316,6 +316,9 @@ void mm_guard_open_range(lkd_mm *mm, uint64_t gva, uint64_t len, int write); /* 
 void mm_host_cleanup(lkd_mm *mm, uint64_t start, uint64_t end); /* I1/I2 after VMAs left [start,end) */
 int mm_fill(lkd_mm *mm, const mm_vma *v, uint64_t s, uint64_t e); /* zero or file content into [s,e) */
 int mm_discard_range(lkd_mm *mm, const mm_vma *v, uint64_t s, uint64_t e); /* zero/refill, O(boundary) */
+/* vm.max_map_count (mm.h LKD_MAX_MAP_COUNT): 1 when `more` more VMAs would take the table past it, Linux's checks
+ * written as map_count + more > sysctl_max_map_count. The first refusal of the process is logged. */
+int mm_map_count_over(lkd_mm *mm, size_t more);
 int mm_split(lkd_mm *mm, uint64_t addr);                         /* split the VMA containing addr at addr */
 void mm_merge_around(lkd_mm *mm, uint64_t start, uint64_t end);  /* merge VMAs touching [start,end] */
 int mm_range_mapped(lkd_mm *mm, uint64_t start, uint64_t end);   /* 1 if fully covered */

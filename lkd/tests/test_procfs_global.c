@@ -199,7 +199,7 @@ LT_TEST(proc_sys_values)
     /* consistency with the guest window: mmap below mmap_min_addr is refused (security_mmap_addr) */
     LT_ERRNO(SC(T, mmap, 0x8000, 0x1000, LX_PROT_READ, LX_MAP_PRIVATE | LX_MAP_ANONYMOUS | LX_MAP_FIXED, (uint64_t)-1, 0), LX_EPERM);
     s = slurp("/proc/sys/vm/max_map_count", &len);
-    LT_STREQ(s, "1048576\n");
+    LT_EQ(atoll(s), LKD_MAX_MAP_COUNT);
     free(s);
     s = slurp("/proc/sys/vm/overcommit_memory", &len);
     LT_STREQ(s, "1\n");
