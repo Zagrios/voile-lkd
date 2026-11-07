@@ -290,6 +290,7 @@ int RunWithLkd(const Args& A, const HostOptions& Opt) {
   // must be created after this point: the dispatcher embeds the base as a constant when InitCore generates it.
   FEXCore::GuestBase = lkd_guest_base;
   LkdStackTop = Cfg.guest_window_bytes - (64ULL << 20);
+  LkdWindowBytes = Cfg.guest_window_bytes;
   if (Opt.Trace) fprintf(stderr, "[fexdarwin] LKD mode, guest root %s, guest base %#llx\n", Cfg.guest_root, (unsigned long long)lkd_guest_base);
 
   G->CTX = FEXCore::Context::Context::CreateNewContext(G->Features);

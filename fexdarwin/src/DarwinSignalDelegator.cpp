@@ -8,6 +8,7 @@
 #include "GuardedStore.h"
 #include "HitchLog.h"
 #include "LkdGlue.h"
+#include "LkdLoader.h"
 #include <FEXCore/Utils/GuestBase.h>
 #include "DarwinContext.h"
 #include "Host.h"
@@ -45,6 +46,13 @@ extern "C" void fexdarwin_kick_trampoline();
 
 namespace {
 // Protection of the guest page holding Addr: negative when unmapped. In LKD mode the VMA table of LKD is the authority.
+// Whether Addr is a guest address at all. A host pointer outside the guest window (a null pointer, the host heap) has
+// no VMA either, so a "no mapping" answer from GuestProtAt alone cannot tell it from a guest page that lost its mapping.
+bool GuestAddrInWindow(uint64_t Addr) {
+  if (LkdEnabled()) return Addr < LkdWindowBytes;
+  return G->Mem.InWindow(Addr, 1);
+}
+
 int GuestProtAt(uint64_t Addr) {
   if (LkdEnabled()) {
     uint64_t S, E;
@@ -755,8 +763,9 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
     //    the protection first and drops the translations after, so a compilation on another thread can read the page
     //    in between. THEIA does this to its code pages (THE FINALS' "Foreground Work" and "Background Work" threads,
     //    once the main menu is up). The instruction becomes a fetch fault, which the guest handles; the read itself
-    //    returns zeros, which the rollback discards.
-    if (T->Compiling && !Write) {
+    //    returns zeros, which the rollback discards. Only for guest addresses: a bad host pointer in a translator pass
+    //    (a null pointer, the host heap) must stay a crash with a report, not become a silent zero load.
+    if (T->Compiling && !Write && GuestAddrInWindow(GuestAddr)) {
       const int GProt = GuestProtAt(GuestAddr);
       GuardedLoad D {};
       if ((GProt < 0 || !(GProt & Linux::PROT_EXEC_)) && DecodeGuardedLoad(Uc, reinterpret_cast<uint64_t>(Info->si_addr), D)) {
