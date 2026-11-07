@@ -18,7 +18,6 @@
 namespace X = FEXCore::X86State;
 
 uint64_t LkdStackTop = 0x3fff'fffe'0000ULL;
-uint64_t LkdWindowBytes = 0x4000'0000'0000ULL;
 
 // Kernel-internal call of LKD (src/lkd/src/include/lkd_internal.h): runs a syscall handler without the task
 // bookkeeping, ptrace stops and tracing. The loader is kernel code: a tracer of the task must not see its mmap calls

@@ -8,7 +8,6 @@
 #include "GuardedStore.h"
 #include "HitchLog.h"
 #include "LkdGlue.h"
-#include "LkdLoader.h"
 #include <FEXCore/Utils/GuestBase.h>
 #include "DarwinContext.h"
 #include "Host.h"
@@ -33,6 +32,7 @@
 
 thread_local GuestThread* CurrentGuestThread = nullptr;
 
+extern "C" uint64_t fexdarwin_lkd_window_size(void);
 extern "C" int fexdarwin_lkd_vma_at(uint64_t gva, uint64_t* start, uint64_t* end, uint32_t* prot);
 extern "C" int fexdarwin_lkd_code_write_fault(uint64_t gva);
 extern "C" int fexdarwin_lkd_code_watched(uint64_t gva);
@@ -46,13 +46,6 @@ extern "C" void fexdarwin_kick_trampoline();
 
 namespace {
 // Protection of the guest page holding Addr: negative when unmapped. In LKD mode the VMA table of LKD is the authority.
-// Whether Addr is a guest address at all. A host pointer outside the guest window (a null pointer, the host heap) has
-// no VMA either, so a "no mapping" answer from GuestProtAt alone cannot tell it from a guest page that lost its mapping.
-bool GuestAddrInWindow(uint64_t Addr) {
-  if (LkdEnabled()) return Addr < LkdWindowBytes;
-  return G->Mem.InWindow(Addr, 1);
-}
-
 int GuestProtAt(uint64_t Addr) {
   if (LkdEnabled()) {
     uint64_t S, E;
@@ -60,6 +53,13 @@ int GuestProtAt(uint64_t Addr) {
     return fexdarwin_lkd_vma_at(Addr, &S, &E, &P) == 0 ? static_cast<int>(P) : -1;
   }
   return G->Mem.ProtAt(Addr);
+}
+
+// LKD mode only: whether Addr is a guest address at all, inside LKD's guest window. A host pointer outside it (a null
+// pointer, the host heap) has no VMA either, so a "no mapping" answer from GuestProtAt alone cannot tell it from a
+// guest page that lost its mapping.
+bool GuestAddrInWindow(uint64_t Addr) {
+  return Addr < fexdarwin_lkd_window_size();
 }
 
 // The first byte of the instruction at Rip that x86 cannot fetch, which an instruction fetch fault reports: Rip, or
@@ -764,7 +764,10 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
     //    in between. THEIA does this to its code pages (THE FINALS' "Foreground Work" and "Background Work" threads,
     //    once the main menu is up). The instruction becomes a fetch fault, which the guest handles; the read itself
     //    returns zeros, which the rollback discards. Only for guest addresses: a bad host pointer in a translator pass
-    //    (a null pointer, the host heap) must stay a crash with a report, not become a silent zero load.
+    //    (a null pointer, the host heap) must stay a crash with a report, not become a silent zero load. The views the
+    //    decoder and the code hash read a guarded page through (DarwinSyscallHandler::GuardedCodeViews) are host memory
+    //    outside the window too: a read through the file view of a page that a concurrent munmap released (the alias
+    //    goes away with the last VMA of its mapping, mb_put) is a crash as well, not a zero load.
     if (T->Compiling && !Write && GuestAddrInWindow(GuestAddr)) {
       const int GProt = GuestProtAt(GuestAddr);
       GuardedLoad D {};

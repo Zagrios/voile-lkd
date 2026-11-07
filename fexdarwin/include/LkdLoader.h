@@ -9,8 +9,6 @@ struct GuestThread;
 // Top of the initial stack of every program: 64 MiB under the top of the guest window, above LKD's mmap base (window
 // top - 128 MiB), like Linux places the stack above the mmap area. Set once the window is known (main.cpp).
 extern uint64_t LkdStackTop;
-// Size of the guest window in LKD mode: guest addresses run from 0 to LkdWindowBytes (set with LkdStackTop).
-extern uint64_t LkdWindowBytes;
 
 struct LkdLoadRequest {
   std::string GuestPath;          // path of the executable inside the guest root
