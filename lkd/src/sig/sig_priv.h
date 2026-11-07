@@ -77,7 +77,7 @@ struct sig_task {
 };
 
 /* Tasks to wake (and kick) after the sig lock is released. Each holds a task reference. */
-#define SIG_WAKESET_MAX 512
+#define SIG_WAKESET_MAX 2048
 struct sig_wakeset { int n; int kick_self; lkd_task *t[SIG_WAKESET_MAX]; };
 
 /* ---- futex.c: shared sleepers and the robust spin lock, for ntsync.c ------------------------------
