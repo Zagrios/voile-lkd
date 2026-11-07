@@ -585,7 +585,19 @@ bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, 
   }
   // The page is open now: run the load here and close it again, or step its guest instruction.
   if (Decoded) {
+    // Another thread can close the page again between the open above and this copy. The handler runs with its own
+    // signal blocked (no SA_NODEFER, see Install()), and macOS replays a fault that arrives blocked until someone
+    // reopens the page: the thread spins at 100 % without ever getting here again. Let the fault signals through for
+    // the copy, as step 3 of HandleFault does for its emulated access. The nested fault is host code touching a
+    // guarded page, so step 6 of HandleFault opens the page once more and the copy completes. The copy depends on
+    // step 6: if step 6 ever misses this nested fault, the race turns into an unhandled fault here.
+    sigset_t Faults, Blocked;
+    sigemptyset(&Faults);
+    sigaddset(&Faults, SIGBUS);
+    sigaddset(&Faults, SIGSEGV);
+    pthread_sigmask(SIG_UNBLOCK, &Faults, &Blocked);
     memcpy(Bytes, reinterpret_cast<const void*>(D.Addr), D.L.Bytes());
+    pthread_sigmask(SIG_SETMASK, &Blocked, nullptr);
     fexdarwin_lkd_guard_close(Page);
     ApplyGuardedLoad(Uc, D, Bytes);
     return true;
