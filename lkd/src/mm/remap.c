@@ -136,6 +136,9 @@ static int64_t move_vma(lkd_task *t, lkd_mm *mm, mm_vma *v, uint64_t addr, uint6
                         uint64_t nw, uint64_t flags, struct mm_inval *iv)
 {
     (void)t;
+    /* map_count >= sysctl_max_map_count - 3: room for the new VMA and for the unmap of the old range, which may
+     * split one VMA into three */
+    if (mm_map_count_over(mm, 4)) return -LX_ENOMEM;
     int hs = (v->vflags & VF_HOSTSHARED) != 0;
     if (hs) {
         if ((addr - nw) & (mm_hps - 1)) {
@@ -225,7 +228,9 @@ static int64_t remap_to(lkd_task *t, lkd_mm *mm, uint64_t addr, uint64_t old_len
     if (nw & (GP - 1)) return -LX_EINVAL;
     if (new_len > mm_win.g_hi - mm_win.g_lo || nw < mm_win.g_lo || nw > mm_win.g_hi - new_len) return -LX_EINVAL;
     if (addr + old_len > nw && nw + new_len > addr) return -LX_EINVAL;
-    if (mm->vt.n + 2 >= 65530 - 3) return -LX_ENOMEM;
+    /* (map_count + 2) >= sysctl_max_map_count - 3: the unmaps below may add one VMA each, then move_vma wants
+     * four free slots */
+    if (mm_map_count_over(mm, 6)) return -LX_ENOMEM;
     int r;
     if (flags & LX_MREMAP_FIXED) {
         if ((r = mm_unmap_locked(mm, nw, nw + new_len, iv))) return r;

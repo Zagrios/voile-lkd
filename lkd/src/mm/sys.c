@@ -114,7 +114,7 @@ static int64_t do_mmap(lkd_task *t, lkd_mm *mm, uint64_t addr, uint64_t len, uin
     uint64_t alen = GP_ALIGN(len);
     if (!alen) return -LX_ENOMEM;
     if ((off >> 12) + (alen >> 12) < (off >> 12)) return -LX_EOVERFLOW;
-    if (mm->vt.n > 65530) return -LX_ENOMEM;
+    if (mm_map_count_over(mm, 0)) return -LX_ENOMEM;   /* map_count > sysctl_max_map_count */
     uint32_t type = flags & LX_MAP_TYPE;
     int hostshared = type == LX_MAP_SHARED || type == LX_MAP_SHARED_VALIDATE;
     uint64_t span = mm_win.g_hi - mm_win.g_lo;

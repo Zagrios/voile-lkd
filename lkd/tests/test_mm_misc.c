@@ -370,6 +370,38 @@ LT_TEST(vm_counters_follow_the_tree)
     down();
 }
 
+/* vm.max_map_count is LKD_MAX_MAP_COUNT (mm.h), not Linux's default of 65530: past 65540 VMAs, mmap, an munmap and an
+ * mprotect that split a VMA, and mremap(MREMAP_MAYMOVE | MREMAP_FIXED) still succeed (do_mmap and remap_to kept 65530
+ * when the limit was first raised). */
+LT_TEST(more_vmas_than_linux_default)
+{
+    up();
+    const uint64_t n = 65544;
+    int64_t a = MMAP(0, n * 0x1000, RW, PA);
+    LT_CHECK(a > 0);
+    H((uint64_t)a + 0x3000)[0] = 0x5a;                                         /* page 3, moved below */
+    int bad = 0;
+    for (uint64_t i = 1; i < n; i += 2)                                         /* RW, R, RW, R...: a VMA per page */
+        if (sc(LKD_NR_mprotect, (uint64_t)a + i * 0x1000, 0x1000, LX_PROT_READ, 0, 0, 0)) bad++;
+    LT_EQ(bad, 0);
+    LT_EQ(T->mm->vt.n, n);
+    int64_t b = MMAP(0, 0x4000, LX_PROT_READ | LX_PROT_EXEC, PA);
+    LT_CHECK(b > 0);
+    LT_EQ(sc(LKD_NR_munmap, (uint64_t)b + 0x1000, 0x1000, 0, 0, 0, 0), 0);        /* a hole in the middle */
+    LT_EQ(sc(LKD_NR_mprotect, (uint64_t)b + 0x2000, 0x1000, RW, 0, 0, 0), 0);
+    LT_EQ(T->mm->vt.n, n + 3);
+    LT_EQ(MREMAP(a + 0x3000, 0x1000, 0x1000, LX_MREMAP_MAYMOVE | LX_MREMAP_FIXED, b + 0x1000), b + 0x1000);
+    uint8_t c = 0;
+    LT_EQ(lkd_user_read((uint64_t)b + 0x1000, &c, 1), 0);
+    LT_EQ(c, 0x5a);
+    struct lkd_vma_info vi;
+    LT_EQ(lkd_mm_find(T->mm, (uint64_t)b + 0x1000, 0, &vi), 0);
+    LT_EQ(vi.prot, LX_PROT_READ);
+    LT_EQ(T->mm->vt.n, n + 3);
+    LT_EQ(vt_check(&T->mm->vt), 0);
+    down();
+}
+
 LT_TEST(pkeys_and_shadow_stack)
 {
     up();
@@ -459,6 +491,7 @@ int main(void)
     LT_RUN(high_water_marks);
     LT_RUN(rss_counting_and_cache);
     LT_RUN(vm_counters_follow_the_tree);
+    LT_RUN(more_vmas_than_linux_default);
     LT_RUN(pkeys_and_shadow_stack);
     LT_RUN(maps_exact_format);
     LT_RUN(futex_keys);
