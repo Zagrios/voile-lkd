@@ -159,4 +159,11 @@ int lkd_mm_futex_key(lkd_task *t, uint64_t gva, int private_hint, struct lkd_fut
  * mappings stay shared (shared anonymous memory is backed by a shared memory object), parent releases,
  * child releases and re-identifies the mm. */
 
+/* vm.max_map_count. Linux's default 65530 (DEFAULT_MAX_MAP_COUNT) is reached by games that remap and reprotect
+ * for an hour (HELLDIVERS 2 after 80 minutes: mprotect splits fail with ENOMEM, Wine keeps its own view of the
+ * protection, the next jump into such a page is a DEP fault); SteamOS and Arch set 1048576 (mm.c MAX_MAP_COUNT,
+ * /proc/sys/vm/max_map_count). */
+#define LKD_MAX_MAP_COUNT 1048576
+#define LKD_MAX_MAP_COUNT_STR "1048576"
+
 #endif /* LKD_MM_H */
