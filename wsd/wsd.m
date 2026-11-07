@@ -1614,9 +1614,11 @@ static CAMetalLayer *make_metal_layer(void) {
     WsdWindow *w = [self win:m->window_id req:type];
     if (!w) break;
     BOOL on = m->value != 0;
-    if (on && w.stalled) { /* the next frame shown takes the pointer */
+    /* The next frame shown, or the window becoming key again, takes the pointer: a game kept in the foreground
+     * while another app is active (WINE_OBELISK_KEEP_FOREGROUND) must not dissociate the user's pointer there. */
+    if (on && (w.stalled || !w.window.keyWindow)) {
       w.relative = YES;
-      LOG("client %d: relative mouse on, waiting for a frame", self.pid);
+      LOG("client %d: relative mouse on, waiting for %s", self.pid, w.stalled ? "a frame" : "the window to be key");
       break;
     }
     if (on != w.relative) {
