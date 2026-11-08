@@ -1,15 +1,48 @@
 #!/bin/sh
-# relative mouse windows of a game's log: how long the driver stayed in relative mode each time, and
-# the jump the game saw on the way out (the raw counts of the window handed back as one absolute move,
-# which is what a snap-back of the view looks like). a driver that behaves shows windows spanning
-# whole matches and a snap-back column near 0. needs `trace+obelisk` in the runtime's winedebug file.
-# usage: tools/dev/mouse-snapback.sh ~/Library/Logs/Obelisk/Steam/wine-<app id>.log
-[ -f "${1:-}" ] || { sed -n '2,6p' "$0" | sed 's/^# //'; exit 2; }
-/usr/bin/grep "update_relative_mouse\|send_mouse hwnd 0x[0-9a-f]* flags 0x1 \|send_mouse hwnd 0x[0-9a-f]* flags 0x8001" "$1" | awk -F'[: ,]' '
-# a window opens on "relative mouse window 0 -> N" and closes on "-> 0"; flags 0x1 moves are the raw
-# deltas inside it, the first 0x8001 (absolute) move after it is the pointer the game got back
-/update_relative_mouse/ { if ($0 ~ /-> [1-9]/) { if (wait) { printf "%.3f %7.2f s %4d raw moves, raw sum %4.0f px, no absolute move before the next window\n", on, off-on, n, sqrt(sx*sx+sy*sy); tot++; dur+=off-on; wait=0 } on=$1+0; n=0; sx=0; sy=0; bx=lx; by=ly } else if (on) { off=$1+0; wait=1 } next }
-/flags 0x1 / { if (on && !wait) { n++; sx+=$(NF-3); sy+=$(NF-2) } next }
-/flags 0x8001/ { x=$(NF-3); y=$(NF-2); if (wait) { jx=x-bx; jy=y-by; raw=sqrt(sx*sx+sy*sy); snap=sqrt((jx+sx)*(jx+sx)+(jy+sy)*(jy+sy));
-      printf "%.3f %7.2f s %4d raw moves, raw sum %4.0f px, pointer jump %4.0f px, snap-back %4.0f px\n", on, off-on, n, raw, sqrt(jx*jx+jy*jy), raw-sqrt(jx*jx+jy*jy); tot++; dur+=off-on; if (raw-sqrt(jx*jx+jy*jy)>=20) big++; wait=0; on=0 } lx=x; ly=y }
-END { printf "windows %d, total %.0f s in relative mode, snap-backs >= 20 px: %d\n", tot, dur, big+0 }'
+# Relative mouse windows of a game's log: how long the driver stayed in relative mode each time, and the jump the
+# game's cursor made on the way out. Since voile-wine a73dadee4ed, the driver warps the Mac pointer to Wine's cursor
+# when it leaves relative mode, and the jump is the distance from that warp to the first absolute move after it:
+# near 0 when the driver behaves. A log of an older driver has no warp line; the jump is then the distance from
+# where the raw moves took Wine's cursor (the last absolute position plus their sum, without the clamp to the
+# screen) to the first absolute move, which is the snap-back of the view.
+# It needs Wine's obelisk channel with timestamps: `+timestamp,err+all,fixme-all,trace+obelisk` on the first line
+# of the runtime's linux/winedebug (see profile-session.sh).
+# Usage: tools/dev/mouse-snapback.sh ~/Library/Logs/Obelisk/Steam/wine-<app id>.log
+[ -f "${1:-}" ] || { sed -n '2,/^# Usage/p' "$0" | sed 's/^# //'; exit 2; }
+/usr/bin/grep -E 'update_relative_mouse |send_mouse hwnd 0x[0-9a-f]+ flags 0x(1|8001) ' "$1" | awk '
+# Wine timestamp in seconds, or -1 on a line without one
+function stamp(  t) { t = $1; sub(/:.*/, "", t); return (t ~ /^[0-9]+\.[0-9]+$/) ? t + 0 : -1 }
+# The x,y of "send_mouse hwnd H flags F x,y data D" and of "warp to x,y, ..."
+function xy(word,  i) { for (i = 1; i < NF; i++) if ($i == word) { split($(i + (word == "flags" ? 2 : 1)), p, ","); return 1 } return 0 }
+function report(jump, how) {
+    printf "%10.3f %8.2f s %5d raw moves, raw sum %5.0f px, jump ", on, off - on, n, sqrt(sx * sx + sy * sy)
+    if (jump < 0) printf "    ? (%s)\n", how; else printf "%5.0f px (%s)\n", jump, how
+    windows++; total += off - on; if (jump >= 20) big++
+}
+{ t = stamp() }
+t < 0 { unstamped++; next }
+/relative mouse window/ {
+    if ($NF != 0) {
+        if (state == "off") report(-1, "no absolute move before the next window")
+        state = "on"; on = t; n = 0; sx = 0; sy = 0; bx = lx; by = ly; based = seen; warped = 0
+    } else if (state == "on") { state = "off"; off = t }
+    next
+}
+/update_relative_mouse warp to / { if (state == "off" && xy("to")) { wx = p[1]; wy = p[2]; warped = 1 } next }
+/ flags 0x1 / { if (state == "on" && xy("flags")) { n++; sx += p[1]; sy += p[2] } next }
+/ flags 0x8001 / {
+    if (!xy("flags")) next
+    if (state == "off") {
+        if (warped) report(sqrt((p[1] - wx) ^ 2 + (p[2] - wy) ^ 2), "from the warp")
+        else if (based) report(sqrt((p[1] - bx - sx) ^ 2 + (p[2] - by - sy) ^ 2), "no warp: from where the raw moves led")
+        else report(-1, "no warp and no absolute move before the window")
+        state = ""
+    }
+    lx = p[1]; ly = p[2]; seen = 1
+}
+END {
+    if (state == "on") printf "%10.3f still in relative mode at the end of the log\n", on
+    printf "windows %d, total %.0f s in relative mode, jumps >= 20 px: %d\n", windows, total, big
+    if (!NR) print "no relative mouse or send_mouse lines: the obelisk channel of Wine is off (see the header of this script)"
+    else if (unstamped && !windows) print "no Wine timestamps: put +timestamp in WINEDEBUG (see the header of this script)"
+}'

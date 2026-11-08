@@ -43,7 +43,7 @@ Apart from `guest/`, what runs inside the guest comes from elsewhere: voile-wine
 | `input/` | `obelisk-input`, the gamepad service of both of Voile's Wines: a native arm64 program that reads the Mac's gamepads with SDL3, linked statically, and serves them to voile-wine's `winebus.sys` over a UNIX socket, rumble included (`input/obelisk_input_protocol.h`). |
 | `guest/` | x86-64 Linux libraries for the guest, built with zig. `steam-hostpid.so` makes `getpid()` return the macOS pid of the host process when Valve's `steamclient.so` calls it (`/proc/<pid>/lkd_host_pid`): Obelisk's Steam host drops a client whose pid is not a live macOS process. |
 | `tests/` | Witness programs: x86-64 ELF (`elf-x86_64`, freestanding), glibc (`glibc-x86_64`), Darwin facts, graphics, input, the EAC probe campaign. |
-| `tools/dev/` | Development scripts that drive a whole session: authenticated Rocket League launch, offline Free Play, mouse stress. `profile-session.sh` records a session of any game in Obelisk (CPU per process and thread, frame pacing, stalls, thermal state). |
+| `tools/dev/` | Development scripts that drive a whole session: authenticated Rocket League launch, offline Free Play, mouse stress. `profile-session.sh` records a session of a game on the Linux engine of an installed Obelisk (CPU per process and thread, frame rate and long frames, stalls, thermal pressure). |
 | `tools/epic-launch/` | Builds an Epic launch plan with Obelisk's `epic-kit`, for development only: Obelisk does this itself. |
 | `docs/` | `V1.md`, and `journal/`, the research and integration journal. |
 
@@ -80,7 +80,7 @@ fexdarwin/scripts/run-with-timeout.sh 60 fexdarwin/build/host/fexdarwin-run \
 > [!WARNING]
 > Always start guests through `run-with-timeout.sh`, or any supervisor that sets `FEXDARWIN_SUPERVISOR_PID`. Every guest process ends itself within half a second once its supervisor is gone. Runaway guests once exhausted the kernel's VM map entries and panicked the Mac (see the safety section of `docs/V1.md`).
 
-The scripts in `tools/dev/` and most of `tests/` expect the development workspace they were written in (`EXP`: the Debian root, the Wine build, a copy of the game, the evidence folders). They are kept as they ran for v1. `tools/dev/profile-session.sh`, `analyze-log.py` and `mouse-snapback.sh` only need an installed Obelisk.
+The scripts in `tools/dev/` and most of `tests/` expect the development workspace they were written in (`EXP`: the Debian root, the Wine build, a copy of the game, the evidence folders). They are kept as they ran for v1. `tools/dev/profile-session.sh`, `analyze-log.py` and `mouse-snapback.sh` need only an installed Obelisk and a game on the Linux engine; their headers say which Wine channels to turn on.
 
 ## Documentation
 
