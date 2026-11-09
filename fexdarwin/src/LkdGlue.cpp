@@ -601,6 +601,9 @@ int ExecImage(lkd_task* t, const struct lkd_exec_image* Img) {
   for (auto& R : St.gregs) R = 0;
   St.rip = T->StartRip;
   St.gregs[X::REG_RSP] = T->StartRsp;
+  // start_thread loads null DS, ES, FS and GS, whatever selectors the old image left there.
+  St.ds_idx = St.es_idx = St.fs_idx = St.gs_idx = 0;
+  St.ds_cached = St.es_cached = 0;
   St.fs_cached = 0;
   St.gs_cached = 0;
   ClearIa32TlsEntries(T); // flush_thread: the new image starts without the old one's TLS entries
@@ -712,15 +715,6 @@ extern "C" uint64_t fexdarwin_kick_safepoint(GuestThread* T) {
   if (T->PendingIa32Syscall) {
     T->PendingIa32Syscall = false;
     HandleIa32Syscall(T);
-  }
-  if (T->PendingUd) {
-    T->PendingUd = false;
-    if (!EmulateFsLoad(T)) {
-      T->FaultErr = 0;
-      T->FaultTrapNo = Linux::TRAP_UD;
-      T->FaultAddr = T->PendingUdAddr;
-      lkd_fault(T->Task, Linux::L_SIGILL, T->PendingUdSiCode, T->PendingUdAddr, 0, Linux::TRAP_UD);
-    }
   }
   DeliverPendingSignals(T);
   T->InLkd.store(false);

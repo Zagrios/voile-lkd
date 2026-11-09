@@ -106,15 +106,12 @@ bool DarwinSignalDelegator::DeliverGuestSignal(GuestThread* T, ucontext_t* Uc, c
   if (LkdEnabled()) {
     // LKD owns the signal state: queue the forced signal, then let the kick trampoline run lkd_signal_next on the thread
     // stack (handler frame, or death of the process for a blocked, ignored or default action).
-    // An int $0x80 is Linux's 32-bit system call entry, not a fault: FEXCore raises #GP for it with the error code of
-    // IDT vector 0x80, which no other instruction produces. The kick safe point serves it (Ia32Syscall.cpp).
-    if (F.Signal == Linux::L_SIGSEGV && F.TrapNo == Linux::TRAP_GP && F.Err == ((0x80u << 3) | 2)) {
+    // An int $0x80 is Linux's 32-bit system call entry: FEXCore raises #GP for it with the error code of IDT vector
+    // 0x80, which no other instruction produces. The kick safe point serves set_thread_area and get_thread_area
+    // (Ia32Syscall.cpp); any other call keeps the #GP, as on a kernel without IA32 emulation.
+    const bool Int80 = F.Signal == Linux::L_SIGSEGV && F.TrapNo == Linux::TRAP_GP && F.Err == ((0x80u << 3) | 2);
+    if (Int80 && ServesIa32Syscall(St)) {
       T->PendingIa32Syscall = true;
-    } else if (F.Signal == Linux::L_SIGILL && F.TrapNo == Linux::TRAP_UD) {
-      // Possibly a mov to %fs in 64-bit code, which FEXCore rejects: the safe point emulates it or delivers SIGILL.
-      T->PendingUd = true;
-      T->PendingUdSiCode = F.SiCode;
-      T->PendingUdAddr = F.Addr;
     } else {
       T->FaultErr = F.Err;
       T->FaultTrapNo = F.TrapNo;
