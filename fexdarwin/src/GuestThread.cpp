@@ -57,14 +57,27 @@ GuestThread* CreateGuestThread(GuestThread* Parent) {
     memcpy(T->Gdt, Parent->Gdt, sizeof(T->Gdt));
     T->SigMask = Parent->SigMask;
   } else {
-    // FEX selects the GDT entry with Selector >> 3, so the RPL bits are safe.
-    for (uint16_t Selector : {GUEST_USER32_CS, GUEST_USER_CS}) {
+    // Linux's ring 3 descriptors, flat, with the access rights LAR reports for them (gdt_page in
+    // arch/x86/kernel/cpu/common.c, and setup_getcpu for 0x7b, whose limit holds the CPU number: LSL answers it from
+    // FEXCore's LinuxUserSegment). FEXCore takes 32-bit or 64-bit mode from the L bit of CS's descriptor, and checks a
+    // MOV to FS or GS in 64-bit mode against the descriptor. FEX selects the entry with Selector >> 3, so the RPL bits
+    // are safe.
+    auto Set = [&](uint16_t Selector, uint8_t Type, bool L, bool D, bool G, uint32_t Limit) {
       auto* Seg = CPUState::GetSegmentFromIndex(Frame->State, Selector);
-      CPUState::SetGDTBase(Seg, 0);
-      CPUState::SetGDTLimit(Seg, 0xF'FFFFU);
-      Seg->L = Selector == GUEST_USER_CS; // long mode
-      Seg->D = Selector == GUEST_USER32_CS;
-    }
+      *Seg = {};
+      CPUState::SetGDTLimit(Seg, Limit);
+      Seg->Type = Type;
+      Seg->S = 1;
+      Seg->DPL = 3;
+      Seg->P = 1;
+      Seg->L = L;
+      Seg->D = D;
+      Seg->G = G;
+    };
+    Set(GUEST_USER32_CS, 0xb, false, true, true, 0xF'FFFF); // execute/read, accessed
+    Set(GUEST_USER_DS, 0x3, false, true, true, 0xF'FFFF);   // read/write, accessed
+    Set(GUEST_USER_CS, 0xb, true, false, true, 0xF'FFFF);   // long mode
+    Set(GUEST_CPUNODE_SEL, 0x5, false, true, false, 0);     // read-only, expand-down, accessed
     LoadGuestCodeSegments(Frame->State, GUEST_USER_CS);
   }
 

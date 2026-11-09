@@ -111,8 +111,9 @@ inline uint32_t GuestEflags(FEXCore::Core::InternalThreadState* Th) {
 }
 
 // Linux x86-64 user selectors (arch/x86/include/asm/segment.h): 32-bit code, data and 64-bit code are GDT entries 4, 5
-// and 6, with RPL 3.
-constexpr uint16_t GUEST_USER32_CS = (4 << 3) | 3, GUEST_USER_DS = (5 << 3) | 3, GUEST_USER_CS = (6 << 3) | 3;
+// and 6, with RPL 3; entry 15 is the per-CPU segment of the vDSO's getcpu.
+constexpr uint16_t GUEST_USER32_CS = (4 << 3) | 3, GUEST_USER_DS = (5 << 3) | 3, GUEST_USER_CS = (6 << 3) | 3,
+                   GUEST_CPUNODE_SEL = (15 << 3) | 3;
 
 // Loads the guest's CS and SS on the way back to user mode. FEXCore decodes the code that follows in the mode of CS's
 // descriptor: 32-bit code under GUEST_USER32_CS, 64-bit code under any other selector, as Windows forces its user code

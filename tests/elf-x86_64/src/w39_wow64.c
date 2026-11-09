@@ -5,6 +5,11 @@
 // (alloc_fs_sel), with the checks of arch/x86/kernel/tls.c. Also get_thread_area, an entry cleared, the reload of a
 // segment register that holds the changed entry, the entry kept by a forked child and gone after an execve
 // (flush_thread), and SIGSEGV for any other int $0x80, as on a kernel without IA32 emulation.
+// Then the mov to %fs Wine makes in 64-bit code before each return to 32-bit code, from a register (ntdll's dispatcher
+// returns) and from 0x90(%r13) (wow64cpu's reset path), after which the 32-bit code reads its TEB without loading %fs
+// itself, and the rules of such loads in 64-bit mode: the base is the descriptor's, zero-extended, a read gives the
+// selector back, 0x2b loads base 0, 0x53 or a selector past the table raise #GP, and a null selector keeps the base,
+// which FEXCore takes from AMD processors without NullSelectorClearsBase (Intel's clear it).
 // Build with EXEC=1: the 32-bit code, its stack and the user_desc must be below 4 GiB. Linux guest only (int $0x80,
 // iretq to selector 0x23, an execve of itself): no WITNESS_HOSTED build.
 #include "rt.h"
@@ -15,8 +20,9 @@
 // leaves for good with ljmp.
 extern u32 call32(u64 entry);
 extern u32 call32_ljmp(void);
-extern char c32_x87[], c32_fs[], c32_fs_area[], c32_i80_end[];
+extern char c32_x87[], c32_fs[], c32_fs_area[], c32_i80_end[], c32_fs_noload[];
 u32 sel32, desc32;
+u16 sel_mem[0x50];
 u32 result32;
 __asm__(
   ".text\n"
@@ -81,6 +87,11 @@ __asm__(
   "  xor %eax, %eax\n"
   "  mov %ax, %fs\n"
   "  ljmp *far_ret64\n"
+  ".globl c32_fs_noload\n"
+  "c32_fs_noload:\n"                       // %fs:0 through whatever %fs the 64-bit side loaded
+  "  movl %fs:0, %eax\n"
+  "  movl %eax, result32\n"
+  "  ljmp *far_ret64\n"
   "c32_lcall:\n"
   "  movl $7, result32\n"
   "  lcall *far_back64_lcall\n"
@@ -102,10 +113,19 @@ __asm__(
 
 // 64-bit code that may fault: the signal handler goes on at the label after the instruction, so an engine that gets it
 // wrong gives FAIL lines instead of dying. int80_call(nr, arg) is int $0x80 with nr in eax and arg in ebx.
-extern char i80_at[], i80_end[];
+extern char lfs_at[], lfs_end[], lfs90_end[], lfsrip_end[], lgs_end[], i80_at[], i80_end[];
 __asm__(".text\n"
+  ".globl load_fs\nload_fs:\n.globl lfs_at\nlfs_at: movw %di, %fs\n.globl lfs_end\nlfs_end: ret\n"
+  ".globl load_fs_r13\nload_fs_r13: push %r13\n lea sel_mem(%rip), %r13\n movw 0x90(%r13), %fs\n"
+  ".globl lfs90_end\nlfs90_end: pop %r13\n ret\n"
+  ".globl load_fs_rip\nload_fs_rip: movw sel_mem+0x90(%rip), %fs\n.globl lfsrip_end\nlfsrip_end: ret\n"
+  ".globl load_gs\nload_gs: movw %di, %gs\n.globl lgs_end\nlgs_end: ret\n"
   ".globl int80_call\nint80_call: push %rbx\n mov %edi, %eax\n mov %esi, %ebx\n.globl i80_at\ni80_at: int $0x80\n"
   ".globl i80_end\ni80_end: pop %rbx\n ret\n");
+void load_fs(u64 sel);
+void load_fs_r13(u64 unused);
+void load_fs_rip(u64 unused);
+void load_gs(u64 sel);
 i32 int80_call(u32 nr, u32 arg);
 
 #define SIGILL_ 4
@@ -132,6 +152,22 @@ static void on_fault(int sig, void* si, struct ucontext_* uc) {
   uc->mc.rip = resume_rip;
 }
 
+// Runs fn(arg), going on at end after a signal; the signal taken, or 0.
+static int run_at(void (*fn)(u64), u64 arg, const char* end) {
+  last_sig = 0; last_rip = 0; last_err = 0; last_trapno = 0; resume_rip = (u64)end;
+  fn(arg);
+  resume_rip = 0;
+  return last_sig;
+}
+
+// SIGSEGV with #GP (trap 13) at `at`.
+static int gp_at(void (*fn)(u64), u64 arg, const char* at, const char* end) {
+  run_at(fn, arg, end);
+  int ok = last_sig == SIGSEGV_ && last_rip == (u64)at && last_trapno == 13;
+  if (!ok) { puts_("     sig="); put_dec(last_sig); puts_(" rip="); put_hex(last_rip, 12); puts_(" trapno="); put_dec((i64)last_trapno); puts_("\n"); }
+  return ok;
+}
+
 // struct user_desc (asm/ldt.h); flags 0x41 = seg_32bit | useable, as alloc_fs_sel passes.
 struct user_desc { u32 entry_number, base_addr, limit, flags; };
 static struct user_desc desc;
@@ -144,6 +180,7 @@ static i32 int80(u32 nr, u32 arg) {
   return r;
 }
 enum { IA32_getpid = 20, IA32_set_thread_area = 243, IA32_get_thread_area = 244 };
+enum { ARCH_SET_GS = 0x1001, ARCH_SET_FS = 0x1002, ARCH_GET_FS = 0x1003, ARCH_GET_GS = 0x1004 };
 #define SYS_fork_ 57
 #define SYS_execve_ 59
 #define SYS_wait4_ 61
@@ -159,6 +196,10 @@ static u32 tls_base(u32 e) {
   int80(IA32_get_thread_area, (u32)(u64)&desc);
   return desc.base_addr;
 }
+static u64 arch_get(int code) { u64 v = 0; sys2(SYS_arch_prctl, code, (i64)&v); return v; }
+static u32 read_fs(void) { u32 v = 0xffffffffu; __asm__ volatile("movl %%fs, %0" : "+r"(v)); return v; }
+static u32 read_gs(void) { u32 v = 0xffffffffu; __asm__ volatile("movl %%gs, %0" : "+r"(v)); return v; }
+static u32 fs_word0(void) { u32 v; __asm__ volatile("movl %%fs:0, %0" : "=r"(v) : : "memory"); return v; }
 
 // Exit status of a child that runs fn (fork), or of this program run again with one argument (fork and execve).
 static int child_status(int (*fn)(void)) {
@@ -174,15 +215,16 @@ static int child_status(int (*fn)(void)) {
   return (st >> 8) & 0xff;
 }
 static u32 g_entry;
-static int forked_child(void) { return tls_base(g_entry) == (u32)(u64)&teb_a ? 7 : 9; }
-// The execve child (one argument): no TLS entry.
+static u16 g_sel;
+static int forked_child(void) { return tls_base(g_entry) == (u32)(u64)&teb_a && read_fs() == g_sel ? 7 : 9; }
+// The execve child (one argument): no TLS entry, and null FS and GS selectors.
 static int exec_child(void) {
   for (u32 e = 12; e <= 14; e++) if (tls_base(e)) return 9;
-  return 7;
+  return read_fs() == 0 && read_gs() == 0 ? 7 : 8;
 }
 
 static int run(void) {
-  puts_("w39_wow64: 32-bit code segment, WoW64 transfers, int $0x80 set_thread_area\n");
+  puts_("w39_wow64: 32-bit code segment, WoW64 transfers, int $0x80 set_thread_area, 64-bit loads of %fs and %gs\n");
   checkb("the witness runs below 4 GiB (EXEC=1)", (u64)&desc < (1ull << 32) && (u64)c32_x87 < (1ull << 32));
   struct ksigaction sa = {(u64)on_fault, SA_SIGINFO_ | SA_RESTORER_ | SA_NODEFER_, (u64)restorer, 0};
   sys4(SYS_rt_sigaction, SIGSEGV_, (i64)&sa, 0, 8);
@@ -237,10 +279,55 @@ static int run(void) {
   checkb("int $0x80 getpid: SIGSEGV at the int, #GP with IDT vector 0x80 (no IA32 emulation)",
          last_sig == SIGSEGV_ && last_rip == (u64)i80_at && last_trapno == 13 && last_err == 0x402);
 
+  // The loads Wine's 64-bit code makes before returning to 32-bit code, inline in FEXCore.
   set_area((u32)-1, (u32)(u64)&teb_a, 0x41);
   g_entry = desc.entry_number;
-  check64("a forked child keeps the TLS entry", (u64)child_status(forked_child), 7);
-  check64("after execve: no TLS entry", (u64)child_status(0), 7);
+  g_sel = (u16)((g_entry << 3) | 3);
+  sys2(SYS_arch_prctl, ARCH_SET_FS, 0x00007f5a12345000L); // a 64-bit base above 4 GiB, as glibc's
+  run_at(load_fs, 0, lfs_end);
+  check64("a null selector keeps all 64 bits of the base", arch_get(ARCH_GET_FS), 0x00007f5a12345000UL);
+  run_at(load_fs, g_sel, lfs_end);
+  check64("mov %reg to %fs in 64-bit code: the base is the descriptor's, zero-extended", arch_get(ARCH_GET_FS), (u64)&teb_a);
+  check64("mov %fs to a register in 64-bit code gives the selector", read_fs(), g_sel);
+  check64("%fs:0 in 64-bit code reads the TEB", fs_word0(), teb_a);
+  check64("then %fs:0 in 32-bit code without loading %fs", call32((u64)c32_fs_noload), teb_a);
+  set_area(g_entry, (u32)(u64)&teb_b, 0x41);
+  check64("set_thread_area on the entry %fs holds reloads its base", arch_get(ARCH_GET_FS), (u64)&teb_b);
+  run_at(load_fs, 0, lfs_end);
+  check64("a null selector keeps the base", arch_get(ARCH_GET_FS), (u64)&teb_b);
+  check64("... and reads back as 0", read_fs(), 0);
+
+  set_area(g_entry, (u32)(u64)&teb_a, 0x41);
+  sel_mem[0x90 / 2] = g_sel;
+  run_at(load_fs_r13, 0, lfs90_end);
+  check64("mov 0x90(%r13) to %fs in 64-bit code (wow64cpu's reset path)", call32((u64)c32_fs_noload), teb_a);
+  set_area(g_entry, (u32)(u64)&teb_b, 0x41);
+  run_at(load_fs_rip, 0, lfsrip_end);
+  check64("RIP-relative mov to %fs in 64-bit code", call32((u64)c32_fs_noload), teb_b);
+
+  run_at(load_fs, 0x2b, lfs_end);
+  check64("mov 0x2b (__USER_DS) to %fs: base 0", arch_get(ARCH_GET_FS), 0);
+  check64("... and reads back as 0x2b", read_fs(), 0x2b);
+  run_at(load_fs, g_sel, lfs_end);
+  checkb("mov 0x53 to %fs: #GP at the mov", gp_at(load_fs, 0x53, lfs_at, lfs_end));
+  check64("... which leaves %fs as it was", ((u64)read_fs() << 32) | arch_get(ARCH_GET_FS), ((u64)g_sel << 32) | (u64)&teb_b);
+  checkb("mov 0x1003 (past the GDT) to %fs: #GP", gp_at(load_fs, 0x1003, lfs_at, lfs_end));
+  set_area((u32)-1, (u32)(u64)&teb_a, 0x41);
+  u32 other = desc.entry_number;
+  run_at(load_fs, (other << 3) | 3, lfs_end);
+  desc = (struct user_desc){other, 0, 0, 0x28};
+  int80(IA32_set_thread_area, (u32)(u64)&desc);
+  check64("clearing the entry %fs holds leaves a null %fs with base 0", ((u64)read_fs() << 32) | arch_get(ARCH_GET_FS), 0);
+  checkb("mov of a cleared TLS entry's selector to %fs: #GP", gp_at(load_fs, (other << 3) | 3, lfs_at, lfs_end));
+
+  set_area(g_entry, (u32)(u64)&teb_a, 0x41);
+  run_at(load_gs, g_sel, lgs_end);
+  check64("mov to %gs in 64-bit code: the base is the descriptor's", arch_get(ARCH_GET_GS), (u64)&teb_a);
+  check64("... and %gs reads back the selector", read_gs(), g_sel);
+
+  run_at(load_fs, g_sel, lfs_end);
+  check64("a forked child keeps the TLS entry and %fs", (u64)child_status(forked_child), 7);
+  check64("after execve: no TLS entry, null %fs and %gs", (u64)child_status(0), 7);
   return finish("w39_wow64");
 }
 
