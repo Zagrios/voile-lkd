@@ -801,6 +801,22 @@ struct lx_cap_data { uint32_t effective, permitted, inheritable; };
 #define LX_ARCH_SET_CPUID 0x1012
 #define LX_ARCH_CET_STATUS 0x3001
 
+/* set_thread_area, get_thread_area, modify_ldt: struct user_desc (asm/ldt.h). flags holds its bitfields from bit 0 in
+ * this order; the bits above lm are padding the kernel ignores. */
+struct lx_user_desc {
+    uint32_t entry_number;
+    uint32_t base_addr;
+    uint32_t limit;
+    uint32_t flags;
+};
+#define LX_USER_DESC_SEG_32BIT 0x01u
+#define LX_USER_DESC_CONTENTS(flags) (((flags) >> 1) & 3u) /* MODIFY_LDT_CONTENTS_DATA, _STACK, _CODE */
+#define LX_USER_DESC_READ_EXEC_ONLY 0x08u
+#define LX_USER_DESC_LIMIT_IN_PAGES 0x10u
+#define LX_USER_DESC_SEG_NOT_PRESENT 0x20u
+#define LX_USER_DESC_USEABLE 0x40u
+#define LX_USER_DESC_LM 0x80u
+
 #define LX_FUTEX_WAIT 0
 #define LX_FUTEX_WAKE 1
 #define LX_FUTEX_FD 2
@@ -1329,6 +1345,7 @@ _Static_assert(offsetof(struct lx_rt_sigframe, info) == 312, "rt_sigframe.info")
 _Static_assert(sizeof(struct lx_rt_sigframe) == 440, "rt_sigframe");
 _Static_assert(sizeof(struct lx_signalfd_siginfo) == 128, "signalfd_siginfo");
 _Static_assert(sizeof(struct lx_clone_args) == LX_CLONE_ARGS_SIZE_VER2, "clone_args");
+_Static_assert(sizeof(struct lx_user_desc) == 16, "user_desc");
 _Static_assert(sizeof(struct lx_timespec) == 16 && sizeof(struct lx_timeval) == 16, "time");
 _Static_assert(sizeof(struct lx_itimerspec) == 32 && sizeof(struct lx_itimerval) == 32, "itimer");
 _Static_assert(sizeof(struct lx_tms) == 32, "tms");
