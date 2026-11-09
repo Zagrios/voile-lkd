@@ -43,7 +43,7 @@ rules that the header cannot express.
 | 10 | BUFFER_DETACH | `wsd_buffer` | drops the server reference; the mapping is unmapped when the last in-flight GPU use ends |
 | 11 | PRESENT | `wsd_present` | queues the buffer for the window (mailbox: an unshown older frame is released with `shown=0` and counted in the next `EV_PRESENTED.replaced`) |
 | 12 | SET_TITLE | `wsd_window` + UTF-8 | window title |
-| 13 | SET_FRAME_RATE | `wsd_window_flag` | `CADisplayLink.preferredFrameRateRange` = value Hz (0: display default) |
+| 13 | SET_FRAME_RATE | `wsd_window_flag` | `CADisplayLink.preferredFrameRateRange` = value Hz (0: display default). With `WSD_FRAME_RATE_DIVISOR` \| n, every frame stays for n refreshes of the window's screen; with `WSD_FRAME_RATE_AUTO` \| fps, wsd takes the highest steady rate of the screen at or below fps, and a slower one while the game does not keep up |
 | 14 | PING | `wsd_ping` | `EV_PONG` with server time |
 | 15 | DEBUG_INJECT | `wsd_window_flag` | test only: synthetic NSEvents fed to the window (1: key, modifiers, buttons, motion, wheel; 2: raw delta; 3: motion outside the clip rect). Every resulting event carries flag bit 31 (`WSD_KEY_SYNTHETIC`) |
 | 16 | QUIT | none | server exits |

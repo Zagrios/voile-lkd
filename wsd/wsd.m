@@ -16,6 +16,7 @@
 #import <Carbon/Carbon.h> /* kVK_* */
 
 #include <errno.h>
+#include <math.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -29,6 +30,7 @@
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <stdatomic.h>
 #include "wsd_protocol.h"
+#include "wsd_frame_lock.h"
 
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
@@ -191,6 +193,11 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 /* present interval statistics (logged every 120 shown frames per plane) */
 @property uint64_t statLastNs, statSumNs, statMaxNs, statMinNs;
 @property uint32_t statCount;
+@property double statSqSum; /* squared intervals in ms, for the spread */
+@property uint64_t statHeldNs; /* from a frame reaching wsd to its being on screen */
+/* SET_FRAME_RATE: a fixed rate (Hz), or a lock to the refreshes of the window's screen; either keeps the ticks */
+@property float frameHz, appliedHz;
+@property wsd_frame_lock frameLock;
 @property BOOL relative, clip, fullscreen, transitioning;
 @property NSRect clipPx;
 /* when the window last showed a new frame on either plane, and whether it has held the pointer without one for
@@ -211,6 +218,7 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 /* the mac keycodes the client was last told are down */
 @property(strong) NSMutableIndexSet *heldKeys;
 - (void)sendEvent:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
+- (void)applyFrameRate;
 - (void)noteKey:(uint32_t)code down:(BOOL)down;
 - (NSWindowLevel)levelForActive:(BOOL)active;
 - (BOOL)floatsForActive:(BOOL)active;
@@ -945,23 +953,66 @@ static CAMetalLayer *make_metal_layer(void) {
 
 /* Display-link tick: encode the latest pending frame, if any. */
 - (void)tick:(CADisplayLink *)link {
-  [self tickPlane];
-  if (self.overlay) [self.overlay tickPlane];
+  BOOL shown = [self tickPlane];
+  if (self.overlay && [self.overlay tickPlane]) shown = YES;
+  [self noteLockTick:shown];
 }
 
-- (void)tickPlane {
+/* The display link's rate from SET_FRAME_RATE. A lock follows the screen the window is on now: every frame stays for a
+ * whole number of its refreshes (wsd_frame_lock.h). */
+- (void)applyFrameRate {
+  if (self.isOverlay) return;
+  float hz = self.frameHz;
+  wsd_frame_lock l = self.frameLock;
+  NSScreen *screen = self.window.screen ?: primary_screen();
+  if (l.mode != WSD_LOCK_NONE) {
+    uint32_t refresh = (uint32_t)screen.maximumFramesPerSecond;
+    if (l.refresh_hz != refresh) {
+      wsd_lock_set_screen(&l, refresh);
+      self.frameLock = l;
+    }
+    hz = (float)refresh / l.divisor;
+  }
+  if (hz == self.appliedHz) return;
+  self.appliedHz = hz;
+  self.link.preferredFrameRateRange = hz > 0 ? CAFrameRateRangeMake(hz, hz, hz) : CAFrameRateRangeDefault;
+  if (l.mode == WSD_LOCK_NONE)
+    LOG("window %u: preferred frame rate %.0f Hz", self.windowId, hz);
+  else
+    LOG("window %u: frames locked to %.1f Hz (every %u refreshes of '%s', %s)", self.windowId, hz, l.divisor,
+        screen.localizedName.UTF8String, l.mode == WSD_LOCK_AUTO ? "automatic" : "fixed");
+}
+
+- (void)windowDidChangeScreen:(NSNotification *)n {
+  [self applyFrameRate];
+}
+
+/* An automatic lock judges whether the game keeps up (wsd_frame_lock.h). */
+- (void)noteLockTick:(BOOL)shown {
+  wsd_frame_lock l = self.frameLock;
+  if (l.mode != WSD_LOCK_AUTO) return;
+  BOOL visible = self.window.visible && (self.window.occlusionState & NSWindowOcclusionStateVisible);
+  enum wsd_lock_change change = wsd_lock_tick(&l, now_ns(), shown, visible);
+  self.frameLock = l;
+  if (change == WSD_LOCK_SAME) return;
+  LOG("window %u: %s", self.windowId,
+      change == WSD_LOCK_SLOWER ? "the game did not keep up, one step slower" : "trying one step faster");
+  [self applyFrameRate];
+}
+
+- (BOOL)tickPlane {
   WsdBuffer *b = self.pendingBuffer;
   BOOL redisplay = NO;
   if (!b && self.redisplay && self.lastBuffer && !self.lastBuffer.detached) { b = self.lastBuffer; redisplay = YES; }
-  if (!b || !self.window.visible) return;
+  if (!b || !self.window.visible) return NO;
   /* A window macOS does not show (covered, on another Space, the screen locked) has its drawables no longer taken:
    * nextDrawable would hold the main queue up to a second, and every message and buffer release with it (2026-10-22:
    * a Space switch held Rocket League's frames, Neptune reported its swapchain occluded, and the game never presented
    * again, Obelisk issue #14). The frame stays pending until the window shows again; a newer one still replaces it. */
-  if (!(self.window.occlusionState & NSWindowOcclusionStateVisible)) return;
+  if (!(self.window.occlusionState & NSWindowOcclusionStateVisible)) return NO;
   uint64_t tick_ns = now_ns();
   id<CAMetalDrawable> d = [self.layer nextDrawable];
-  if (!d) return; /* keep it pending */
+  if (!d) return NO; /* keep it pending */
   if (redisplay) self.redisplay = NO;
   else { self.pendingBuffer = nil; self.lastBuffer = b; self.redisplayTries = 0; }
   CGSize want = CGSizeMake(b.width, b.height);
@@ -1002,13 +1053,20 @@ static CAMetalLayer *make_metal_layer(void) {
                 sw.isOverlay ? "overlay" : "base", d / 1e6, lt.tm_hour, lt.tm_min, lt.tm_sec, (int)(tv.tv_usec / 1000));
           }
           sw.statSumNs += d;
+          sw.statSqSum += (d / 1e6) * (d / 1e6);
+          if (e2.presented_ns > e2.received_ns) sw.statHeldNs += e2.presented_ns - e2.received_ns;
           if (d > sw.statMaxNs) sw.statMaxNs = d;
           if (!sw.statMinNs || d < sw.statMinNs) sw.statMinNs = d;
           if (++sw.statCount == 120) {
-            LOG("window %u %s: 120 frames shown, present interval avg %.3f min %.3f max %.3f ms, latency submit->shown %.3f ms",
-                sw.windowId, sw.isOverlay ? "overlay" : "base", sw.statSumNs / 120 / 1e6, sw.statMinNs / 1e6,
-                sw.statMaxNs / 1e6, (e2.presented_ns > e2.client_time_ns ? e2.presented_ns - e2.client_time_ns : 0) / 1e6);
+            double avg = sw.statSumNs / 120 / 1e6;
+            LOG("window %u %s: 120 frames shown, present interval avg %.3f min %.3f max %.3f ms, latency submit->shown "
+                "%.3f ms, spread %.3f ms, received->shown %.3f ms",
+                sw.windowId, sw.isOverlay ? "overlay" : "base", avg, sw.statMinNs / 1e6, sw.statMaxNs / 1e6,
+                (e2.presented_ns > e2.client_time_ns ? e2.presented_ns - e2.client_time_ns : 0) / 1e6,
+                sqrt(fmax(0, sw.statSqSum / 120 - avg * avg)), sw.statHeldNs / 120 / 1e6);
             sw.statCount = 0; sw.statSumNs = sw.statMaxNs = sw.statMinNs = 0;
+            sw.statSqSum = 0;
+            sw.statHeldNs = 0;
           }
         }
         sw.statLastNs = e2.presented_ns;
@@ -1032,6 +1090,7 @@ static CAMetalLayer *make_metal_layer(void) {
       dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf releaseBuffer:b serial:serial shown:YES]; });
   }];
   [cb commit];
+  return !redisplay;
 }
 
 /* Moves and/or resizes the content area. Pixels are converted with the effective scale (backing_scale()); y counts
@@ -1812,9 +1871,21 @@ static CAMetalLayer *make_metal_layer(void) {
     NEED(wsd_window_flag);
     WsdWindow *w = [self win:m->window_id req:type];
     if (!w) break;
-    float hz = (float)m->value;
-    w.link.preferredFrameRateRange = hz > 0 ? CAFrameRateRangeMake(hz, hz, hz) : CAFrameRateRangeDefault;
-    LOG("client %d: window %u preferred frame rate %u Hz", self.pid, m->window_id, m->value);
+    wsd_frame_lock lock = {0};
+    float hz = 0;
+    if (m->value & WSD_FRAME_RATE_AUTO) {
+      lock.mode = WSD_LOCK_AUTO;
+      lock.cap_hz = m->value & 0xffff;
+    } else if (m->value & WSD_FRAME_RATE_DIVISOR) {
+      lock.mode = WSD_LOCK_FIXED;
+      lock.divisor = (m->value & 0xff) ? (m->value & 0xff) : 1;
+    } else {
+      hz = (float)m->value;
+    }
+    w.frameLock = lock;
+    w.frameHz = hz;
+    w.appliedHz = -1;
+    [w applyFrameRate];
     break;
   }
   case WSD_PING: {
@@ -2002,7 +2073,10 @@ static BOOL screens_changed(void) {
   BOOL rescaled = r.backing_scale_x1000 != g_display.backing_scale_x1000 ||
                   r.display_width_px != g_display.display_width_px || r.display_height_px != g_display.display_height_px;
   for (WsdClient *c in g_clients)
-    for (WsdWindow *w in c.windows.allValues) [w fitScreen:rescaled];
+    for (WsdWindow *w in c.windows.allValues) {
+      [w fitScreen:rescaled];
+      [w applyFrameRate];
+    }
   if (r.display_width_px == g_display.display_width_px && r.display_height_px == g_display.display_height_px &&
       r.max_refresh_hz == g_display.max_refresh_hz && r.backing_scale_x1000 == g_display.backing_scale_x1000 &&
       r.native_width_px == g_display.native_width_px && r.native_height_px == g_display.native_height_px)
