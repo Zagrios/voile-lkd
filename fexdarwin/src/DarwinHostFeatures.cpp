@@ -85,14 +85,14 @@ FEXCore::HostFeatures GetDarwinHostFeatures(std::string* Report) {
   // RNDR/RNDRRS raise SIGILL at EL0 on macOS (measured), and no FEAT_RNG sysctl exists: keep the software RNG.
   F.SupportsRAND = false;
   // SVE is absent from hw.optional.arm.* on this machine (only SME/SME2 streaming mode exists): no SVE code paths.
-  F.SupportsSVE128 = Has("FEAT_SVE");
-  F.SupportsSVE256 = false; // FEX also needs a 256-bit vector length, which cannot be probed without SVE
+  F.ProcessFeatures.SupportsSVE128 = Has("FEAT_SVE");
+  F.ProcessFeatures.SupportsSVE256 = false; // FEX also needs a 256-bit vector length, which cannot be probed without SVE
   F.SupportsSVEBitPerm = false;
 
   // Same convention as Source/Common/HostFeatures.cpp: AVX is always emulated with NEON pairs when no SVE256.
   F.Supports3DNow = true;
-  F.SupportsAVX = true;
-  F.SupportsAES256 = F.SupportsAVX && F.SupportsAES;
+  F.ProcessFeatures.SupportsAVX = true;
+  F.SupportsAES256 = F.SupportsAVX() && F.SupportsAES;
   F.SupportsPreserveAllABI = FEX_HAS_PRESERVE_ALL_ATTR;
   F.PreferZVAForVZero = false;
   F.SupportsCPUIndexInTPIDRRO = false; // TPIDRRO_EL0 holds the thread pointer on macOS (measured)
@@ -140,9 +140,12 @@ FEXCore::HostFeatures GetDarwinHostFeatures(std::string* Report) {
     }
   }
 
-  // The host type changes code generation: Unknown means no Linux inline getcpu syscall, no vsyscall page, no
-  // int 0x80, and RDTSCP/RDPID are reported unsupported (see OpcodeDispatcher.cpp:5076).
-  F.HostType = FEXCore::HostFeatures::HostTypeEnum::Unknown;
+  // The host type changes code generation: Unknown means no vsyscall page (vgettimeofday, vtime, vgetcpu) and no
+  // int 0x80 system call (Decoder::AdjustAddrForSpecialRegion, OpDispatchBuilder::INTOp). RDTSCPOp and RDPIDOp also
+  // refuse a host other than Linux without the CPU index in TPIDRRO_EL0, but the Darwin port compiles that check out.
+  F.ProcessFeatures.HostType = FEXCore::HostFeatures::HostTypeEnum::Unknown;
+  // Is64BitMode only feeds the code cache's hash, as in upstream's FetchHostFeatures.
+  F.ProcessFeatures.Is64BitMode = true;
 
   // Per-core MIDR values feed CPUID (core count, brand string, hybrid detection). MIDR_EL1 is not readable, so use one
   // synthetic Apple value (implementer 0x61, part 0) for every logical core: FEX then reports "Apple Silicon" and a
@@ -154,7 +157,7 @@ FEXCore::HostFeatures GetDarwinHostFeatures(std::string* Report) {
   if (Report) {
     char B[128];
     snprintf(B, sizeof B, "  logical cores = %d, HostType = Unknown, SVE128=%d SVE256=%d AVX=%d LSE=%d RCPC=%d RCPC2=%d CLZERO=%d\n",
-             Cores, (int)F.SupportsSVE128, (int)F.SupportsSVE256, (int)F.SupportsAVX, (int)F.SupportsAtomics, (int)F.SupportsRCPC,
+             Cores, (int)F.SupportsSVE128(), (int)F.SupportsSVE256(), (int)F.SupportsAVX(), (int)F.SupportsAtomics, (int)F.SupportsRCPC,
              (int)F.SupportsTSOImm9, (int)F.SupportsCLZERO);
     *Report += B;
   }

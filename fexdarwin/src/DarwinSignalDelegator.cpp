@@ -32,6 +32,7 @@
 
 thread_local GuestThread* CurrentGuestThread = nullptr;
 
+extern "C" uint64_t fexdarwin_lkd_window_size(void);
 extern "C" int fexdarwin_lkd_vma_at(uint64_t gva, uint64_t* start, uint64_t* end, uint32_t* prot);
 extern "C" int fexdarwin_lkd_code_write_fault(uint64_t gva);
 extern "C" int fexdarwin_lkd_code_watched(uint64_t gva);
@@ -52,6 +53,13 @@ int GuestProtAt(uint64_t Addr) {
     return fexdarwin_lkd_vma_at(Addr, &S, &E, &P) == 0 ? static_cast<int>(P) : -1;
   }
   return G->Mem.ProtAt(Addr);
+}
+
+// LKD mode only: whether Addr is a guest address at all, inside LKD's guest window. A host pointer outside it (a null
+// pointer, the host heap) has no VMA either, so a "no mapping" answer from GuestProtAt alone cannot tell it from a
+// guest page that lost its mapping.
+bool GuestAddrInWindow(uint64_t Addr) {
+  return Addr < fexdarwin_lkd_window_size();
 }
 
 // The first byte of the instruction at Rip that x86 cannot fetch, which an instruction fetch fault reports: Rip, or
@@ -181,8 +189,8 @@ void DarwinSignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread,
     }
     State.gregs[i] = DarwinCtx::GetReg(Uc, Idx);
   }
-  const bool SupportsAVX = G->Features.SupportsAVX;
-  const bool SupportsSVE256 = G->Features.SupportsSVE256;
+  const bool SupportsAVX = G->Features.SupportsAVX();
+  const bool SupportsSVE256 = G->Features.SupportsSVE256();
   for (size_t i = 0; i < Config.SRAFPRCount; i++) {
     __uint128_t Fpr = DarwinCtx::GetFpr(Uc, Config.SRAFPRMapping[i]);
     if (SupportsAVX && SupportsSVE256) {
@@ -577,7 +585,19 @@ bool DarwinSignalDelegator::ResolveGuardedFault(GuestThread* T, ucontext_t* Uc, 
   }
   // The page is open now: run the load here and close it again, or step its guest instruction.
   if (Decoded) {
+    // Another thread can close the page again between the open above and this copy. The handler runs with its own
+    // signal blocked (no SA_NODEFER, see Install()), and macOS replays a fault that arrives blocked until someone
+    // reopens the page: the thread spins at 100 % without ever getting here again. Let the fault signals through for
+    // the copy, as step 3 of HandleFault does for its emulated access. The nested fault is host code touching a
+    // guarded page, so step 6 of HandleFault opens the page once more and the copy completes. The copy depends on
+    // step 6: if step 6 ever misses this nested fault, the race turns into an unhandled fault here.
+    sigset_t Faults, Blocked;
+    sigemptyset(&Faults);
+    sigaddset(&Faults, SIGBUS);
+    sigaddset(&Faults, SIGSEGV);
+    pthread_sigmask(SIG_UNBLOCK, &Faults, &Blocked);
     memcpy(Bytes, reinterpret_cast<const void*>(D.Addr), D.L.Bytes());
+    pthread_sigmask(SIG_SETMASK, &Blocked, nullptr);
     fexdarwin_lkd_guard_close(Page);
     ApplyGuardedLoad(Uc, D, Bytes);
     return true;
@@ -755,8 +775,12 @@ bool DarwinSignalDelegator::HandleFault(GuestThread* T, int Sig, siginfo_t* Info
     //    the protection first and drops the translations after, so a compilation on another thread can read the page
     //    in between. THEIA does this to its code pages (THE FINALS' "Foreground Work" and "Background Work" threads,
     //    once the main menu is up). The instruction becomes a fetch fault, which the guest handles; the read itself
-    //    returns zeros, which the rollback discards.
-    if (T->Compiling && !Write) {
+    //    returns zeros, which the rollback discards. Only for guest addresses: a bad host pointer in a translator pass
+    //    (a null pointer, the host heap) must stay a crash with a report, not become a silent zero load. The views the
+    //    decoder and the code hash read a guarded page through (DarwinSyscallHandler::GuardedCodeViews) are host memory
+    //    outside the window too: a read through the file view of a page that a concurrent munmap released (the alias
+    //    goes away with the last VMA of its mapping, mb_put) is a crash as well, not a zero load.
+    if (T->Compiling && !Write && GuestAddrInWindow(GuestAddr)) {
       const int GProt = GuestProtAt(GuestAddr);
       GuardedLoad D {};
       if ((GProt < 0 || !(GProt & Linux::PROT_EXEC_)) && DecodeGuardedLoad(Uc, reinterpret_cast<uint64_t>(Info->si_addr), D)) {

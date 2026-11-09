@@ -7,6 +7,11 @@
 #include "task.h"
 #include "../mm/lkd_mm_watch.h"
 
+// Size of the guest window (guest addresses 0 to it), 0 before LKD reserves it. Takes no lock: the fault handler asks.
+uint64_t fexdarwin_lkd_window_size(void) {
+  return lkd_mm_window_size();
+}
+
 // VMA of the current task containing gva: 0 with [start, end) and LX_PROT_* bits, or -LX_ENOENT if unmapped.
 int fexdarwin_lkd_vma_at(uint64_t gva, uint64_t* start, uint64_t* end, uint32_t* prot) {
   lkd_task* t = lkd_current();

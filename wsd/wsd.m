@@ -787,7 +787,8 @@ static CAMetalLayer *make_metal_layer(void) {
       [self sendKey:modifiers[i] down:YES];
 }
 - (void)windowDidBecomeKey:(NSNotification *)n {
-  /* back in the window: a relative-mode window takes the pointer again, once it shows frames */
+  /* the window is key: a relative-mode window takes the pointer once it shows frames, whether it held it before or
+   * its request came while the window was not key (see WSD_RELATIVE_MOUSE) */
   if (self.relative && !g_relative_global && !self.stalled) {
     CGError e = CGAssociateMouseAndMouseCursorPosition(false);
     g_relative_global = (e == kCGErrorSuccess);
@@ -1614,9 +1615,12 @@ static CAMetalLayer *make_metal_layer(void) {
     WsdWindow *w = [self win:m->window_id req:type];
     if (!w) break;
     BOOL on = m->value != 0;
-    if (on && w.stalled) { /* the next frame shown takes the pointer */
+    /* The pointer belongs to the game only while its window is key and shows frames, since disassociating it is
+     * global: a request made before waits, and -windowDidBecomeKey: or the next frame shown takes the pointer. */
+    if (on && (w.stalled || !w.window.keyWindow)) {
       w.relative = YES;
-      LOG("client %d: relative mouse on, waiting for a frame", self.pid);
+      LOG("client %d: relative mouse on, waiting for %s", self.pid,
+          !w.stalled ? "the window to be key" : w.window.keyWindow ? "a frame" : "a frame and the window to be key");
       break;
     }
     if (on != w.relative) {
@@ -2128,7 +2132,8 @@ static BOOL session_ending(void) {
 /* The game goes to the background as it does on Windows: its client puts the desktop in the foreground, as Wine's Mac
  * driver does on the same notification (APP_DEACTIVATED, macdrv_app_deactivated), and the game gets WM_ACTIVATEAPP
  * (it may pause, mute or minimize itself). Wine kept the game in the foreground until then, whatever app the user
- * was in. */
+ * was in. On request, wineobelisk.drv may keep a fullscreen game in the foreground instead; its window is no longer key
+ * all the same, so the game does not take the user's pointer (see WSD_RELATIVE_MOUSE). */
 - (void)applicationDidResignActive:(NSNotification *)n {
   for (WsdClient *c in g_clients) [c send:WSD_EV_APP_DEACTIVATED payload:NULL len:0 extra:nil];
 }
