@@ -189,8 +189,8 @@ void DarwinSignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread,
     }
     State.gregs[i] = DarwinCtx::GetReg(Uc, Idx);
   }
-  const bool SupportsAVX = G->Features.SupportsAVX;
-  const bool SupportsSVE256 = G->Features.SupportsSVE256;
+  const bool SupportsAVX = G->Features.SupportsAVX();
+  const bool SupportsSVE256 = G->Features.SupportsSVE256();
   for (size_t i = 0; i < Config.SRAFPRCount; i++) {
     __uint128_t Fpr = DarwinCtx::GetFpr(Uc, Config.SRAFPRMapping[i]);
     if (SupportsAVX && SupportsSVE256) {
