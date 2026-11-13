@@ -14,12 +14,13 @@ Date: 2026-10-02. Milestones 1 to 3 reached: signals, futex, signalfd, family IP
 | `src/sig/syscalls.c` | signal system calls |
 | `src/sig/signalfd.c` | signalfd objects (fd.h), readability through a notification pipe |
 | `src/sig/futex.c` | futex, futex_waitv, futex2, PI, robust lists, private table and shared table |
+| `src/sig/sem.c` | System V semaphores (semget, semop, semtimedop, semctl) in the family file `sem.shm`: queue served oldest first, SEM_UNDO applied at process exit, waits on the shared sleepers of futex.c |
 | `src/sig/famsvc.c`, `src/include/famsvc.h` | family IPC service (decision of the project lead), announced in `docs/requests/sig-famsvc.md` |
 | `src/sig/NOTICE` | no code imported from HyperLinux |
 
-## Registered system calls (21)
+## Registered system calls (25)
 
-rt_sigaction, rt_sigprocmask, rt_sigreturn, rt_sigpending, rt_sigtimedwait, rt_sigqueueinfo, rt_sigsuspend, rt_tgsigqueueinfo, sigaltstack, kill, tkill, tgkill, pause, signalfd, signalfd4, pidfd_send_signal, futex, futex_waitv, futex_wake, futex_wait, futex_requeue. All those of `OWNERS.md` for sig.
+rt_sigaction, rt_sigprocmask, rt_sigreturn, rt_sigpending, rt_sigtimedwait, rt_sigqueueinfo, rt_sigsuspend, rt_tgsigqueueinfo, sigaltstack, kill, tkill, tgkill, pause, signalfd, signalfd4, pidfd_send_signal, futex, futex_waitv, futex_wake, futex_wait, futex_requeue, semget, semop, semtimedop, semctl. All those of `OWNERS.md` for sig.
 
 ## Tests (MEASURED, `tools/runtest.sh`)
 
@@ -28,6 +29,7 @@ rt_sigaction, rt_sigprocmask, rt_sigreturn, rt_sigpending, rt_sigtimedwait, rt_s
 | `test_sig_basic` | 385 | 26 | rt_sigaction (UAPI flags, KILL/STOP), masks, delivery and frame (SI_USER, old/new masks, NODEFER, RESETHAND), ignored signals, coalescing and FIFO real-time queue, sigqueueinfo EPERM, arguments of kill/tkill/tgkill, permissions (uid, suid, SIGCONT same session, CAP_KILL), thread choice, restart rules, faults (si_code, si_addr, SI_KERNEL, force_sig on a blocked or ignored action, core status), group fatal signal, sigaltstack (ENOMEM, EINVAL, EPERM, SS_ONSTACK, SA_ONSTACK, SS_AUTODISARM, restore), frame failure then SIGSEGV, blocking rt_sigtimedwait, rt_sigsuspend, pause, group stop and resume, SIGCHLD (NOCLDSTOP, NOCLDWAIT, SIG_IGN), group kill, signalfd, exec, re-exec export/import, trace line of the fatal signal (absent without `LKD_TRACE`) |
 | `test_sig_more` | 83 | 8 | SIGKILL during a stop, tgkill(SIGKILL) kills the group, SIGPIPE, RLIMIT_SIGPENDING limit (EAGAIN, silent loss), cloning of the actions (CLONE_SIGHAND, CLONE_CLEAR_SIGHAND), retarget on blocking and on thread exit, state of the child of a real fork, 4 concurrent senders x 500 real-time signals (none lost, FIFO per sender), path of w15 (`lkd_task_create_main`, `rt_sigaction`, real `clone` of the task module, `tgkill`, delivery on the new thread) |
 | `test_sig_futex` | 147 | 13 | WAIT errors, WAIT/WAKE with 8 threads (nr = 0 wakes one), bitset, absolute MONOTONIC and REALTIME timeouts, REQUEUE and CMP_REQUEUE, WAKE_OP (5 operations, OPARG_SHIFT, ENOSYS), PI protocol (EDEADLK, EWOULDBLOCK, EPERM, ownership handoff, ESRCH, timeout, OWNER_DIED), interruption by a signal (ERESTARTSYS, ERESTART_RESTARTBLOCK and restart_syscall up to the original deadline), futex_waitv, futex2 calls, robust list (OWNER_DIED, list_op_pending, bounded cycle), futex mutex with 16 threads, futex shared between two processes (fork), shared PI |
+| `test_sig_sem` | 165 | 7 | semget (EINVAL, ENOENT, EEXIST, sem_more_checks, EACCES, IPC_SET, EPERM, a new sequence after IPC_RMID), semop and semtimedop (EINVAL, E2BIG, EFBIG, ERANGE at SEMVMX and for the undo adjustment, IPC_NOWAIT, all or nothing, operations in order, timeout, invalid timespec), SETVAL, SETALL, GETALL, GETPID, queue served oldest first with GETNCNT and GETZCNT, wait-for-zero, check_restart, SETVAL serving the queue, IPC_RMID ending waits (EIDRM), a signal ending a wait (EINTR even with SA_RESTART), SEM_UNDO applied at the exit of a cloned process, a set shared across a real fork, a dead waiter dropped, IPC_INFO, SEM_INFO, SEM_STAT, SEM_STAT_ANY |
 | `test_sig_famsvc` | 93 | 9 | PING, payloads of 3 and 6 MiB, descriptor passing, caller identity, unknown opcode ENOSYS, nested call refused, ESRCH, timeout then resume, service of the child of a fork, signals child to parent (kill, tgkill) and parent to child, EPERM between processes, adoption of the socket after a real host re-exec (`execl` of the test binary), shutdown and removal of the directory |
 
 Total: 708 assertions, 56 cases, including multi-thread cases (up to 16 threads) and multi-process cases (real fork through `lkd_fork_host`, real exec).
@@ -36,6 +38,7 @@ Total: 708 assertions, 56 cases, including multi-thread cases (up to 16 threads)
 
 - famsvc, 4-byte PING, 2000 calls: to another process p50 8.4 to 10.4 us, p99 22 to 32 us; to itself p50 8.4 to 12.7 us. First version with `poll`: p50 19 us; switch to kqueue on the service side and blocking sockets with `SO_RCVTIMEO` on the client side.
 - Futex wait on a shared key interrupted by a signal sent at 20 ms: return at 22.5 to 25 ms (the direct ring avoids the 50 ms slice).
+- semop wait interrupted by a signal sent at 20 ms: return at 21 to 22.5 ms. Hand-off through a set, parent to child and back: 40 us (unit test), 58 to 82 us under fexdarwin-run with glibc's wrappers (M5 Pro).
 - Private futex mutex, 16 threads x 3000 sections with `sched_yield` inside: 7.4 ms, 1579 FUTEX_WAIT calls.
 
 ## Engine witnesses (MEASURED, 19:25, details in `docs/requests/sig-4.md`)
