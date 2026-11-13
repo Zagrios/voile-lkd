@@ -2271,6 +2271,17 @@ int main(int argc, char **argv) {
       sigsrc[i] = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)sigs[i], 0, dispatch_get_main_queue());
       int sn = sigs[i];
       dispatch_source_set_event_handler(sigsrc[i], ^{
+        /* Stopped while the game still has windows, as by a Force Quit of the game's app (wsd): the game would run on
+         * unseen and its launcher would wait for it. The launcher, wsd's parent, ends it as Obelisk's Stop does.
+         * SIGALRM, the test wrapper's timeout, leaves it alone. */
+        NSUInteger windows = 0;
+        for (WsdClient *c in g_clients) windows += c.windows.count;
+        pid_t parent = getppid();
+        if (windows && sn != SIGALRM && parent > 1) {
+          LOG("signal %d with %lu window(s) open: asking the launcher (pid %d) to end the game", sn,
+              (unsigned long)windows, (int)parent);
+          kill(parent, SIGTERM);
+        }
         LOG("signal %d, restoring input state and exiting", sn);
         restore_input_state();
         unlink(path);
