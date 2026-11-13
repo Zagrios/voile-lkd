@@ -151,7 +151,8 @@ struct wsd_present {
 struct wsd_ping { uint64_t token; uint64_t time_ns; };
 struct wsd_debug_input {
   uint32_t kind;   /* 1 key (a = mac keycode, b = 1 down / 0 up), 2 left click at window pixels (a, b),
-                      3 raw motion, 4 window action as the user does it (a = WSD_DEBUG_WINDOW_*) */
+                      3 raw motion, 4 window action as the user does it (a = WSD_DEBUG_WINDOW_*),
+                      5 pointer motion at view pixels (a, b), without activating anything */
   uint32_t a, b;
   uint32_t reserved; /* kind 4: second coordinate */
 };

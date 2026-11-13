@@ -49,6 +49,10 @@ static int g_cursor_hidden;       /* [NSCursor hide] in effect */
 static NSMutableSet *g_clients;
 static BOOL g_caps_told;           /* the Caps Lock state the clients were brought to (-syncCapsLock:) */
 static NSTimeInterval g_warp_time; /* uptime of the last CURSOR_WARP: the mouse moves queued before it are dropped */
+/* The jump of the last CURSOR_WARP, in points, until the first mouse move after it: macOS reports the warp in that
+ * move's delta (SDL's Cocoa backend and Wine's Mac driver make up for it too). */
+static double g_warp_dx, g_warp_dy;
+static BOOL g_warp_delta_pending;
 static NSCursor *g_cursor;         /* the cursor over the windows (CURSOR_SET), nil for the arrow */
 static BOOL g_ever_active;         /* wsd has been the active app since it started */
 static BOOL g_terminate_pending;   /* a logout, restart or shutdown waits for the clients to leave */
@@ -192,6 +196,9 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property uint64_t statLastNs, statSumNs, statMaxNs, statMinNs;
 @property uint32_t statCount;
 @property BOOL relative, clip, fullscreen, transitioning;
+/* a hide waiting HIDE_DELAY_NS for a show that would cancel it (-hideSoon), and its generation */
+@property BOOL hidePending;
+@property uint64_t hideGeneration;
 @property NSRect clipPx;
 /* when the window last showed a new frame on either plane, and whether it has held the pointer without one for
  * STALL_NS since (the pointer and the cursor are then the user's) */
@@ -213,6 +220,7 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 - (void)sendEvent:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra;
 - (void)noteKey:(uint32_t)code down:(BOOL)down;
 - (NSWindowLevel)levelForActive:(BOOL)active;
+- (WsdScale)pointerScale;
 - (BOOL)floatsForActive:(BOOL)active;
 - (void)orderInFront:(BOOL)activate;
 - (void)syncCapsLock:(BOOL)on;
@@ -631,7 +639,7 @@ static CAMetalLayer *make_metal_layer(void) {
 - (uint64_t)evNs:(NSEvent *)e { return (uint64_t)(e.timestamp * 1e9); }
 - (void)pixelPoint:(NSEvent *)e x:(float *)x y:(float *)y {
   NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-  WsdScale s = backing_scale_xy(self.window);
+  WsdScale s = [self.ww pointerScale];
   *x = (float)(p.x * s.x);
   *y = (float)((self.bounds.size.height - p.y) * s.y);
 }
@@ -681,9 +689,23 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)otherMouseUp:(NSEvent *)e { [self button:e which:(uint32_t)e.buttonNumber down:NO]; }
 - (void)motion:(NSEvent *)e {
   WsdWindow *w = self.ww;
+  /* The first move after a CURSOR_WARP carries the warp's jump in its delta, whatever mode it arrives in. A game that
+   * centers the pointer and then turns on relative mode (Killing Floor on entering a map or leaving the shop: a warp
+   * from (1847,227) to (1284,739), then a first delta of (-563,512)) took the jump for a mouse movement and looked
+   * straight down or up. The jump is taken out of that delta, unless that would make it larger (a move that did not
+   * carry it). */
+  BOOL after_warp = g_warp_delta_pending && e.timestamp > g_warp_time;
+  if (after_warp) g_warp_delta_pending = NO;
   if (w.relative) {
     if (w.stalled) return; /* the user's pointer, not the game's camera: a stopped game would get it all at once */
-    struct wsd_ev_relative r = {w.windowId, [self synth], (float)e.deltaX, (float)e.deltaY, [self evNs:e]};
+    double dx = e.deltaX, dy = e.deltaY;
+    if (after_warp && fabs(dx - g_warp_dx) + fabs(dy - g_warp_dy) < fabs(dx) + fabs(dy)) {
+      LOG("window %u: first move after a pointer warp (%.0f,%.0f) taken as (%.0f,%.0f)", w.windowId, dx, dy,
+          dx - g_warp_dx, dy - g_warp_dy);
+      dx -= g_warp_dx;
+      dy -= g_warp_dy;
+    }
+    struct wsd_ev_relative r = {w.windowId, [self synth], (float)dx, (float)dy, [self evNs:e]};
     [w sendEvent:WSD_EV_RELATIVE payload:&r len:sizeof(r) extra:nil];
     return;
   }
@@ -694,7 +716,10 @@ static CAMetalLayer *make_metal_layer(void) {
   }
   struct wsd_ev_motion m = {w.windowId, [self synth], 0, 0, [self evNs:e]};
   [self pixelPoint:e x:&m.x y:&m.y];
-  if (w.clip) {
+  /* The clip rectangle holds the pointer only while the game's window has the focus: after Cmd-Tab, a drag that
+   * began in the game (a held fire button) still sent moves here, and the pointer was warped back into the game
+   * while the user was in another app (Killing Floor, windowed, in a map). */
+  if (w.clip && NSApp.active && self.window.isKeyWindow) {
     NSRect c = w.clipPx;
     float cx = fminf(fmaxf(m.x, c.origin.x), c.origin.x + c.size.width - 1);
     float cy = fminf(fmaxf(m.y, c.origin.y), c.origin.y + c.size.height - 1);
@@ -702,7 +727,7 @@ static CAMetalLayer *make_metal_layer(void) {
       m.flags |= 1; /* clamped */
       if (!g_injecting && !w.stalled) {
         /* Real pointer left the clip rect: warp it back (global, top-left display coordinates). */
-        WsdScale s = backing_scale_xy(self.window);
+        WsdScale s = [w pointerScale];
         NSPoint vp = NSMakePoint(cx / s.x, self.bounds.size.height - cy / s.y);
         NSPoint sp = [self.window convertPointToScreen:[self convertPoint:vp toView:nil]];
         CGFloat top = primary_screen().frame.size.height;
@@ -739,6 +764,20 @@ static CAMetalLayer *make_metal_layer(void) {
   struct wsd_ev_resize r = {self.windowId, (uint32_t)lround(sz.width * s.x), (uint32_t)lround(sz.height * s.y),
                             (uint32_t)lround(s.x * 1000)};
   [self sendEvent:WSD_EV_RESIZE payload:&r len:sizeof(r) extra:nil];
+}
+/* Client pixels per view point, per axis, for the pointer: the scale, unless the view shows a frame of another size.
+ * The layer stretches the client's last frame over the view (kCAGravityResize), and a window can have another size
+ * than the client's: AppKit shortens a window taller than the screen to fit below the menu bar while the client keeps
+ * its size (2026-11-05: Killing Floor windowed at 2560x1418 px in a 2560x1359 window, and at 2560x1418 in a 2560x1440
+ * fullscreen one). The pointer must land where the frame shows things: Killing Floor selected menu items up to 59 px
+ * above the pointer. An overlay plane is placed at the scale itself (-overlayAt:), so a window with one keeps it. */
+- (WsdScale)pointerScale {
+  WsdScale s = backing_scale_xy(self.window);
+  WsdBuffer *b = self.lastBuffer;
+  NSSize v = self.view.bounds.size;
+  if (!b || self.overlay || v.width < 1 || v.height < 1) return s;
+  if (fabs(b.width - v.width * s.x) < 1 && fabs(b.height - v.height * s.y) < 1) return s;
+  return (WsdScale){b.width / v.width, b.height / v.height};
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender {
   struct wsd_window w = {self.windowId};
@@ -911,6 +950,24 @@ static CAMetalLayer *make_metal_layer(void) {
   [w makeFirstResponder:self.view];
   self.transitioning = NO;
   LOG("window %u style 0x%x", self.windowId, style);
+}
+/* A hide a show follows within HIDE_DELAY_NS does not reach macOS. A game that changes its window's style hides
+ * it, restyles it and shows it again without activation (Unreal Engine 2's SetRes, within a few milliseconds):
+ * ordered out at once, the key window took the app's focus with it, macOS made another app active, and the client
+ * heard APP_DEACTIVATED in the middle of its start. Killing Floor then left fullscreen while starting and died
+ * reopening its window (DirectInput "Couldn't set cooperative level", 2026-11-05). */
+#define HIDE_DELAY_NS (100 * NSEC_PER_MSEC)
+- (void)hideSoon {
+  self.hidePending = YES;
+  uint64_t gen = ++self.hideGeneration;
+  __weak WsdWindow *ww = self;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, HIDE_DELAY_NS), dispatch_get_main_queue(), ^{
+    WsdWindow *w = ww;
+    if (!w || !w.hidePending || w.hideGeneration != gen) return;
+    w.hidePending = NO;
+    [w.window orderOut:nil];
+    adjust_levels(NSApp.active);
+  });
 }
 - (void)minimize:(BOOL)on {
   NSWindow *w = self.window;
@@ -1577,6 +1634,11 @@ static CAMetalLayer *make_metal_layer(void) {
     WsdWindow *w = [self win:m->window_id req:type];
     if (!w) break;
     w.minimizedOut = NO;
+    if (m->value && w.hidePending) {
+      w.hidePending = NO; /* still on screen: the hide never happened */
+      LOG("window %u: hidden and shown again within %llu ms, kept on screen", w.windowId,
+          (unsigned long long)(HIDE_DELAY_NS / NSEC_PER_MSEC));
+    }
     if (m->value) {
       if (m->value == 1) [NSApp activate];
       [w orderInFront:m->value == 1];
@@ -1585,8 +1647,7 @@ static CAMetalLayer *make_metal_layer(void) {
       __weak WsdWindow *ww = w;
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000000000), dispatch_get_main_queue(), ^{ [ww logState:"show+1s"]; });
     } else {
-      [w.window orderOut:nil];
-      adjust_levels(NSApp.active);
+      [w hideSoon];
     }
     break;
   }
@@ -1748,7 +1809,7 @@ static CAMetalLayer *make_metal_layer(void) {
     if (!g_probe_enabled) {
       g_probe_enabled = YES;
       LOG("latency probe on (first test input)");
-    } else if (m->kind != 3 && (m->kind == 2 || m->b)) probe_arm(m->kind == 1 ? "key" : "click");
+    } else if (m->kind != 3 && m->kind != 5 && (m->kind == 2 || m->b)) probe_arm(m->kind == 1 ? "key" : "click");
     g_injecting = YES;
     if (m->kind == 3) {
       /* raw mouse motion (relative mode test): delta x = a - 10000, delta y = b - 10000, through the view as a real
@@ -1766,6 +1827,17 @@ static CAMetalLayer *make_metal_layer(void) {
                                modifierFlags:0 timestamp:t windowNumber:nw.windowNumber context:nil characters:@""
                  charactersIgnoringModifiers:@"" isARepeat:NO keyCode:(unsigned short)m->a];
       [nw sendEvent:e];
+    } else if (m->kind == 5) {
+      /* pointer motion at view pixels (a, b) (view points at the backing scale), into the view: unlike a click it
+       * neither activates wsd nor makes the window key */
+      WsdScale sc = backing_scale_xy(nw);
+      NSPoint p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
+      NSEvent *e = [NSEvent mouseEventWithType:NSEventTypeMouseMoved location:p modifierFlags:0 timestamp:t
+                                windowNumber:nw.windowNumber context:nil eventNumber:0 clickCount:0 pressure:0];
+      [best.view mouseMoved:e];
+      WsdScale ps = [best pointerScale];
+      LOG("debug hover: view %.0fx%.0f pt, frame shown %ux%u px, pointer scale %.4f x %.4f", best.view.bounds.size.width,
+          best.view.bounds.size.height, best.lastBuffer.width, best.lastBuffer.height, ps.x, ps.y);
     } else if (m->kind == 2) {
       WsdScale sc = backing_scale_xy(nw);
       NSPoint p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
@@ -1889,11 +1961,18 @@ static CAMetalLayer *make_metal_layer(void) {
      * pointer still, then the mouse moves already queued are dropped (-motion:). */
     if (!NSApp.active || g_relative_global) break;
     WsdScale s = backing_scale_xy(nil);
+    CGPoint to = CGPointMake(m->x / s.x, m->y / s.y);
+    CGEventRef now_ev = CGEventCreate(NULL);
+    CGPoint from = now_ev ? CGEventGetLocation(now_ev) : to;
+    if (now_ev) CFRelease(now_ev);
     CGSetLocalEventsSuppressionInterval(0);
-    CGError e = CGWarpMouseCursorPosition(CGPointMake(m->x / s.x, m->y / s.y));
+    CGError e = CGWarpMouseCursorPosition(to);
     CGSetLocalEventsSuppressionInterval(0.25);
     if (e != kCGErrorSuccess) { [self error:type code:-EIO]; break; }
     g_warp_time = NSProcessInfo.processInfo.systemUptime;
+    g_warp_dx = to.x - from.x;
+    g_warp_dy = to.y - from.y;
+    g_warp_delta_pending = fabs(g_warp_dx) + fabs(g_warp_dy) >= 1;
     CGAssociateMouseAndMouseCursorPosition(true);
     break;
   }
