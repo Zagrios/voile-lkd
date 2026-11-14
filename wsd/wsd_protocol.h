@@ -35,7 +35,7 @@ enum {
   WSD_BUFFER_DETACH = 10,  /* wsd_buffer */
   WSD_PRESENT = 11,        /* wsd_present */
   WSD_SET_TITLE = 12,      /* wsd_window + UTF-8 title */
-  WSD_SET_FRAME_RATE = 13, /* wsd_window_flag (value: preferred Hz, 0 = display default) */
+  WSD_SET_FRAME_RATE = 13, /* wsd_window_flag (value: preferred Hz, 0 = display default, or a lock, below) */
   WSD_PING = 14,           /* wsd_ping */
   WSD_DEBUG_INJECT = 15,   /* wsd_window_flag (value: scenario); synthetic NSEvents, test only */
   WSD_QUIT = 16,           /* no payload; server exits after flushing */
@@ -273,5 +273,11 @@ WSD_ASSERT_SIZE(wsd_ev_button, 32);
 WSD_ASSERT_SIZE(wsd_ev_motion, 24);
 WSD_ASSERT_SIZE(wsd_ev_presented, 56);
 WSD_ASSERT_SIZE(wsd_ev_release, 16);
+
+/* SET_FRAME_RATE value: a lock to the refreshes of the window's screen, followed when the window changes screens.
+ * WSD_FRAME_RATE_DIVISOR | n: every frame stays for n refreshes. WSD_FRAME_RATE_AUTO | fps: wsd takes the highest steady
+ * rate of the screen at or below fps, and a slower one while the game does not keep up (wsd_frame_lock.h). */
+#define WSD_FRAME_RATE_DIVISOR 0x80000000u
+#define WSD_FRAME_RATE_AUTO 0x40000000u
 
 #endif
