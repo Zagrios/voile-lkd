@@ -174,15 +174,28 @@ static int64_t host_maxrss_kib(void)
     return atomic_load(&maxrss_kib);
 }
 
+/* The calling thread's times, read from the host at most once a millisecond per thread. thread_info is a Mach
+ * trap, and Wine's NtYieldExecution brackets every sched_yield with two getrusage(RUSAGE_THREAD): idle worker
+ * threads of a game spin on it (Bodycam lobby, Time Profiler of the game process: 11.8 % of its CPU time in this
+ * call, 10.3 % in thread_info, about one core). Linux itself accounts these times per scheduler tick (4 ms at
+ * HZ=250), so a value up to a millisecond old is finer than what a Linux kernel reports. */
+#define THREAD_RUSAGE_MAX_AGE_NS 1000000
 static void thread_rusage(struct lx_rusage *ru)
 {
+    static _Thread_local struct { int64_t at; struct lx_timeval utime, stime; } last;
     memset(ru, 0, sizeof *ru);
-    thread_basic_info_data_t bi;
-    mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
-    if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) == KERN_SUCCESS) {
-        ru->ru_utime.tv_sec = bi.user_time.seconds; ru->ru_utime.tv_usec = bi.user_time.microseconds;
-        ru->ru_stime.tv_sec = bi.system_time.seconds; ru->ru_stime.tv_usec = bi.system_time.microseconds;
+    int64_t now = lkd_host_mono_ns();
+    if (!last.at || now - last.at >= THREAD_RUSAGE_MAX_AGE_NS) {
+        thread_basic_info_data_t bi;
+        mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt) == KERN_SUCCESS) {
+            last.utime.tv_sec = bi.user_time.seconds; last.utime.tv_usec = bi.user_time.microseconds;
+            last.stime.tv_sec = bi.system_time.seconds; last.stime.tv_usec = bi.system_time.microseconds;
+            last.at = now;
+        }
     }
+    ru->ru_utime = last.utime;
+    ru->ru_stime = last.stime;
     ru->ru_maxrss = host_maxrss_kib(); /* RUSAGE_THREAD reports the process maxrss */
 }
 
