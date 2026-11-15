@@ -1,8 +1,8 @@
 /* test_sig_sem.c: System V semaphores (sig module, src/sig/sem.c). Follows ipc/sem.c of Linux v6.12 and
  * semget(2), semop(2), semctl(2): creation and lookup, all-or-nothing operations and their limits, the
  * queue served oldest first, wait-for-zero, GETNCNT and GETZCNT, IPC_RMID ending waits, a signal and a
- * timeout ending a wait, SEM_UNDO applied at process exit, a set shared across a host fork and a dead
- * waiter dropped. */
+ * timeout ending a wait, SEM_UNDO applied at process exit and after a host process was killed outright, a
+ * set shared across a host fork, a dead waiter dropped, and more waiters than 256. */
 #include <pthread.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -42,7 +42,7 @@ static void fixture(void)
     T = fake_make_task();
     T->mm = lkd_mm_create();
     if (!T->mm) { fprintf(stderr, "mm failed\n"); exit(2); }
-    int64_t a = lkd_mm_map(T->mm, 0, 1u << 20, LX_PROT_READ | LX_PROT_WRITE, LX_MAP_PRIVATE | LX_MAP_ANONYMOUS, NULL, 0, NULL);
+    int64_t a = lkd_mm_map(T->mm, 0, 4u << 20, LX_PROT_READ | LX_PROT_WRITE, LX_MAP_PRIVATE | LX_MAP_ANONYMOUS, NULL, 0, NULL);
     if (a < 0) { fprintf(stderr, "scratch map failed %lld\n", (long long)a); exit(2); }
     SB = lkd_g2h((uint64_t)a);
 }
@@ -110,6 +110,7 @@ struct w {
     int k, id, n;
     int64_t rel;
     int16_t o[12];
+    const int16_t *big; /* more than 4 operations: the caller's array */
     _Atomic int started, done;
     int64_t ret;
 };
@@ -118,18 +119,24 @@ static void *w_main(void *p)
     struct w *w = p;
     lkd_set_current(w->t);
     atomic_store(&w->started, 1);
-    w->ret = ops_as(w->t, w->k, w->id, w->rel, w->n, w->o);
+    w->ret = ops_as(w->t, w->k, w->id, w->rel, w->n, w->big ? w->big : w->o);
     atomic_store(&w->done, 1);
     return NULL;
 }
-static void w_start(struct w *w, int k, int id, int n, const int16_t *o)
+/* rel_ns as in ops_as */
+static void w_launch(struct w *w, int k, int id, int n, const int16_t *o, int64_t rel_ns)
 {
     memset(w, 0, sizeof *w);
     w->t = fake_make_thread(T);
-    w->k = k; w->id = id; w->n = n; w->rel = -1;
-    memcpy(w->o, o, (size_t)n * 3 * sizeof o[0]);
+    w->k = k; w->id = id; w->n = n; w->rel = rel_ns;
+    if (n <= 4) memcpy(w->o, o, (size_t)n * 3 * sizeof o[0]);
+    else w->big = o;
     pthread_create(&w->th, NULL, w_main, w);
     while (!atomic_load(&w->started)) usleep(100);
+}
+static void w_start(struct w *w, int k, int id, int n, const int16_t *o)
+{
+    w_launch(w, k, id, n, o, -1);
     usleep(30000); /* reach the sleep */
 }
 static void w_join(struct w *w) { pthread_join(w->th, NULL); }
@@ -172,6 +179,12 @@ LT_TEST(get_rules)
     LT_EQ(ctl(id, 0, K_SET, P(d)), 0);
     LT_EQ(ctl(id, 0, K_STAT, P(d)), 0);
     LT_EQ(d->perm.mode, 0640);
+    d->perm.uid = (uint32_t)-1; /* ipc_update_perm: no valid uid, EINVAL */
+    LT_ERRNO(ctl(id, 0, K_SET, P(d)), LX_EINVAL);
+    LT_EQ(ctl(id, 0, K_STAT, P(d)), 0);
+    LT_EQ(d->perm.uid, T->proc->cred.euid);
+    d->perm.gid = (uint32_t)-1;
+    LT_ERRNO(ctl(id, 0, K_SET, P(d)), LX_EINVAL);
     struct lkd_creds saved = T->proc->cred;
     T->proc->cred.euid = 4242;
     T->proc->cred.egid = 4242;
@@ -456,6 +469,116 @@ LT_TEST(shared_across_fork)
     LT_EQ(ctl(id, 0, K_RMID, 0), 0);
 }
 
+/* exit_sem runs in do_exit (kernel/exit.c), before the process is a zombie: a SEM_UNDO lock comes back
+ * however its holder dies. Here the holder's host process is killed outright, so no exit hook runs. */
+LT_TEST(undo_after_host_kill)
+{
+    int id = (int)sget(K_PRIVATE, 1, 0600);
+    LT_EQ(ctl(id, 0, K_SETVAL, 1), 0);
+    const int16_t lockop[3] = { 0, -1, K_UNDO };
+    int pfd[2];
+    LT_EQ(pipe(pfd), 0);
+
+    /* a waiter already sleeps when the holder dies; nobody waits for the holder (it stays a zombie) */
+    fflush(NULL);
+    pid_t c = lkd_fork_host(T, 0);
+    if (c == 0) {
+        alarm(20);
+        put64(pfd[1], ops_as(T, 1, id, -1, 1, lockop));
+        pause();
+        _exit(10);
+    }
+    LT_CHECK(c > 0);
+    LT_EQ(get64(pfd[0]), 0);
+    LT_EQ(val(id, 0), 0);
+    struct w a;
+    w_launch(&a, 2, id, 1, lockop, 5000000000ll);
+    usleep(30000);
+    LT_EQ(ctl(id, 0, K_GETNCNT, 0), 1);
+    int64_t t0 = lkd_host_mono_ns();
+    kill(c, SIGKILL);
+    w_join(&a);
+    int64_t dt = lkd_host_mono_ns() - t0;
+    LT_EQ(a.ret, 0);
+    LT_CHECK(dt < 1000000000ll);
+    printf("MEASURE waiter served %.1f ms after the holder's host was killed\n", dt / 1e6);
+    LT_EQ(val(id, 0), 0);
+    LT_EQ(ctl(id, 0, K_GETNCNT, 0), 0);
+    int st = 0;
+    LT_EQ(waitpid(c, &st, 0), c);
+    LT_CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    LT_EQ(op1(id, 0, 1, K_UNDO), 0); /* the waiter's process gives the lock back */
+    LT_EQ(val(id, 0), 1);
+
+    /* nobody waits when the holder dies: the next operation that would block applies its record first,
+     * an IPC_NOWAIT one too */
+    fflush(NULL);
+    c = lkd_fork_host(T, 0);
+    if (c == 0) {
+        alarm(20);
+        put64(pfd[1], ops_as(T, 1, id, -1, 1, lockop));
+        pause();
+        _exit(10);
+    }
+    LT_CHECK(c > 0);
+    LT_EQ(get64(pfd[0]), 0);
+    LT_EQ(val(id, 0), 0);
+    const int16_t trylock[3] = { 0, -1, K_UNDO | K_NOWAIT };
+    LT_ERRNO(ops_as(T, 0, id, -1, 1, trylock), LX_EAGAIN);
+    kill(c, SIGKILL);
+    siginfo_t si;
+    LT_EQ(waitid(P_PID, (id_t)c, &si, WEXITED | WNOWAIT), 0); /* dead, not reaped */
+    LT_EQ(ops_as(T, 0, id, -1, 1, trylock), 0);
+    LT_EQ(val(id, 0), 0);
+    LT_EQ(waitpid(c, &st, 0), c);
+    LT_EQ(op1(id, 0, 1, K_UNDO), 0);
+    LT_EQ(val(id, 0), 1);
+    close(pfd[0]); close(pfd[1]);
+    LT_EQ(ctl(id, 0, K_RMID, 0), 0);
+}
+
+/* Linux queues one blocked operation per task, with up to SEMOPM operations each (do_semtimedop) */
+LT_TEST(many_waiters)
+{
+    enum { N = 288 }; /* more than 256, under the 300 threads of a test process */
+    static struct w ws[N];
+    int id = (int)sget(K_PRIVATE, 2, 0600);
+    LT_CHECK(id >= 0);
+    const int16_t dec[3] = { 0, -1, 0 };
+    for (int i = 0; i < N; i++) w_launch(&ws[i], 8 + i, id, 1, dec, 20000000000ll);
+    for (int k = 0; k < 500 && ctl(id, 0, K_GETNCNT, 0) < N; k++) usleep(10000);
+    LT_EQ(ctl(id, 0, K_GETNCNT, 0), N);
+    int done = 0;
+    for (int i = 0; i < N; i++) done += atomic_load(&ws[i].done);
+    LT_EQ(done, 0);
+    LT_EQ(ctl(id, 0, K_SETVAL, N), 0);
+    int ok = 0;
+    for (int i = 0; i < N; i++) {
+        w_join(&ws[i]);
+        ok += ws[i].ret == 0;
+    }
+    LT_EQ(ok, N);
+    LT_EQ(val(id, 0), 0);
+    LT_EQ(ctl(id, 0, K_GETNCNT, 0), 0);
+
+    /* SEMOPM operations queued at once: wait on semaphore 1, then add 1 to semaphore 0 499 times */
+    static int16_t big[3 * 500];
+    big[0] = 1; big[1] = -1; big[2] = 0;
+    for (int i = 1; i < 500; i++) { big[3 * i] = 0; big[3 * i + 1] = 1; big[3 * i + 2] = 0; }
+    struct w b;
+    w_launch(&b, 8, id, 500, big, 20000000000ll);
+    usleep(30000);
+    LT_EQ(ctl(id, 1, K_GETNCNT, 0), 1);
+    LT_EQ(ctl(id, 0, K_GETNCNT, 0), 0);
+    LT_EQ(val(id, 0), 0);
+    LT_EQ(op1(id, 1, 1, 0), 0);
+    w_join(&b);
+    LT_EQ(b.ret, 0);
+    LT_EQ(val(id, 0), 499);
+    LT_EQ(val(id, 1), 0);
+    LT_EQ(ctl(id, 0, K_RMID, 0), 0);
+}
+
 /* ---- information -------------------------------------------------------------------------------- */
 
 LT_TEST(info_and_stat)
@@ -481,6 +604,7 @@ LT_TEST(info_and_stat)
     LT_EQ(ctl(id % 32768, 0, K_SEM_STAT, P(d)), id);
     LT_EQ(d->nsems, 4);
     LT_EQ(ctl(id % 32768, 0, K_SEM_STAT_ANY, P(d)), id);
+    LT_EQ(ctl(id % 32768 + 7 * 32768, 0, K_SEM_STAT, P(d)), id); /* ipcid_to_idx keeps the low 15 bits */
     LT_ERRNO(ctl(1023, 0, K_SEM_STAT, P(d)), LX_EINVAL);
     LT_ERRNO(ctl(id, 0, K_STAT, 8), LX_EFAULT);
     LT_ERRNO(ctl(id, 0, 99, 0), LX_EINVAL);
@@ -497,6 +621,8 @@ int main(void)
     LT_RUN(signal_ends_wait);
     LT_RUN(undo_at_exit);
     LT_RUN(shared_across_fork);
+    LT_RUN(undo_after_host_kill);
+    LT_RUN(many_waiters);
     LT_RUN(info_and_stat);
     return lt_finish();
 }

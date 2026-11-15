@@ -293,6 +293,7 @@ void lkd_sig_fork_child(lkd_task *t)
     g_fork_sp = NULL;
     g_fork_hand = NULL;
     sig_ntsync_fork_child();
+    sig_sem_fork_child();
     sig_futex_fork_child();
     lkd_famsvc_fork_child();
 }
