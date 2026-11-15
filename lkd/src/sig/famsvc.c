@@ -225,8 +225,31 @@ static int recv_msg(int fd, struct fs_wire *h, void **data, int *fds, int *nfds,
 
 /* ---- directory -------------------------------------------------------------------------------- */
 
+static int has_suffix(const char *name, const char *suffix)
+{
+    size_t n = strlen(name), k = strlen(suffix);
+    return n > k && !strcmp(name + n - k, suffix);
+}
+
+/* Unlink the family files of d (every "*.shm": the shared tables of futex.c, ntsync.c and sem.c) and,
+ * with sockets, its socket files, then remove d. rmdir fails while anything else is left in it. */
+static void remove_family_dir(const char *d, int sockets)
+{
+    DIR *x = opendir(d);
+    if (!x) return;
+    struct dirent *f;
+    while ((f = readdir(x))) {
+        if (!has_suffix(f->d_name, ".shm") && !(sockets && has_suffix(f->d_name, ".s"))) continue;
+        char q[PATH_MAX];
+        snprintf(q, sizeof q, "%s/%s", d, f->d_name);
+        unlink(q);
+    }
+    closedir(x);
+    rmdir(d);
+}
+
 /* Remove family directories left by crashed runs: lkdfam.* under base, older than a minute, holding
- * only sockets of dead processes and the futex file. */
+ * only sockets of dead processes and family files. */
 static void gc_stale_dirs(const char *base)
 {
     DIR *b = opendir(base);
@@ -243,25 +266,13 @@ static void gc_stale_dirs(const char *base)
         if (!x) continue;
         int keep = 0;
         struct dirent *f;
-        while ((f = readdir(x)) && !keep) {
-            if (!strcmp(f->d_name, ".") || !strcmp(f->d_name, "..") || !strcmp(f->d_name, "futex.shm")) continue;
-            size_t n = strlen(f->d_name);
-            if (n < 3 || strcmp(f->d_name + n - 2, ".s") != 0) { keep = 1; break; }
-            int pid = atoi(f->d_name);
-            if (pid <= 0 || kill(pid, 0) == 0 || errno == EPERM) keep = 1;
+        while (!keep && (f = readdir(x))) {
+            if (!strcmp(f->d_name, ".") || !strcmp(f->d_name, "..") || has_suffix(f->d_name, ".shm")) continue;
+            int pid = has_suffix(f->d_name, ".s") ? atoi(f->d_name) : 0;
+            keep = pid <= 0 || kill(pid, 0) == 0 || errno == EPERM;
         }
         closedir(x);
-        if (keep) continue;
-        x = opendir(d);
-        if (!x) continue;
-        while ((f = readdir(x))) {
-            if (!strcmp(f->d_name, ".") || !strcmp(f->d_name, "..")) continue;
-            char q[PATH_MAX];
-            snprintf(q, sizeof q, "%s/%s", d, f->d_name);
-            unlink(q);
-        }
-        closedir(x);
-        rmdir(d);
+        if (!keep) remove_family_dir(d, 1);
     }
     closedir(b);
 }
@@ -543,7 +554,8 @@ static void pool_drop_all(void)
     g_pool_n = 0;
 }
 
-/* Remove sockets of dead processes; remove the directory when no live socket remains. */
+/* Remove sockets of dead processes; remove the family files and the directory when no live socket
+ * remains. */
 static void sweep_dir(void)
 {
     const char *d = lkd_famsvc_dir();
@@ -553,8 +565,7 @@ static void sweep_dir(void)
     int live = 0;
     struct dirent *e;
     while ((e = readdir(dir))) {
-        size_t n = strlen(e->d_name);
-        if (n < 3 || strcmp(e->d_name + n - 2, ".s") != 0) continue;
+        if (!has_suffix(e->d_name, ".s")) continue;
         int pid = atoi(e->d_name);
         char p[PATH_MAX];
         snprintf(p, sizeof p, "%s/%s", d, e->d_name);
@@ -562,12 +573,7 @@ static void sweep_dir(void)
         else unlink(p);
     }
     closedir(dir);
-    if (!live) {
-        char p[PATH_MAX];
-        snprintf(p, sizeof p, "%s/futex.shm", d);
-        unlink(p);
-        rmdir(d);
-    }
+    if (!live) remove_family_dir(d, 0);
 }
 
 void lkd_famsvc_shutdown(void)

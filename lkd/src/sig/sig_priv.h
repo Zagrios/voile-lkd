@@ -91,8 +91,15 @@ uint32_t sig_shared_sleeper_index(struct fx_sleeper *s); /* 1-based */
 void sig_shared_sleeper_wake(uint32_t index);
 int sig_shared_sleep(lkd_task *t, struct fx_sleeper *s, int64_t deadline);
 void sig_shared_sleeper_put(struct fx_sleeper *s);
+/* Forget a wake, keep the ring count: the owner sleeps again on s. The caller knows the wake was stray. */
+void sig_shared_sleeper_rearm(struct fx_sleeper *s);
 void sig_spin_lock(_Atomic uint32_t *l);
 void sig_spin_unlock(_Atomic uint32_t *l);
+
+/* ---- sem.c ------------------------------------------------------------------------------------ */
+void sig_sem_register(void);
+void sig_sem_proc_exit(lkd_task *t); /* the guest process of t exits: apply its SEM_UNDO adjustments */
+void sig_sem_fork_child(void);
 
 /* ---- ntsync.c --------------------------------------------------------------------------------- */
 void sig_ntsync_host_exit(void);  /* last guest process of this host process: release its ntsync slots */
@@ -171,5 +178,8 @@ void lkd_futex_set_key_fn(int (*fn)(lkd_task *t, uint64_t gva, int private_hint,
 
 /* ---- syscalls.c ------------------------------------------------------------------------------- */
 void sig_syscalls_register(void);
+/* A relative struct timespec of the guest: -LX_EFAULT, -LX_EINVAL (tv_sec < 0, tv_nsec outside
+ * [0, 1e9)), or 0 with *rel_ns, tv_sec capped so that a deadline of lkd_host_mono_ns() + *rel_ns fits. */
+int sig_read_timeout(uint64_t uts, int64_t *rel_ns);
 
 #endif /* LKD_SIG_PRIV_H */

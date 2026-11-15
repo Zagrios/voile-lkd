@@ -18,9 +18,9 @@
  * (mkdtemp under $TMPDIR, or /tmp when the path would not fit sun_path) and exports the variable; fork
  * children inherit it; a host re-exec of the runtime keeps it when the engine keeps the environment
  * (it must keep LKD_FAMSVC_DIR and LKD_FAMSVC_FD, as it keeps LKD_FAMILY_FD). Tests may set
- * LKD_FAMSVC_DIR to a directory of their own before lkd_init. The directory also holds the shared
- * futex table (futex.shm). The last process that leaves (lkd_famsvc_shutdown with no peer socket left)
- * removes the directory.
+ * LKD_FAMSVC_DIR to a directory of their own before lkd_init. The directory also holds the family's
+ * shared tables, the "*.shm" files (futex.shm, ntsync.shm, sem.shm). The last process that leaves
+ * (lkd_famsvc_shutdown with no peer socket left) removes them and the directory.
  *
  * Lifetime. Started by lkd_sig_init (so by lkd_init), restarted in the fork child by lkd_sig_fork_child
  * (new socket for the new host pid; inherited connections are closed), adopted after a host re-exec:

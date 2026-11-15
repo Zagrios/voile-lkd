@@ -84,12 +84,12 @@ LKD_SYSCALL(rt_sigpending)
     return 0;
 }
 
-static int read_timeout(uint64_t uts, int64_t *rel_ns)
+int sig_read_timeout(uint64_t uts, int64_t *rel_ns)
 {
     struct lx_timespec ts;
     if (lkd_user_read(uts, &ts, sizeof ts) < 0) return -LX_EFAULT;
     if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -LX_EINVAL;
-    if (ts.tv_sec > 100000000000ll) ts.tv_sec = 100000000000ll;
+    if (ts.tv_sec > 1000000000ll) ts.tv_sec = 1000000000ll; /* 31 years, so that the ns count fits */
     *rel_ns = ts.tv_sec * 1000000000ll + ts.tv_nsec;
     return 0;
 }
@@ -102,7 +102,7 @@ LKD_SYSCALL(rt_sigtimedwait)
     uint64_t set;
     if (lkd_user_read(uset, &set, sizeof set) < 0) return -LX_EFAULT;
     int64_t rel = -1;
-    if (uts) { int e = read_timeout(uts, &rel); if (e < 0) return e; }
+    if (uts) { int e = sig_read_timeout(uts, &rel); if (e < 0) return e; }
     set &= ~LX_SIG_UNBLOCKABLE;
     struct lkd_sigproc *sp = sig_proc(t->proc);
     struct lx_siginfo info;
