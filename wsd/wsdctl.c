@@ -1,5 +1,5 @@
 /* wsdctl: test-only host tool for wsd. Sends synthetic input (WSD_DEBUG_INPUT) to the largest visible window.
- * Usage: wsdctl SOCKET key KEYCODE down|up | tap KEYCODE | click X Y | move COUNT HZ
+ * Usage: wsdctl SOCKET key KEYCODE down|up | tap KEYCODE | click X Y | hover X Y | move COUNT HZ
  *        | window move X Y | window size W H | window minimize|restore|zoom|close|quit  (screen points) */
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,7 +21,7 @@ int main(int argc, char **argv)
     struct wsd_debug_input in = {0};
     int fd;
     if (argc < 4) {
-        fprintf(stderr, "usage: wsdctl SOCKET key CODE down|up | tap CODE | click X Y | move COUNT HZ | "
+        fprintf(stderr, "usage: wsdctl SOCKET key CODE down|up | tap CODE | click X Y | hover X Y | move COUNT HZ | "
                         "window move X Y | window size W H | window minimize|restore|zoom|close|quit\n");
         return 2;
     }
@@ -51,6 +51,9 @@ int main(int argc, char **argv)
         in.kind = 4;
         for (uint32_t i = 1; i < sizeof(actions) / sizeof(*actions); i++) if (!strcmp(argv[3], actions[i])) in.a = i;
         if (argc >= 6) { in.b = atoi(argv[4]); in.reserved = atoi(argv[5]); }
+        sendmsg_wsd(fd, WSD_DEBUG_INPUT, &in, sizeof(in));
+    } else if (!strcmp(argv[2], "hover") && argc >= 5) {
+        in.kind = 5; in.a = atoi(argv[3]); in.b = atoi(argv[4]);
         sendmsg_wsd(fd, WSD_DEBUG_INPUT, &in, sizeof(in));
     } else if (!strcmp(argv[2], "click") && argc >= 5) {
         in.kind = 2; in.a = atoi(argv[3]); in.b = atoi(argv[4]);
