@@ -8,7 +8,8 @@
  * 3. Protocol checks: synthetic input (DEBUG_INJECT), relative mouse mode, cursor clip, cursor
  *    visibility, fullscreen toggle, title, ping latency.
  * 4. --render-check: what wsd tells a client and what macOS makes of a window, for the render percent wsd runs with.
- * 5. --pointer-check: a pointer over a view that shows a frame of another size lands where the frame shows it.
+ * 5. --pointer-check: a pointer over a view that shows a frame of another size lands where the frame shows it, and
+ *    a warp there (SetCursorPos) reads back where it went.
  * Single-threaded, bounded loops, ends with "RESULT PASS|FAIL".
  *
  * Usage: wsd_client <socket> [seconds_per_rate<=10] [rates e.g. 60,120] [--no-pointer]
@@ -627,15 +628,24 @@ static void mode_check(const struct wsd_hello_reply *hr, const char *socket_path
 /* Pointer over a frame of another size than the view (a client that keeps its size while AppKit gave its window
  * another): wsd stretches the frame over the view, and the pointer it reports must follow the stretch. Synthetic
  * motion at view pixels (DEBUG_INPUT kind 5, which activates nothing), first over a frame 1.25x taller than the view,
- * then over one of the view's own size. */
-static void hover_at(uint32_t x, uint32_t y, float want_x, float want_y) {
-  struct wsd_debug_input in = {5, x, y, 0};
+ * then over one of the view's own size. A warp into the window must read back where it went: kind 6 sends the motion
+ * where CURSOR_WARP to screen pixels would put the pointer, without moving it (wsd is not the active app). */
+static void motion_at(uint32_t kind, const char *what, uint32_t a, uint32_t b, float want_x, float want_y) {
+  struct wsd_debug_input in = {kind, a, b, 0};
   send_msg(WSD_DEBUG_INPUT, &in, sizeof(in), NULL, 0, -1);
   struct event e;
   int ok = wait_type(WSD_EV_MOTION, &e, 1000);
   const struct wsd_ev_motion *m = (const void *)e.data;
-  if (ok) printf("  hover view px (%u,%u) -> motion (%.1f,%.1f), want (%.1f,%.1f)\n", x, y, m->x, m->y, want_x, want_y);
-  CHECK(ok && fabsf(m->x - want_x) < 1 && fabsf(m->y - want_y) < 1, "pointer at view (%u,%u)", x, y);
+  if (ok) printf("  %s (%d,%d) -> motion (%.1f,%.1f), want (%.1f,%.1f)\n", what, (int32_t)a, (int32_t)b, m->x, m->y, want_x,
+                 want_y);
+  CHECK(ok && fabsf(m->x - want_x) < 1 && fabsf(m->y - want_y) < 1, "%s (%d,%d)", what, (int32_t)a, (int32_t)b);
+}
+static void hover_at(uint32_t x, uint32_t y, float want_x, float want_y) {
+  motion_at(5, "hover view px", x, y, want_x, want_y);
+}
+/* a warp to the client pixel (x, y) of the window whose content's top-left is at screen pixels (ox, oy) */
+static void warp_at(int32_t ox, int32_t oy, uint32_t x, uint32_t y) {
+  motion_at(6, "warp screen px", (uint32_t)(ox + (int32_t)x), (uint32_t)(oy + (int32_t)y), x, y);
 }
 static void present_frame(uint32_t id, uint32_t w, uint32_t h) {
   size_t sz = (size_t)w * h * 4;
@@ -656,7 +666,7 @@ static void present_frame(uint32_t id, uint32_t w, uint32_t h) {
   munmap(px, sz);
   close(fd);
 }
-static void pointer_check(int place, int32_t x, int32_t y) {
+static void pointer_check(pid_t server, int place, int32_t x, int32_t y) {
   struct event e;
   struct wsd_window_create wc = {WIN, g_w, g_h, WSD_STYLE_TITLED | WSD_STYLE_CLOSABLE};
   send_msg(WSD_WINDOW_CREATE, &wc, sizeof(wc), "wsd_client pointer", 18, -1);
@@ -669,16 +679,26 @@ static void pointer_check(int place, int32_t x, int32_t y) {
   if (!wait_type(WSD_EV_RESIZE, &e, 2000)) die("no RESIZE after show");
   const struct wsd_ev_resize *rs = (const void *)e.data;
   uint32_t vw = rs->width_px, vh = rs->height_px, fh = vh * 5 / 4;
+  double sc = rs->backing_scale_x1000 / 1000.0;
   printf("pointer check: view %ux%u px, frame %ux%u px\n", vw, vh, vw, fh);
   present_frame(10, vw, fh);
+  /* the content's top-left in screen pixels, from the window macOS lists: the bottom of its frame less the view */
+  CGRect r;
+  if (!window_width_points(server, vw / sc, &r)) die("window not listed");
+  int32_t ox = (int32_t)lround(r.origin.x * sc), oy = (int32_t)lround((r.origin.y + r.size.height) * sc) - (int32_t)vh;
   float k = (float)fh / (float)vh;
   hover_at(vw / 4, vh / 4, vw / 4, vh / 4 * k);
   hover_at(vw / 2, vh / 2, vw / 2, vh / 2 * k);
   hover_at(vw - 10, vh - 10, vw - 10, (vh - 10) * k);
+  warp_at(ox, oy, vw / 4, fh / 4);
+  warp_at(ox, oy, vw / 2, fh / 2);
+  warp_at(ox, oy, vw - 10, fh - 10); /* below the view's own pixels: lower than the scale alone puts it */
   printf("pointer check: frame %ux%u px (the view's)\n", vw, vh);
   present_frame(11, vw, vh);
   hover_at(vw / 2, vh / 2, vw / 2, vh / 2);
   hover_at(vw - 10, vh - 10, vw - 10, vh - 10);
+  warp_at(ox, oy, vw / 2, vh / 2);
+  warp_at(ox, oy, vw - 10, vh - 10);
   struct wsd_window wd = {WIN};
   send_msg(WSD_WINDOW_DESTROY, &wd, sizeof(wd), NULL, 0, -1);
   CHECK(g_errors == 0, "%d server errors", g_errors);
@@ -728,7 +748,7 @@ int main(int argc, char **argv) {
          hr.display_width_px, hr.display_height_px, hr.max_refresh_hz, hr.backing_scale_x1000 / 1000.0);
 
   if (pointer_only) {
-    pointer_check(place, place_x, place_y);
+    pointer_check((pid_t)hr.server_pid, place, place_x, place_y);
     close(g_sock);
     printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;

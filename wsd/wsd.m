@@ -202,6 +202,8 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property(strong) WsdWindow *overlay;
 @property BOOL isOverlay;
 @property(weak) WsdWindow *base; /* an overlay's window */
+/* the overlay plane was removed and the base plane has shown no frame since (-pointerScale) */
+@property BOOL overlayGone;
 @property NSRect overlayPx;
 @property NSRect savedFrame;
 @property NSWindowStyleMask savedStyle;
@@ -746,12 +748,15 @@ static CAMetalLayer *make_metal_layer(void) {
  * than the client's: AppKit shortens a window taller than the screen to fit below the menu bar while the client keeps
  * its size (2026-11-05: Killing Floor windowed at 2560x1418 px in a 2560x1359 window, and at 2560x1418 in a 2560x1440
  * fullscreen one). The pointer must land where the frame shows things: Killing Floor selected menu items up to 59 px
- * above the pointer. An overlay plane is placed at the scale itself (-overlayAt:), so a window with one keeps it. */
+ * above the pointer. An overlay plane is placed at the scale itself (-overlayAt:), so a window with one keeps it, and
+ * so does a window whose overlay was removed until its base plane shows a new frame: a game that recreates its
+ * swapchain removes the plane (PRESENT_REGION 0x0) for a moment, and the base plane's last frame may be a GDI one
+ * of an older size. */
 - (WsdScale)pointerScale {
   WsdScale s = backing_scale_xy(self.window);
   WsdBuffer *b = self.lastBuffer;
   NSSize v = self.view.bounds.size;
-  if (!b || self.overlay || v.width < 1 || v.height < 1) return s;
+  if (!b || self.overlay || self.overlayGone || v.width < 1 || v.height < 1) return s;
   if (fabs(b.width - v.width * s.x) < 1 && fabs(b.height - v.height * s.y) < 1) return s;
   return (WsdScale){b.width / v.width, b.height / v.height};
 }
@@ -978,7 +983,7 @@ static CAMetalLayer *make_metal_layer(void) {
   id<CAMetalDrawable> d = [self.layer nextDrawable];
   if (!d) return; /* keep it pending */
   if (redisplay) self.redisplay = NO;
-  else { self.pendingBuffer = nil; self.lastBuffer = b; self.redisplayTries = 0; }
+  else { self.pendingBuffer = nil; self.lastBuffer = b; self.redisplayTries = 0; self.overlayGone = NO; }
   CGSize want = CGSizeMake(b.width, b.height);
   if (!CGSizeEqualToSize(self.layer.drawableSize, want)) self.layer.drawableSize = want;
 
@@ -1156,6 +1161,7 @@ static CAMetalLayer *make_metal_layer(void) {
   o.lastBuffer = nil;
   [o.layer removeFromSuperlayer];
   self.overlay = nil;
+  self.overlayGone = YES;
 }
 
 /* Places the overlay plane at a rectangle of the content view given in pixels (top-left origin). */
@@ -1215,6 +1221,29 @@ static CAMetalLayer *make_metal_layer(void) {
 @end
 
 /* ---------------------------------------------------------------- client connection */
+
+/* SetCursorPos's screen pixels to global display points (origin top-left of the screen with the menu bar). In a
+ * window of the client, the pixel goes where the window shows it, through -pointerScale as the moves come back:
+ * with the scale alone, a warp into a window showing a frame taller than its view came back lower (a 1418 px high
+ * frame in a 1359 px view, as Killing Floor's: a warp to y=709 comes back as 740). Elsewhere, the screen's scale. */
+static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
+  double top = NSMaxY(primary_screen().frame);
+  for (NSWindow *nw in NSApp.orderedWindows) {
+    if (!nw.visible) continue;
+    for (WsdWindow *w in c.windows.allValues) {
+      if (w.window != nw) continue;
+      /* client pixels from the content's top-left, as -sendFrame gives it */
+      WsdScale s = backing_scale_xy(nw), ps = [w pointerScale];
+      NSRect r = [nw contentRectForFrameRect:nw.frame];
+      double left = r.origin.x, ctop = top - NSMaxY(r), cx = x - left * s.x, cy = y - ctop * s.y;
+      NSSize v = w.view.bounds.size;
+      if (cx >= 0 && cy >= 0 && cx < v.width * ps.x && cy < v.height * ps.y)
+        return CGPointMake(left + cx / ps.x, ctop + cy / ps.y);
+    }
+  }
+  WsdScale s = backing_scale_xy(nil);
+  return CGPointMake(x / s.x, y / s.y);
+}
 
 @implementation WsdClient
 - (void)send:(uint32_t)type payload:(const void *)p len:(uint32_t)n extra:(NSData *)extra {
@@ -1763,7 +1792,7 @@ static CAMetalLayer *make_metal_layer(void) {
     if (!g_probe_enabled) {
       g_probe_enabled = YES;
       LOG("latency probe on (first test input)");
-    } else if (m->kind != 3 && m->kind != 5 && (m->kind == 2 || m->b)) probe_arm(m->kind == 1 ? "key" : "click");
+    } else if (m->kind == 2 || (m->kind == 1 && m->b)) probe_arm(m->kind == 1 ? "key" : "click");
     g_injecting = YES;
     if (m->kind == 3) {
       /* raw mouse motion (relative mode test): delta x = a - 10000, delta y = b - 10000, through the view as a real
@@ -1781,11 +1810,18 @@ static CAMetalLayer *make_metal_layer(void) {
                                modifierFlags:0 timestamp:t windowNumber:nw.windowNumber context:nil characters:@""
                  charactersIgnoringModifiers:@"" isARepeat:NO keyCode:(unsigned short)m->a];
       [nw sendEvent:e];
-    } else if (m->kind == 5) {
-      /* pointer motion at view pixels (a, b) (view points at the backing scale), into the view: unlike a click it
-       * neither activates wsd nor makes the window key */
-      WsdScale sc = backing_scale_xy(nw);
-      NSPoint p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
+    } else if (m->kind == 5 || m->kind == 6) {
+      /* pointer motion into the view, which unlike a click neither activates wsd nor makes the window key: 5 at view
+       * pixels (a, b) (view points at the backing scale), 6 where CURSOR_WARP to screen pixels (a, b) would put the
+       * pointer (warp_point, for the window's client), without moving it */
+      NSPoint p;
+      if (m->kind == 6) {
+        CGPoint g = warp_point(best.client, (int32_t)m->a, (int32_t)m->b);
+        p = [nw convertPointFromScreen:NSMakePoint(g.x, NSMaxY(primary_screen().frame) - g.y)];
+      } else {
+        WsdScale sc = backing_scale_xy(nw);
+        p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
+      }
       NSEvent *e = [NSEvent mouseEventWithType:NSEventTypeMouseMoved location:p modifierFlags:0 timestamp:t
                                 windowNumber:nw.windowNumber context:nil eventNumber:0 clickCount:0 pressure:0];
       [best.view mouseMoved:e];
@@ -1912,11 +1948,11 @@ static CAMetalLayer *make_metal_layer(void) {
     /* SetCursorPos, only while wsd is the active app (a game behind another app must not move the user's pointer) and
      * outside relative mode (the pointer stands still there and the game reads deltas). As in Wine's Mac driver
      * (-[WineApplicationController setCursorPosition:]), without the 0.25 s after a warp during which macOS keeps the
-     * pointer still, then the mouse moves already queued are dropped (-motion:). */
+     * pointer still, then the mouse moves already queued are dropped (-motion:). In a window, the pixel is the one
+     * its moves report (warp_point). */
     if (!NSApp.active || g_relative_global) break;
-    WsdScale s = backing_scale_xy(nil);
     CGSetLocalEventsSuppressionInterval(0);
-    CGError e = CGWarpMouseCursorPosition(CGPointMake(m->x / s.x, m->y / s.y));
+    CGError e = CGWarpMouseCursorPosition(warp_point(self, m->x, m->y));
     CGSetLocalEventsSuppressionInterval(0.25);
     if (e != kCGErrorSuccess) { [self error:type code:-EIO]; break; }
     g_warp_time = NSProcessInfo.processInfo.systemUptime;
