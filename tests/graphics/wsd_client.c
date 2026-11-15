@@ -64,6 +64,13 @@ static void die(const char *m) {
   exit(1);
 }
 
+/* Disconnects and gives main's result. */
+static int finish(void) {
+  close(g_sock);
+  printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
+  return g_fail;
+}
+
 static void send_msg(uint32_t type, const void *p, uint32_t n, const void *extra, uint32_t en, int fd) {
   uint8_t buf[sizeof(struct wsd_hdr) + WSD_MAX_PAYLOAD];
   struct wsd_hdr h = {type, n + en};
@@ -675,20 +682,32 @@ static void present_frame(uint32_t id, uint32_t w, uint32_t h) {
   munmap(b.px, sz);
   close(b.fd);
 }
-static void pointer_check(pid_t server, int place, int32_t x, int32_t y) {
-  struct event e;
+/* Creates window WIN, at screen pixels (x, y) when place, and shows it without activation; returns its first RESIZE. */
+static struct wsd_ev_resize open_inactive_window(const char *title, int place, int32_t x, int32_t y) {
   struct wsd_window_create wc = {WIN, g_w, g_h, WSD_STYLE_TITLED | WSD_STYLE_CLOSABLE};
-  send_msg(WSD_WINDOW_CREATE, &wc, sizeof(wc), "wsd_client pointer", 18, -1);
+  send_msg(WSD_WINDOW_CREATE, &wc, sizeof(wc), title, (uint32_t)strlen(title), -1);
   if (place) {
     struct wsd_window_frame f = {WIN, WSD_FRAME_MOVE, x, y, g_w, g_h};
     send_msg(WSD_WINDOW_SET_FRAME, &f, sizeof(f), NULL, 0, -1);
   }
   struct wsd_window_flag show = {WIN, 2}; /* without activation */
   send_msg(WSD_WINDOW_SHOW, &show, sizeof(show), NULL, 0, -1);
+  struct event e;
   if (!wait_type(WSD_EV_RESIZE, &e, 2000)) die("no RESIZE after show");
-  const struct wsd_ev_resize *rs = (const void *)e.data;
-  uint32_t vw = rs->width_px, vh = rs->height_px, fh = vh * 5 / 4;
-  double sc = rs->backing_scale_x1000 / 1000.0;
+  struct wsd_ev_resize rs;
+  memcpy(&rs, e.data, sizeof(rs));
+  return rs;
+}
+/* Destroys window WIN; wsd must have refused no request. */
+static void close_window(void) {
+  struct wsd_window wd = {WIN};
+  send_msg(WSD_WINDOW_DESTROY, &wd, sizeof(wd), NULL, 0, -1);
+  CHECK(g_errors == 0, "%d server errors", g_errors);
+}
+static void pointer_check(pid_t server, int place, int32_t x, int32_t y) {
+  struct wsd_ev_resize rs = open_inactive_window("wsd_client pointer", place, x, y);
+  uint32_t vw = rs.width_px, vh = rs.height_px, fh = vh * 5 / 4;
+  double sc = rs.backing_scale_x1000 / 1000.0;
   printf("pointer check: view %ux%u px, frame %ux%u px\n", vw, vh, vw, fh);
   present_frame(10, vw, fh);
   /* the content's top-left in screen pixels, from the window macOS lists: the bottom of its frame less the view */
@@ -708,53 +727,41 @@ static void pointer_check(pid_t server, int place, int32_t x, int32_t y) {
   hover_at(vw - 10, vh - 10, vw - 10, vh - 10);
   warp_at(ox, oy, vw / 2, vh / 2);
   warp_at(ox, oy, vw - 10, vh - 10);
-  struct wsd_window wd = {WIN};
-  send_msg(WSD_WINDOW_DESTROY, &wd, sizeof(wd), NULL, 0, -1);
-  CHECK(g_errors == 0, "%d server errors", g_errors);
+  close_window();
 }
 
+/* Waits ms, then checks that macOS lists a window of the server on screen (want 1) or none (want 0). */
+static void expect_listed(pid_t server, int want, int ms, const char *after) {
+  usleep((useconds_t)ms * 1000);
+  CGRect r;
+  int on = window_points(server, &r);
+  printf("hide check: %d ms after %s the window is %s\n", ms, after, on ? "on screen" : "off screen");
+  CHECK(on == want, "%d ms after %s the window is %s", ms, after, on ? "on screen" : "off screen");
+}
 /* A hide followed at once by a show (a game restyling its window) must not take the window off screen, which would
  * take the app's focus with it; a hide alone must. Shown without activation, so it reads the window list. */
-static pid_t g_server_pid;
-static void hide_check(int place, int32_t x, int32_t y) {
-  struct event e;
-  struct wsd_window_create wc = {WIN, g_w, g_h, WSD_STYLE_TITLED | WSD_STYLE_CLOSABLE};
-  send_msg(WSD_WINDOW_CREATE, &wc, sizeof(wc), "wsd_client hide", 15, -1);
-  if (place) {
-    struct wsd_window_frame f = {WIN, WSD_FRAME_MOVE, x, y, g_w, g_h};
-    send_msg(WSD_WINDOW_SET_FRAME, &f, sizeof(f), NULL, 0, -1);
-  }
+static void hide_check(pid_t server, int place, int32_t x, int32_t y) {
+  open_inactive_window("wsd_client hide", place, x, y);
+  expect_listed(server, 1, 200, "the first show");
   struct wsd_window_flag show = {WIN, 2}, hide = {WIN, 0};
-  send_msg(WSD_WINDOW_SHOW, &show, sizeof(show), NULL, 0, -1);
-  if (!wait_type(WSD_EV_RESIZE, &e, 2000)) die("no RESIZE after show");
-  usleep(200000);
-  CGRect r;
-  CHECK(window_points(g_server_pid, &r), "window not on screen after the first show");
   send_msg(WSD_WINDOW_SHOW, &hide, sizeof(hide), NULL, 0, -1);
   send_msg(WSD_WINDOW_SHOW, &show, sizeof(show), NULL, 0, -1);
-  usleep(300000);
-  int on_after_quick = window_points(g_server_pid, &r);
-  printf("hide check: after a hide and an immediate show the window is %s\n", on_after_quick ? "on screen" : "off screen");
-  CHECK(on_after_quick, "a hide followed by a show took the window off screen");
+  expect_listed(server, 1, 300, "a hide and an immediate show");
   send_msg(WSD_WINDOW_SHOW, &hide, sizeof(hide), NULL, 0, -1);
-  usleep(400000);
-  int on_after_hide = window_points(g_server_pid, &r);
-  printf("hide check: 400 ms after a hide alone the window is %s\n", on_after_hide ? "on screen" : "off screen");
-  CHECK(!on_after_hide, "a hide alone left the window on screen");
-  struct wsd_window wd = {WIN};
-  send_msg(WSD_WINDOW_DESTROY, &wd, sizeof(wd), NULL, 0, -1);
-  CHECK(g_errors == 0, "%d server errors", g_errors);
+  expect_listed(server, 0, 400, "a hide alone");
+  close_window();
 }
 
 int main(int argc, char **argv) {
   if (argc < 2) { fprintf(stderr, "usage: %s <socket> [seconds] [rates] [--no-pointer]\n", argv[0]); return 2; }
   int render_percent = -1, render_fullscreen = 0; /* render_percent: the --render-check value, -1 without the option */
-  int mode_check_only = 0, pointer_only = 0, hide_only = 0, place = 0;
+  int mode_check_only = 0, place = 0;
   int32_t place_x = 0, place_y = 0;
+  void (*window_check)(pid_t, int, int32_t, int32_t) = NULL; /* --pointer-check or --hide-check, run alone */
   for (int i = 2; i < argc; i++) {
-    if (!strcmp(argv[i], "--pointer-check") || !strcmp(argv[i], "--hide-check")) {
-      if (!strcmp(argv[i], "--hide-check")) hide_only = 1;
-      else pointer_only = 1;
+    int hide = !strcmp(argv[i], "--hide-check");
+    if (hide || !strcmp(argv[i], "--pointer-check")) {
+      window_check = hide ? hide_check : pointer_check;
       if (i + 2 < argc && argv[i + 1][0] != '-') { place = 1; place_x = atoi(argv[++i]); place_y = atoi(argv[++i]); }
       continue;
     }
@@ -790,32 +797,19 @@ int main(int argc, char **argv) {
   printf("hello: version=%u server_pid=%u display=%ux%u px max_refresh=%u Hz scale=%.3f\n", hr.version, hr.server_pid,
          hr.display_width_px, hr.display_height_px, hr.max_refresh_hz, hr.backing_scale_x1000 / 1000.0);
 
-  g_server_pid = (pid_t)hr.server_pid;
-  if (hide_only) {
-    hide_check(place, place_x, place_y);
-    close(g_sock);
-    printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
-    return g_fail;
-  }
-
-  if (pointer_only) {
-    pointer_check((pid_t)hr.server_pid, place, place_x, place_y);
-    close(g_sock);
-    printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
-    return g_fail;
+  if (window_check) {
+    window_check((pid_t)hr.server_pid, place, place_x, place_y);
+    return finish();
   }
 
   if (mode_check_only) {
     mode_check(&hr, argv[1]);
-    printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
-    return g_fail;
+    return finish();
   }
 
   if (render_percent >= 0) {
     render_check(&hr, render_percent, render_fullscreen);
-    close(g_sock);
-    printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
-    return g_fail;
+    return finish();
   }
 
   struct wsd_window_create wc = {WIN, g_w, g_h, WSD_STYLE_TITLED | WSD_STYLE_CLOSABLE | WSD_STYLE_RESIZABLE | WSD_STYLE_TOPMOST};
@@ -846,10 +840,6 @@ int main(int argc, char **argv) {
   /* Drain, destroy, disconnect. */
   uint64_t end = now_ns() + 200000000ull;
   while (now_ns() < end) if (next_event(&e, 20)) handle_async(&e);
-  struct wsd_window wd = {WIN};
-  send_msg(WSD_WINDOW_DESTROY, &wd, sizeof(wd), NULL, 0, -1);
-  CHECK(g_errors == 0, "%d server errors", g_errors);
-  close(g_sock);
-  printf("RESULT %s\n", g_fail ? "FAIL" : "PASS");
-  return g_fail;
+  close_window();
+  return finish();
 }
