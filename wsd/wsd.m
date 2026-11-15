@@ -50,7 +50,11 @@ static NSMutableSet *g_clients;
 static BOOL g_caps_told;           /* the Caps Lock state the clients were brought to (-syncCapsLock:) */
 static NSTimeInterval g_warp_time; /* uptime of the last CURSOR_WARP: the mouse moves queued before it are dropped */
 /* The jump of the last CURSOR_WARP, in points, until the first mouse move after it: macOS reports the warp in that
- * move's delta (SDL's Cocoa backend and Wine's Mac driver make up for it too). */
+ * move's delta (SDL's Cocoa backend and Wine's Mac driver make up for it too). wsd sees the moves through its key
+ * window only, so the jump waits only while the window that was key at the warp stays key (-windowDidResignKey:):
+ * after Cmd-Tab the move that carried it went to another app, and taking it out of a later one turned the camera
+ * the wrong way. However late the first move comes, it carries the jump (a game centers the pointer while a map
+ * loads), and turning relative mode on does not change which move that is. */
 static double g_warp_dx, g_warp_dy;
 static BOOL g_warp_delta_pending;
 static NSCursor *g_cursor;         /* the cursor over the windows (CURSOR_SET), nil for the arrow */
@@ -199,6 +203,8 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 /* a hide waiting HIDE_DELAY_NS for a show that would cancel it (-hideSoon), and its generation */
 @property BOOL hidePending;
 @property uint64_t hideGeneration;
+/* visible as the client sees it: on screen, and no hide waiting */
+@property(readonly) BOOL shown;
 @property NSRect clipPx;
 /* when the window last showed a new frame on either plane, and whether it has held the pointer without one for
  * STALL_NS since (the pointer and the cursor are then the user's) */
@@ -844,6 +850,7 @@ static CAMetalLayer *make_metal_layer(void) {
   [self syncCapsLock:(NSEvent.modifierFlags & NSEventModifierFlagCapsLock) != 0];
 }
 - (void)windowDidResignKey:(NSNotification *)n {
+  g_warp_delta_pending = NO; /* the next moves are no longer this window's */
   /* The pointer disassociation is global: leaving the window (Cmd+Tab, another app, a notification) must give the
    * user their cursor back at once, whatever the game does with the focus event (2026-10-03 session: the cursor
    * stayed captured and the user had to kill wsd). */
@@ -968,14 +975,22 @@ static CAMetalLayer *make_metal_layer(void) {
   __weak WsdWindow *ww = self;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, HIDE_DELAY_NS), dispatch_get_main_queue(), ^{
     WsdWindow *w = ww;
-    if (!w || !w.hidePending || w.hideGeneration != gen) return;
-    w.hidePending = NO;
-    [w.window orderOut:nil];
-    adjust_levels(NSApp.active);
+    if (w.hidePending && w.hideGeneration == gen) [w hideNow];
   });
+}
+- (void)hideNow {
+  self.hidePending = NO;
+  [self.window orderOut:nil];
+  adjust_levels(NSApp.active);
+}
+/* A window whose hide waits is still on screen, but already hidden for a focus request and for bringing a window
+ * back (unminimize_if_none_visible). */
+- (BOOL)shown {
+  return self.window.visible && !self.hidePending;
 }
 - (void)minimize:(BOOL)on {
   NSWindow *w = self.window;
+  if (on && self.hidePending) [self hideNow]; /* hidden, then minimized: in that order, as without the delay */
   if (on && !w.miniaturized && !self.minimizedOut) {
     if (w.styleMask & NSWindowStyleMaskMiniaturizable) [w miniaturize:nil];
     else {
@@ -2008,7 +2023,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     g_warp_time = NSProcessInfo.processInfo.systemUptime;
     g_warp_dx = to.x - from.x;
     g_warp_dy = to.y - from.y;
-    g_warp_delta_pending = fabs(g_warp_dx) + fabs(g_warp_dy) >= 1;
+    g_warp_delta_pending = fabs(g_warp_dx) + fabs(g_warp_dy) >= 1 && [NSApp.keyWindow isKindOfClass:WsdNSWindow.class];
     CGAssociateMouseAndMouseCursorPosition(true);
     break;
   }
@@ -2028,7 +2043,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   case WSD_WINDOW_FOCUS: {
     NEED(wsd_window);
     WsdWindow *w = [self win:m->window_id req:type];
-    if (!w || !w.window.visible || ((WsdNSWindow *)w.window).noActivate) break;
+    if (!w || !w.shown || ((WsdNSWindow *)w.window).noActivate) break;
     /* Wine activated the window (SetForegroundWindow, a dialog taking the focus): the key window follows, as Wine's
      * Mac driver gives it in ActivateWindow. wsd itself becomes active this way only at the game's start; later, a
      * window activated while another app is in front becomes key once wsd is active again. */
@@ -2165,7 +2180,7 @@ static void unminimize_if_none_visible(void) {
   double area = 0;
   for (WsdClient *c in g_clients)
     for (WsdWindow *w in c.windows.allValues) {
-      if (w.window.visible) return;
+      if (w.shown) return;
       NSSize sz = w.window.frame.size;
       if ((w.window.miniaturized || w.minimizedOut) && sz.width * sz.height > area) {
         area = sz.width * sz.height;
@@ -2261,7 +2276,7 @@ static BOOL session_ending(void) {
   g_ever_active = YES;
   WsdWindow *w = g_focus_wanted;
   g_focus_wanted = nil;
-  if (w.window.visible && !((WsdNSWindow *)w.window).noActivate) [w orderInFront:YES];
+  if (w.shown && !((WsdNSWindow *)w.window).noActivate) [w orderInFront:YES];
   adjust_levels(YES);
 }
 @end
