@@ -131,6 +131,22 @@ static struct buf g_buf[NBUF];
 static uint64_t *g_presented, *g_latency, *g_encode;
 static int g_npresented, g_nzero, g_replaced, g_errors;
 
+/* A w x h BGRA8 buffer in shared memory (shm_open + unlink), attached to wsd as buffer id by SCM_RIGHTS. */
+static struct buf attach_buffer(uint32_t id, uint32_t w, uint32_t h) {
+  size_t sz = (size_t)w * h * 4;
+  char name[32];
+  snprintf(name, sizeof(name), "/wsdc-%d-%u", getpid(), id);
+  struct buf b = {shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600), NULL, 0};
+  if (b.fd < 0) die("shm_open");
+  shm_unlink(name);
+  if (ftruncate(b.fd, (off_t)sz)) die("ftruncate");
+  b.px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, b.fd, 0);
+  if (b.px == MAP_FAILED) die("mmap");
+  struct wsd_buffer_attach a = {id, w, h, w * 4, WSD_FMT_BGRA8, 0, 0, sz};
+  send_msg(WSD_BUFFER_ATTACH, &a, sizeof(a), NULL, 0, b.fd);
+  return b;
+}
+
 static void handle_async(const struct event *e) {
   if (e->type == WSD_EV_RELEASE) {
     const struct wsd_ev_release *r = (const void *)e->data;
@@ -651,22 +667,13 @@ static void warp_at(int32_t ox, int32_t oy, uint32_t x, uint32_t y) {
 }
 static void present_frame(uint32_t id, uint32_t w, uint32_t h) {
   size_t sz = (size_t)w * h * 4;
-  char name[32];
-  snprintf(name, sizeof(name), "/wsdc-%d-p%u", getpid(), id);
-  int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
-  if (fd < 0) die("shm_open");
-  shm_unlink(name);
-  if (ftruncate(fd, (off_t)sz)) die("ftruncate");
-  uint8_t *px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  if (px == MAP_FAILED) die("mmap");
-  memset(px, 0x80, sz);
-  struct wsd_buffer_attach a = {id, w, h, w * 4, WSD_FMT_BGRA8, 0, 0, sz};
-  send_msg(WSD_BUFFER_ATTACH, &a, sizeof(a), NULL, 0, fd);
+  struct buf b = attach_buffer(id, w, h);
+  memset(b.px, 0x80, sz);
   struct wsd_present p = {WIN, id, id, now_ns()};
   send_msg(WSD_PRESENT, &p, sizeof(p), NULL, 0, -1);
   CHECK(wait_type(WSD_EV_RELEASE, NULL, 2000), "frame %ux%u not shown", w, h);
-  munmap(px, sz);
-  close(fd);
+  munmap(b.px, sz);
+  close(b.fd);
 }
 static void pointer_check(pid_t server, int place, int32_t x, int32_t y) {
   struct event e;
@@ -820,20 +827,7 @@ int main(int argc, char **argv) {
   printf("window shown: %ux%u px scale=%.3f\n", rs->width_px, rs->height_px, rs->backing_scale_x1000 / 1000.0);
   CHECK(rs->width_px == g_w && rs->height_px == g_h, "window size %ux%u", rs->width_px, rs->height_px);
 
-  size_t sz = (size_t)g_w * g_h * 4;
-  for (int i = 0; i < NBUF; i++) {
-    char name[32];
-    snprintf(name, sizeof(name), "/wsdc-%d-%d", getpid(), i);
-    int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
-    if (fd < 0) die("shm_open");
-    shm_unlink(name);
-    if (ftruncate(fd, (off_t)sz)) die("ftruncate");
-    g_buf[i].fd = fd;
-    g_buf[i].px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (g_buf[i].px == MAP_FAILED) die("mmap");
-    struct wsd_buffer_attach a = {(uint32_t)i + 1, g_w, g_h, g_w * 4, WSD_FMT_BGRA8, 0, 0, sz};
-    send_msg(WSD_BUFFER_ATTACH, &a, sizeof(a), NULL, 0, fd);
-  }
+  for (int i = 0; i < NBUF; i++) g_buf[i] = attach_buffer((uint32_t)i + 1, g_w, g_h);
 
   static uint64_t pres[4096], lat[4096], enc[4096];
   g_presented = pres; g_latency = lat; g_encode = enc;

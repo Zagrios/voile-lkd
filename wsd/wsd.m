@@ -229,6 +229,7 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 - (void)noteKey:(uint32_t)code down:(BOOL)down;
 - (NSWindowLevel)levelForActive:(BOOL)active;
 - (WsdScale)pointerScale;
+- (CGPoint)screenPointForPixel:(NSPoint)px;
 - (BOOL)floatsForActive:(BOOL)active;
 - (void)orderInFront:(BOOL)activate;
 - (void)syncCapsLock:(BOOL)on;
@@ -734,12 +735,8 @@ static CAMetalLayer *make_metal_layer(void) {
     if (cx != m.x || cy != m.y) {
       m.flags |= 1; /* clamped */
       if (!g_injecting && !w.stalled) {
-        /* Real pointer left the clip rect: warp it back (global, top-left display coordinates). */
-        WsdScale s = [w pointerScale];
-        NSPoint vp = NSMakePoint(cx / s.x, self.bounds.size.height - cy / s.y);
-        NSPoint sp = [self.window convertPointToScreen:[self convertPoint:vp toView:nil]];
-        CGFloat top = primary_screen().frame.size.height;
-        CGWarpMouseCursorPosition(CGPointMake(sp.x, top - sp.y));
+        /* Real pointer left the clip rect: warp it back. */
+        CGWarpMouseCursorPosition([w screenPointForPixel:NSMakePoint(cx, cy)]);
         CGAssociateMouseAndMouseCursorPosition(true);
       }
       m.x = cx;
@@ -789,6 +786,14 @@ static CAMetalLayer *make_metal_layer(void) {
   if (!b || self.overlay || self.overlayGone || v.width < 1 || v.height < 1) return s;
   if (fabs(b.width - v.width * s.x) < 1 && fabs(b.height - v.height * s.y) < 1) return s;
   return (WsdScale){b.width / v.width, b.height / v.height};
+}
+/* Where the view shows client pixel px (from the content's top-left, through -pointerScale as the moves report it),
+ * in global display points (origin top-left of the screen with the menu bar), as CGWarpMouseCursorPosition takes. */
+- (CGPoint)screenPointForPixel:(NSPoint)px {
+  WsdScale s = [self pointerScale];
+  NSPoint vp = NSMakePoint(px.x / s.x, self.view.bounds.size.height - px.y / s.y);
+  NSPoint sp = [self.window convertPointToScreen:[self.view convertPoint:vp toView:nil]];
+  return CGPointMake(sp.x, NSMaxY(primary_screen().frame) - sp.y);
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender {
   struct wsd_window w = {self.windowId};
@@ -1286,17 +1291,16 @@ static CAMetalLayer *make_metal_layer(void) {
 static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   double top = NSMaxY(primary_screen().frame);
   for (NSWindow *nw in NSApp.orderedWindows) {
-    if (!nw.visible) continue;
-    for (WsdWindow *w in c.windows.allValues) {
-      if (w.window != nw) continue;
-      /* client pixels from the content's top-left, as -sendFrame gives it */
-      WsdScale s = backing_scale_xy(nw), ps = [w pointerScale];
-      NSRect r = [nw contentRectForFrameRect:nw.frame];
-      double left = r.origin.x, ctop = top - NSMaxY(r), cx = x - left * s.x, cy = y - ctop * s.y;
-      NSSize v = w.view.bounds.size;
-      if (cx >= 0 && cy >= 0 && cx < v.width * ps.x && cy < v.height * ps.y)
-        return CGPointMake(left + cx / ps.x, ctop + cy / ps.y);
-    }
+    if (!nw.visible || ![nw isKindOfClass:WsdNSWindow.class]) continue;
+    WsdWindow *w = (WsdWindow *)nw.delegate;
+    if (w.client != c) continue;
+    /* client pixels from the content's top-left, as -sendFrame gives it */
+    WsdScale s = backing_scale_xy(nw), ps = [w pointerScale];
+    NSRect r = [nw contentRectForFrameRect:nw.frame];
+    double cx = x - r.origin.x * s.x, cy = y - (top - NSMaxY(r)) * s.y;
+    NSSize v = w.view.bounds.size;
+    if (cx >= 0 && cy >= 0 && cx < v.width * ps.x && cy < v.height * ps.y)
+      return [w screenPointForPixel:NSMakePoint(cx, cy)];
   }
   WsdScale s = backing_scale_xy(nil);
   return CGPointMake(x / s.x, y / s.y);
@@ -1866,6 +1870,10 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
       g_injecting = NO;
       break;
     }
+    /* kinds 2 and 5: view pixels (a, b) are view points at the backing scale; the view reports them back through
+     * -pointerScale, as a real pointer's */
+    WsdScale sc = backing_scale_xy(nw);
+    NSPoint p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
     if (m->kind == 1) {
       NSEvent *e = [NSEvent keyEventWithType:m->b ? NSEventTypeKeyDown : NSEventTypeKeyUp location:NSZeroPoint
                                modifierFlags:0 timestamp:t windowNumber:nw.windowNumber context:nil characters:@""
@@ -1873,25 +1881,16 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
       [nw sendEvent:e];
     } else if (m->kind == 5 || m->kind == 6) {
       /* pointer motion into the view, which unlike a click neither activates wsd nor makes the window key: 5 at view
-       * pixels (a, b) (view points at the backing scale), 6 where CURSOR_WARP to screen pixels (a, b) would put the
-       * pointer (warp_point, for the window's client), without moving it */
-      NSPoint p;
+       * pixels (a, b), 6 where CURSOR_WARP to screen pixels (a, b) would put the pointer (warp_point, for the
+       * window's client), without moving it */
       if (m->kind == 6) {
         CGPoint g = warp_point(best.client, (int32_t)m->a, (int32_t)m->b);
         p = [nw convertPointFromScreen:NSMakePoint(g.x, NSMaxY(primary_screen().frame) - g.y)];
-      } else {
-        WsdScale sc = backing_scale_xy(nw);
-        p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
       }
       NSEvent *e = [NSEvent mouseEventWithType:NSEventTypeMouseMoved location:p modifierFlags:0 timestamp:t
                                 windowNumber:nw.windowNumber context:nil eventNumber:0 clickCount:0 pressure:0];
       [best.view mouseMoved:e];
-      WsdScale ps = [best pointerScale];
-      LOG("debug hover: view %.0fx%.0f pt, frame shown %ux%u px, pointer scale %.4f x %.4f", best.view.bounds.size.width,
-          best.view.bounds.size.height, best.lastBuffer.width, best.lastBuffer.height, ps.x, ps.y);
     } else if (m->kind == 2) {
-      WsdScale sc = backing_scale_xy(nw);
-      NSPoint p = NSMakePoint(m->a / sc.x, best.view.bounds.size.height - m->b / sc.y);
       for (int i = 0; i < 2; i++) {
         NSEvent *e = [NSEvent mouseEventWithType:i ? NSEventTypeLeftMouseUp : NSEventTypeLeftMouseDown location:p
                                    modifierFlags:0 timestamp:t windowNumber:nw.windowNumber context:nil
@@ -1900,7 +1899,14 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
       }
     }
     g_injecting = NO;
-    LOG("debug input kind %u a %u b %u -> window %u", m->kind, m->a, m->b, best.windowId);
+    if (m->kind == 5 || m->kind == 6) {
+      WsdScale ps = [best pointerScale];
+      LOG("debug input kind %u a %u b %u -> window %u: view %.0fx%.0f pt, frame shown %ux%u px, pointer scale %.4f x %.4f",
+          m->kind, m->a, m->b, best.windowId, best.view.bounds.size.width, best.view.bounds.size.height,
+          best.lastBuffer.width, best.lastBuffer.height, ps.x, ps.y);
+    } else {
+      LOG("debug input kind %u a %u b %u -> window %u", m->kind, m->a, m->b, best.windowId);
+    }
     break;
   }
   case WSD_PRESENT_REGION: {
