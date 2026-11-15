@@ -49,6 +49,17 @@ static int g_cursor_hidden;       /* [NSCursor hide] in effect */
 static NSMutableSet *g_clients;
 static BOOL g_caps_told;           /* the Caps Lock state the clients were brought to (-syncCapsLock:) */
 static NSTimeInterval g_warp_time; /* uptime of the last CURSOR_WARP: the mouse moves queued before it are dropped */
+/* The jump of the last CURSOR_WARP, in points, until the first mouse move after it, zero for none: macOS reports the
+ * warp in that move's delta (SDL's Cocoa backend and Wine's Mac driver make up for it too), and -motion: takes it out,
+ * unless that would make the delta larger (a move that did not carry it). A game that centers the pointer and then
+ * turns on relative mode took the jump for a mouse movement (Killing Floor on entering a map: a warp from (1847,227)
+ * to (1284,739), then a first delta of (-563,512), and it looked straight down or up). wsd sees the moves through its
+ * key window only, so the jump waits only while the window that was key at the warp stays key
+ * (-windowDidResignKey:): after Cmd-Tab the move that carried it went to another app, and taking it out of a later
+ * one turned the camera the wrong way. However late the first move comes, it carries the jump (a game centers the
+ * pointer while a map loads), and turning relative mode on does not change which move that is. */
+static CGPoint g_warp_jump;
+static uint64_t g_hide_gen;        /* the generation of the last -hideSoon, never 0 */
 static NSCursor *g_cursor;         /* the cursor over the windows (CURSOR_SET), nil for the arrow */
 static BOOL g_ever_active;         /* wsd has been the active app since it started */
 static BOOL g_terminate_pending;   /* a logout, restart or shutdown waits for the clients to leave */
@@ -192,6 +203,10 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property uint64_t statLastNs, statSumNs, statMaxNs, statMinNs;
 @property uint32_t statCount;
 @property BOOL relative, clip, fullscreen, transitioning;
+/* the generation of a hide waiting HIDE_DELAY_NS for a show that would cancel it (-hideSoon), 0 for none */
+@property uint64_t pendingHide;
+/* visible as the client sees it: on screen, and no hide waiting */
+@property(readonly) BOOL shown;
 @property NSRect clipPx;
 /* when the window last showed a new frame on either plane, and whether it has held the pointer without one for
  * STALL_NS since (the pointer and the cursor are then the user's) */
@@ -685,9 +700,21 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)otherMouseUp:(NSEvent *)e { [self button:e which:(uint32_t)e.buttonNumber down:NO]; }
 - (void)motion:(NSEvent *)e {
   WsdWindow *w = self.ww;
+  CGPoint jump = CGPointZero; /* g_warp_jump, when this is the first move after the warp */
+  if (e.timestamp > g_warp_time) {
+    jump = g_warp_jump;
+    g_warp_jump = CGPointZero;
+  }
   if (w.relative) {
     if (w.stalled) return; /* the user's pointer, not the game's camera: a stopped game would get it all at once */
-    struct wsd_ev_relative r = {w.windowId, [self synth], (float)e.deltaX, (float)e.deltaY, [self evNs:e]};
+    double dx = e.deltaX, dy = e.deltaY;
+    if (fabs(dx - jump.x) + fabs(dy - jump.y) < fabs(dx) + fabs(dy)) { /* never for a zero jump */
+      LOG("window %u: first move after a pointer warp (%.0f,%.0f) taken as (%.0f,%.0f)", w.windowId, dx, dy,
+          dx - jump.x, dy - jump.y);
+      dx -= jump.x;
+      dy -= jump.y;
+    }
+    struct wsd_ev_relative r = {w.windowId, [self synth], (float)dx, (float)dy, [self evNs:e]};
     [w sendEvent:WSD_EV_RELATIVE payload:&r len:sizeof(r) extra:nil];
     return;
   }
@@ -698,7 +725,10 @@ static CAMetalLayer *make_metal_layer(void) {
   }
   struct wsd_ev_motion m = {w.windowId, [self synth], 0, 0, [self evNs:e]};
   [self pixelPoint:e x:&m.x y:&m.y];
-  if (w.clip) {
+  /* The clip rectangle holds the pointer only while the game's window has the focus: after Cmd-Tab, a drag that
+   * began in the game (a held fire button) still sent moves here, and the pointer was warped back into the game
+   * while the user was in another app (Killing Floor, windowed, in a map). */
+  if (w.clip && NSApp.active && self.window.isKeyWindow) {
     NSRect c = w.clipPx;
     float cx = fminf(fmaxf(m.x, c.origin.x), c.origin.x + c.size.width - 1);
     float cy = fminf(fmaxf(m.y, c.origin.y), c.origin.y + c.size.height - 1);
@@ -825,6 +855,7 @@ static CAMetalLayer *make_metal_layer(void) {
   [self syncCapsLock:(NSEvent.modifierFlags & NSEventModifierFlagCapsLock) != 0];
 }
 - (void)windowDidResignKey:(NSNotification *)n {
+  g_warp_jump = CGPointZero; /* the next moves are no longer this window's */
   /* The pointer disassociation is global: leaving the window (Cmd+Tab, another app, a notification) must give the
    * user their cursor back at once, whatever the game does with the focus event (2026-10-03 session: the cursor
    * stayed captured and the user had to kill wsd). */
@@ -937,8 +968,34 @@ static CAMetalLayer *make_metal_layer(void) {
   self.transitioning = NO;
   LOG("window %u style 0x%x", self.windowId, style);
 }
+/* A hide a show follows within HIDE_DELAY_NS does not reach macOS. A game that changes its window's style hides
+ * it, restyles it and shows it again without activation (Unreal Engine 2's SetRes, within a few milliseconds):
+ * ordered out at once, the key window took the app's focus with it, macOS made another app active, and the client
+ * heard APP_DEACTIVATED in the middle of its start. Killing Floor then left fullscreen while starting and died
+ * reopening its window (DirectInput "Couldn't set cooperative level", 2026-11-05). */
+#define HIDE_DELAY_NS (100 * NSEC_PER_MSEC)
+- (void)hideSoon {
+  uint64_t gen = ++g_hide_gen;
+  self.pendingHide = gen;
+  __weak WsdWindow *ww = self;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, HIDE_DELAY_NS), dispatch_get_main_queue(), ^{
+    WsdWindow *w = ww;
+    if (w.pendingHide == gen) [w hideNow];
+  });
+}
+- (void)hideNow {
+  self.pendingHide = 0;
+  [self.window orderOut:nil];
+  adjust_levels(NSApp.active);
+}
+/* A window whose hide waits is still on screen, but already hidden for a focus request and for bringing a window
+ * back (unminimize_if_none_visible). */
+- (BOOL)shown {
+  return self.window.visible && !self.pendingHide;
+}
 - (void)minimize:(BOOL)on {
   NSWindow *w = self.window;
+  if (on && self.pendingHide) [self hideNow]; /* hidden, then minimized: in that order, as without the delay */
   if (on && !w.miniaturized && !self.minimizedOut) {
     if (w.styleMask & NSWindowStyleMaskMiniaturizable) [w miniaturize:nil];
     else {
@@ -1234,9 +1291,9 @@ static CAMetalLayer *make_metal_layer(void) {
 static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   double top = NSMaxY(primary_screen().frame);
   for (NSWindow *nw in NSApp.orderedWindows) {
-    if (!nw.visible || ![nw isKindOfClass:WsdNSWindow.class]) continue;
+    if (![nw isKindOfClass:WsdNSWindow.class]) continue;
     WsdWindow *w = (WsdWindow *)nw.delegate;
-    if (w.client != c) continue;
+    if (w.client != c || !w.shown) continue;
     /* client pixels from the content's top-left, as -sendFrame gives it */
     WsdScale s = backing_scale_xy(nw), ps = [w pointerScale];
     NSRect r = [nw contentRectForFrameRect:nw.frame];
@@ -1626,6 +1683,11 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     if (!w) break;
     w.minimizedOut = NO;
     if (m->value) {
+      if (w.pendingHide) {
+        w.pendingHide = 0; /* still on screen: the hide never happened */
+        LOG("window %u: hidden and shown again within %llu ms, kept on screen", w.windowId,
+            (unsigned long long)(HIDE_DELAY_NS / NSEC_PER_MSEC));
+      }
       if (m->value == 1) [NSApp activate];
       [w orderInFront:m->value == 1];
       [w sendResize];
@@ -1633,8 +1695,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
       __weak WsdWindow *ww = w;
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000000000), dispatch_get_main_queue(), ^{ [ww logState:"show+1s"]; });
     } else {
-      [w.window orderOut:nil];
-      adjust_levels(NSApp.active);
+      [w hideSoon];
     }
     break;
   }
@@ -1761,7 +1822,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     for (WsdClient *c in g_clients)
       for (WsdWindow *w in c.windows.allValues) {
         NSSize sz = w.window.frame.size;
-        if ((w.window.visible || (m->kind == 4 && w.window.miniaturized)) && sz.width * sz.height > area) {
+        if ((w.shown || (m->kind == 4 && w.window.miniaturized)) && sz.width * sz.height > area) {
           area = sz.width * sz.height;
           best = w;
         }
@@ -1957,11 +2018,18 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
      * pointer still, then the mouse moves already queued are dropped (-motion:). In a window, the pixel is the one
      * its moves report (warp_point). */
     if (!NSApp.active || g_relative_global) break;
+    CGPoint to = warp_point(self, m->x, m->y);
+    CGEventRef now_ev = CGEventCreate(NULL);
+    CGPoint from = now_ev ? CGEventGetLocation(now_ev) : to;
+    if (now_ev) CFRelease(now_ev);
     CGSetLocalEventsSuppressionInterval(0);
-    CGError e = CGWarpMouseCursorPosition(warp_point(self, m->x, m->y));
+    CGError e = CGWarpMouseCursorPosition(to);
     CGSetLocalEventsSuppressionInterval(0.25);
     if (e != kCGErrorSuccess) { [self error:type code:-EIO]; break; }
     g_warp_time = NSProcessInfo.processInfo.systemUptime;
+    CGPoint jump = CGPointMake(to.x - from.x, to.y - from.y);
+    BOOL keep = fabs(jump.x) + fabs(jump.y) >= 1 && [NSApp.keyWindow isKindOfClass:WsdNSWindow.class];
+    g_warp_jump = keep ? jump : CGPointZero;
     CGAssociateMouseAndMouseCursorPosition(true);
     break;
   }
@@ -1981,7 +2049,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   case WSD_WINDOW_FOCUS: {
     NEED(wsd_window);
     WsdWindow *w = [self win:m->window_id req:type];
-    if (!w || !w.window.visible || ((WsdNSWindow *)w.window).noActivate) break;
+    if (!w || !w.shown || ((WsdNSWindow *)w.window).noActivate) break;
     /* Wine activated the window (SetForegroundWindow, a dialog taking the focus): the key window follows, as Wine's
      * Mac driver gives it in ActivateWindow. wsd itself becomes active this way only at the game's start; later, a
      * window activated while another app is in front becomes key once wsd is active again. */
@@ -2118,7 +2186,7 @@ static void unminimize_if_none_visible(void) {
   double area = 0;
   for (WsdClient *c in g_clients)
     for (WsdWindow *w in c.windows.allValues) {
-      if (w.window.visible) return;
+      if (w.shown) return;
       NSSize sz = w.window.frame.size;
       if ((w.window.miniaturized || w.minimizedOut) && sz.width * sz.height > area) {
         area = sz.width * sz.height;
@@ -2214,7 +2282,7 @@ static BOOL session_ending(void) {
   g_ever_active = YES;
   WsdWindow *w = g_focus_wanted;
   g_focus_wanted = nil;
-  if (w.window.visible && !((WsdNSWindow *)w.window).noActivate) [w orderInFront:YES];
+  if (w.shown && !((WsdNSWindow *)w.window).noActivate) [w orderInFront:YES];
   adjust_levels(YES);
 }
 @end
