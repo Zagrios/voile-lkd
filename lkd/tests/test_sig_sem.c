@@ -7,45 +7,10 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#include "ltest.h"
-#include "fake_engine.h"
-#include "lkd_internal.h"
+#include "test_procfs_util.h"
 #include "famsvc.h"
-#include "mm.h"
 #include "sig.h"
 #include "task.h"
-#include <lkd/syscall_nr.h>
-
-#define P(x) ((uint64_t)(uintptr_t)(x))
-
-/* The task runs with a real mm: every guest pointer handed to a syscall points into one scratch mapping
- * (identity window, lkd_guest_base == 0). */
-static lkd_task *T;
-static uint8_t *SB;
-
-static int64_t sc_call(lkd_task *t, unsigned nr, const uint64_t *a, size_t n)
-{
-    lkd_sysreq rq = { .nr = nr };
-    for (size_t i = 0; i < n && i < 6; i++) rq.a[i] = a[i];
-    int64_t rax = 0;
-    lkd_disp d = lkd_syscall(t, &rq, &rax);
-    if (d != LKD_RETURN) return -100000 - (int64_t)d;
-    return rax;
-}
-#define SC(t, name, ...) sc_call((t), LKD_NR_##name, (const uint64_t[]){ __VA_ARGS__ }, \
-                                 sizeof((const uint64_t[]){ __VA_ARGS__ }) / sizeof(uint64_t))
-
-static void fixture(void)
-{
-    lkd_config cfg = { .size = sizeof cfg };
-    if (lkd_init_config(&cfg) < 0 || fake_engine_init() < 0) { fprintf(stderr, "init failed\n"); exit(2); }
-    T = fake_make_task();
-    T->mm = lkd_mm_create();
-    if (!T->mm) { fprintf(stderr, "mm failed\n"); exit(2); }
-    int64_t a = lkd_mm_map(T->mm, 0, 4u << 20, LX_PROT_READ | LX_PROT_WRITE, LX_MAP_PRIVATE | LX_MAP_ANONYMOUS, NULL, 0, NULL);
-    if (a < 0) { fprintf(stderr, "scratch map failed %lld\n", (long long)a); exit(2); }
-    SB = lkd_g2h((uint64_t)a);
-}
 
 #define K_PRIVATE 0
 #define K_CREAT 01000
@@ -109,8 +74,7 @@ struct w {
     lkd_task *t;
     int k, id, n;
     int64_t rel;
-    int16_t o[12];
-    const int16_t *big; /* more than 4 operations: the caller's array */
+    const int16_t *o; /* the caller's array, which outlives w_join */
     _Atomic int started, done;
     int64_t ret;
 };
@@ -119,7 +83,7 @@ static void *w_main(void *p)
     struct w *w = p;
     lkd_set_current(w->t);
     atomic_store(&w->started, 1);
-    w->ret = ops_as(w->t, w->k, w->id, w->rel, w->n, w->big ? w->big : w->o);
+    w->ret = ops_as(w->t, w->k, w->id, w->rel, w->n, w->o);
     atomic_store(&w->done, 1);
     return NULL;
 }
@@ -128,15 +92,13 @@ static void w_launch(struct w *w, int k, int id, int n, const int16_t *o, int64_
 {
     memset(w, 0, sizeof *w);
     w->t = fake_make_thread(T);
-    w->k = k; w->id = id; w->n = n; w->rel = rel_ns;
-    if (n <= 4) memcpy(w->o, o, (size_t)n * 3 * sizeof o[0]);
-    else w->big = o;
+    w->k = k; w->id = id; w->n = n; w->o = o; w->rel = rel_ns;
     pthread_create(&w->th, NULL, w_main, w);
     while (!atomic_load(&w->started)) usleep(100);
 }
-static void w_start(struct w *w, int k, int id, int n, const int16_t *o)
+static void w_start(struct w *w, int k, int id, int n, const int16_t *o, int64_t rel_ns)
 {
-    w_launch(w, k, id, n, o, -1);
+    w_launch(w, k, id, n, o, rel_ns);
     usleep(30000); /* reach the sleep */
 }
 static void w_join(struct w *w) { pthread_join(w->th, NULL); }
@@ -294,8 +256,8 @@ LT_TEST(queue_order)
     struct w a, b, z;
     /* waiters are served oldest first, and a newcomer does not take a value meant for a waiter */
     const int16_t dec[3] = { 0, -1, 0 };
-    w_start(&a, 1, id, 1, dec);
-    w_start(&b, 2, id, 1, dec);
+    w_start(&a, 1, id, 1, dec, -1);
+    w_start(&b, 2, id, 1, dec, -1);
     LT_EQ(ctl(id, 0, K_GETNCNT, 0), 2);
     LT_EQ(ctl(id, 0, K_GETZCNT, 0), 0);
     LT_EQ(op1(id, 0, 1, 0), 0);
@@ -313,7 +275,7 @@ LT_TEST(queue_order)
     /* wait-for-zero */
     LT_EQ(ctl(id, 0, K_SETVAL, 2), 0);
     const int16_t zero[3] = { 0, 0, 0 };
-    w_start(&z, 3, id, 1, zero);
+    w_start(&z, 3, id, 1, zero, -1);
     LT_EQ(ctl(id, 0, K_GETZCNT, 0), 1);
     LT_EQ(ctl(id, 0, K_GETNCNT, 0), 0);
     LT_EQ(op1(id, 0, -2, 0), 0);
@@ -324,8 +286,8 @@ LT_TEST(queue_order)
     /* check_restart: completing a newer waiter unblocks an older one, both complete */
     const int16_t take1[3] = { 1, -1, 0 };
     const int16_t pass[6] = { 0, -1, 0, 1, 1, 0 };
-    w_start(&a, 1, id, 1, take1);
-    w_start(&b, 2, id, 2, pass);
+    w_start(&a, 1, id, 1, take1, -1);
+    w_start(&b, 2, id, 2, pass, -1);
     LT_EQ(ctl(id, 1, K_GETNCNT, 0), 1);
     LT_EQ(ctl(id, 0, K_GETNCNT, 0), 1);
     LT_EQ(op1(id, 0, 1, 0), 0);
@@ -335,14 +297,14 @@ LT_TEST(queue_order)
     LT_EQ(val(id, 1), 0);
 
     /* SETVAL serves the queue too */
-    w_start(&a, 1, id, 1, dec);
+    w_start(&a, 1, id, 1, dec, -1);
     LT_EQ(ctl(id, 0, K_SETVAL, 1), 0);
     w_join(&a);
     LT_EQ(a.ret, 0);
     LT_EQ(val(id, 0), 0);
 
     /* IPC_RMID ends the waits with EIDRM */
-    w_start(&a, 1, id, 1, dec);
+    w_start(&a, 1, id, 1, dec, -1);
     LT_EQ(ctl(id, 0, K_RMID, 0), 0);
     w_join(&a);
     LT_ERRNO(a.ret, LX_EIDRM);
@@ -469,6 +431,21 @@ LT_TEST(shared_across_fork)
     LT_EQ(ctl(id, 0, K_RMID, 0), 0);
 }
 
+/* A host process of the family that takes lockop on set id, writes the result to fd, then waits to be
+ * killed. */
+static pid_t spawn_holder(int id, const int16_t *lockop, int fd)
+{
+    fflush(NULL);
+    pid_t c = lkd_fork_host(T, 0);
+    if (c == 0) {
+        alarm(20);
+        put64(fd, ops_as(T, 1, id, -1, 1, lockop));
+        pause();
+        _exit(10);
+    }
+    return c;
+}
+
 /* exit_sem runs in do_exit (kernel/exit.c), before the process is a zombie: a SEM_UNDO lock comes back
  * however its holder dies. Here the holder's host process is killed outright, so no exit hook runs. */
 LT_TEST(undo_after_host_kill)
@@ -480,20 +457,12 @@ LT_TEST(undo_after_host_kill)
     LT_EQ(pipe(pfd), 0);
 
     /* a waiter already sleeps when the holder dies; nobody waits for the holder (it stays a zombie) */
-    fflush(NULL);
-    pid_t c = lkd_fork_host(T, 0);
-    if (c == 0) {
-        alarm(20);
-        put64(pfd[1], ops_as(T, 1, id, -1, 1, lockop));
-        pause();
-        _exit(10);
-    }
+    pid_t c = spawn_holder(id, lockop, pfd[1]);
     LT_CHECK(c > 0);
     LT_EQ(get64(pfd[0]), 0);
     LT_EQ(val(id, 0), 0);
     struct w a;
-    w_launch(&a, 2, id, 1, lockop, 5000000000ll);
-    usleep(30000);
+    w_start(&a, 2, id, 1, lockop, 5000000000ll);
     LT_EQ(ctl(id, 0, K_GETNCNT, 0), 1);
     int64_t t0 = lkd_host_mono_ns();
     kill(c, SIGKILL);
@@ -512,14 +481,7 @@ LT_TEST(undo_after_host_kill)
 
     /* nobody waits when the holder dies: the next operation that would block applies its record first,
      * an IPC_NOWAIT one too */
-    fflush(NULL);
-    c = lkd_fork_host(T, 0);
-    if (c == 0) {
-        alarm(20);
-        put64(pfd[1], ops_as(T, 1, id, -1, 1, lockop));
-        pause();
-        _exit(10);
-    }
+    c = spawn_holder(id, lockop, pfd[1]);
     LT_CHECK(c > 0);
     LT_EQ(get64(pfd[0]), 0);
     LT_EQ(val(id, 0), 0);
@@ -566,8 +528,7 @@ LT_TEST(many_waiters)
     big[0] = 1; big[1] = -1; big[2] = 0;
     for (int i = 1; i < 500; i++) { big[3 * i] = 0; big[3 * i + 1] = 1; big[3 * i + 2] = 0; }
     struct w b;
-    w_launch(&b, 8, id, 500, big, 20000000000ll);
-    usleep(30000);
+    w_start(&b, 8, id, 500, big, 20000000000ll);
     LT_EQ(ctl(id, 1, K_GETNCNT, 0), 1);
     LT_EQ(ctl(id, 0, K_GETNCNT, 0), 0);
     LT_EQ(val(id, 0), 0);
@@ -613,7 +574,7 @@ LT_TEST(info_and_stat)
 
 int main(void)
 {
-    fixture();
+    procfs_fixture();
     if (!lkd_famsvc_dir()) { printf("SKIP no family directory\n"); return lt_finish(); }
     LT_RUN(get_rules);
     LT_RUN(op_rules);

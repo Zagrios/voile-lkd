@@ -74,7 +74,7 @@ Reproduction: liblkd.a built in a work directory, `fexdarwin-run` host built aga
 8. Interruption of JIT code: only at the next syscall as long as the engine has no interrupt page (engine limit, sig-3.md).
 9. Absolute REALTIME timeouts are converted once: a later change of the time does not move them.
 10. System V semaphores belong to the family (`sem.shm`), not to the system: a key is not seen by another family. Each set has one queue served oldest first, where Linux keeps wait-for-zero and per-semaphore queues and serves them in its own order (`do_smart_update`): no waiter is passed over, but waiters of different semaphores of a set can be served in another order.
-11. The SEM_UNDO records of a host process killed outright are applied once its death is seen: when an operation on the set would block, by a waiter of the set within 250 ms, or when the record pool is full. Until then GETVAL and GETALL show the values without them. A reused host pid hides the death.
+11. The SEM_UNDO records of a host process killed outright are applied once its death is seen: when an operation on the set would block, by a waiter of the set within 250 ms (one waiter of a set looks every 250 ms, so up to 500 ms when the one that looked last leaves the queue), or when the record pool is full. Until then GETVAL and GETALL show the values without them. A reused host pid hides the death.
 12. At most 4096 queued semaphore operations in a family, and 16384 `sembuf` entries for those of more than 8 operations, then ENOMEM where Linux would allocate. The 2048 shared sleepers of `futex.shm`, shared with shared futex and ntsync waits, bound them too.
 
 ## Open requests

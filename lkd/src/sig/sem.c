@@ -23,8 +23,8 @@
  * exit of the process applies it, capping each value to [0, SEMVMX] as Linux does (sig_sem_proc_exit). A
  * fork child starts without records; execve keeps them. A host process killed outright (SIGKILL, a crash)
  * runs no exit hook: its records are applied the same way once its death is seen, when an operation on
- * the set would block, when a waiter of the set looks again (every SEM_DEAD_CHECK_NS) or when the record
- * pool needs room. A host process that exited but was not waited for yet counts as dead.
+ * the set would block, when a waiter of the set looks again (one of them every SEM_DEAD_CHECK_NS) or when
+ * the record pool needs room. A host process that exited but was not waited for yet counts as dead.
  *
  * Limits. Linux's per-set and per-call limits (SEMMSL 32000, SEMOPM 500, SEMVMX 32767). The family holds
  * at most SEM_SETS sets, SEM_POOL semaphores, SEM_UNDOS undo records and SEM_WAITERS queued operations;
@@ -107,6 +107,7 @@ struct sem_set {
     uint32_t mode, uid, gid, cuid, cgid;
     uint32_t base;             /* first semaphore in the pool */
     int64_t otime, ctime;
+    int64_t last_reap_ns;      /* when a waiter last looked for dead undo holders (wait_queued) */
     uint32_t head, tail;       /* queued operations, oldest first (waiter index + 1) */
 };
 struct sem_val { int32_t val, pid; };
@@ -199,6 +200,16 @@ static int host_dead(int32_t pid)
     return kill(pid, 0) < 0 && errno == ESRCH;
 }
 
+/* host_dead for the host process of a record or a waiter met in a walk: not this process, nor *alive,
+ * the last one the walk saw alive. */
+static int dead_other(int32_t pid, int32_t *alive)
+{
+    if (pid == (int32_t)getpid() || pid == *alive) return 0;
+    if (host_dead(pid)) return 1;
+    *alive = pid;
+    return 0;
+}
+
 static int in_group(lkd_task *t, uint32_t g)
 {
     if (!t || !t->proc) return 0;
@@ -227,25 +238,21 @@ static int owner_or_admin(lkd_task *t, const struct sem_set *s)
     return uid == s->uid || uid == s->cuid || capable(t, CAP_SYS_ADMIN);
 }
 
+/* The set in the slot of id >= 0, whatever its sequence: ipc_obtain_object_idr keeps the low bits
+ * (ipcid_to_idx). */
+static struct sem_set *slot_of(int id)
+{
+    int slot = id % SEQ_MULT;
+    return slot < SEM_SETS && g_sem->set[slot].used ? &g_sem->set[slot] : NULL;
+}
 static struct sem_set *by_id(int id)
 {
-    if (id < 0) return NULL;
-    int slot = id % SEQ_MULT, seq = id / SEQ_MULT;
-    if (slot >= SEM_SETS) return NULL;
-    struct sem_set *s = &g_sem->set[slot];
-    return s->used && s->seq == seq ? s : NULL;
+    struct sem_set *s = slot_of(id);
+    return s && s->seq == id / SEQ_MULT ? s : NULL;
 }
 static int set_id(const struct sem_set *s) { return (int)(s - g_sem->set) + s->seq * SEQ_MULT; }
 static uint32_t set_slot(const struct sem_set *s) { return (uint32_t)(s - g_sem->set); }
 static struct sem_val *vals(const struct sem_set *s) { return &g_sem->val[s->base]; }
-
-static int max_idx(void)
-{
-    int m = -1;
-    for (int i = 0; i < SEM_SETS; i++)
-        if (g_sem->set[i].used) m = i;
-    return m;
-}
 
 /* Bit maps of the semaphore and adjustment pools: first fit of n consecutive free entries. */
 static void bits_set(uint64_t *map, uint32_t i, uint32_t n, int on)
@@ -287,12 +294,11 @@ static int undo_of_set(const struct sem_undo *u, const struct sem_set *s)
 static void update_queue(struct sem_set *s);
 
 /* exit_sem (ipc/sem.c): add the adjustments, each value capped to [0, SEMVMX], drop the record, then serve
- * the set's queue. Lock held. */
+ * the set's queue. A record's set is live: freeary drops its records first. Lock held. */
 static void undo_apply(struct sem_undo *u)
 {
     struct sem_set *s = &g_sem->set[u->set];
-    int live = s->used && s->seq == u->seq;
-    for (uint32_t k = 0; live && k < u->nsems; k++) {
+    for (uint32_t k = 0; k < u->nsems; k++) {
         int16_t a = g_sem->adj[u->adj + k];
         if (!a) continue;
         struct sem_val *v = &vals(s)[k];
@@ -302,26 +308,41 @@ static void undo_apply(struct sem_undo *u)
         v->pid = u->pid;
     }
     undo_free(u);
-    if (live) update_queue(s);
+    update_queue(s);
 }
 
 /* The records of host processes that died without running their exit (SIGKILL, a crash): apply them as
  * exit_sem would have. s: only the records of that set; NULL: all. Returns how many. Lock held. */
 static int undo_reap_dead(const struct sem_set *s)
 {
-    int32_t me = (int32_t)getpid(), alive = 0;
+    int32_t alive = 0;
     int n = 0;
     for (uint32_t i = 0; i < SEM_UNDOS; i++) {
         struct sem_undo *u = &g_sem->undo[i];
-        if (!u->used || (s && !undo_of_set(u, s)) || u->host_pid == me || u->host_pid == alive) continue;
-        if (!host_dead(u->host_pid)) { alive = u->host_pid; continue; }
+        if (!u->used || (s && !undo_of_set(u, s)) || !dead_other(u->host_pid, &alive)) continue;
         undo_apply(u);
         n++;
     }
     return n;
 }
 
-/* find_alloc_undo (ipc/sem.c): the record of process pid for set s, made on first use. 0 when full. */
+/* A new record of process pid of this host process for set s. 0 when the table or the pool is full. */
+static uint32_t undo_alloc(struct sem_set *s, int32_t pid)
+{
+    uint32_t i = 0;
+    while (i < SEM_UNDOS && g_sem->undo[i].used) i++;
+    if (i == SEM_UNDOS) return 0;
+    int64_t adj = range_alloc(g_sem->adj_map, SEM_ADJ_POOL, (uint32_t)s->nsems);
+    if (adj < 0) return 0;
+    g_sem->undo[i] = (struct sem_undo){ .used = 1, .set = set_slot(s), .nsems = (uint32_t)s->nsems,
+                                        .adj = (uint32_t)adj, .seq = s->seq, .pid = pid,
+                                        .host_pid = (int32_t)getpid() };
+    memset(&g_sem->adj[adj], 0, (size_t)s->nsems * sizeof g_sem->adj[0]);
+    return i + 1;
+}
+
+/* find_alloc_undo (ipc/sem.c): the record of process pid for set s, made on first use. When full, the
+ * records of dead host processes make room. 0 when still full. */
 static uint32_t undo_find_alloc(struct sem_set *s, int32_t pid)
 {
     int32_t host = (int32_t)getpid();
@@ -329,26 +350,9 @@ static uint32_t undo_find_alloc(struct sem_set *s, int32_t pid)
         struct sem_undo *u = &g_sem->undo[i];
         if (undo_of_set(u, s) && u->pid == pid && u->host_pid == host) return i + 1;
     }
-    for (int pass = 0; pass < 2; pass++) {
-        if (pass) undo_reap_dead(NULL);
-        uint32_t i = 0;
-        while (i < SEM_UNDOS && g_sem->undo[i].used) i++;
-        if (i == SEM_UNDOS) continue;
-        int64_t adj = range_alloc(g_sem->adj_map, SEM_ADJ_POOL, (uint32_t)s->nsems);
-        if (adj < 0) continue;
-        struct sem_undo *u = &g_sem->undo[i];
-        memset(u, 0, sizeof *u);
-        u->used = 1;
-        u->set = set_slot(s);
-        u->seq = s->seq;
-        u->nsems = (uint32_t)s->nsems;
-        u->adj = (uint32_t)adj;
-        u->pid = pid;
-        u->host_pid = host;
-        memset(&g_sem->adj[adj], 0, (size_t)s->nsems * sizeof g_sem->adj[0]);
-        return i + 1;
-    }
-    return 0;
+    uint32_t i = undo_alloc(s, pid);
+    if (!i && undo_reap_dead(NULL)) i = undo_alloc(s, pid);
+    return i;
 }
 
 /* SETVAL and SETALL clear the adjustments of every process for the semaphores they set. */
@@ -391,7 +395,7 @@ static int perform(const struct sem_set *s, const struct lx_sembuf *sops, uint32
     for (i = 0; i < nsops; i++) v[sops[i].sem_num].pid = pid;
     return 0;
 would_block:
-    if (blocking) *blocking = i;
+    *blocking = i;
     r = (sops[i].sem_flg & LX_IPC_NOWAIT) ? -LX_EAGAIN : 1;
 revert:
     while (i-- > 0) {
@@ -457,15 +461,12 @@ static void waiter_free(struct sem_waiter *w)
  * the head (check_restart). Lock held. */
 static void update_queue(struct sem_set *s)
 {
-    int32_t me = (int32_t)getpid(), alive = 0;
+    int32_t alive = 0;
 again:
     for (uint32_t i = s->head, next; i; i = next) {
         struct sem_waiter *w = wt(i);
         next = w->next;
-        if (w->host_pid != me && w->host_pid != alive) {
-            if (host_dead(w->host_pid)) { q_remove(s, i); waiter_free(w); continue; }
-            alive = w->host_pid;
-        }
+        if (dead_other(w->host_pid, &alive)) { q_remove(s, i); waiter_free(w); continue; }
         const struct lx_sembuf *ops = wops(w);
         int r = perform(s, ops, w->nsops, undo_of(w->undo), w->pid, &w->blocking);
         if (r > 0) continue;
@@ -496,11 +497,12 @@ static void freeary(struct sem_set *s)
 {
     for (uint32_t i = 0; i < SEM_UNDOS; i++)
         if (undo_of_set(&g_sem->undo[i], s)) undo_free(&g_sem->undo[i]);
+    int32_t alive = 0;
     for (uint32_t i = s->head, next; i; i = next) {
         struct sem_waiter *w = wt(i);
         next = w->next;
         w->next = w->prev = 0;
-        if (host_dead(w->host_pid)) { waiter_free(w); continue; }
+        if (dead_other(w->host_pid, &alive)) { waiter_free(w); continue; }
         w->status = -LX_EIDRM;
         sig_shared_sleeper_wake(w->sleeper);
     }
@@ -559,47 +561,38 @@ LKD_SYSCALL(semget)
 }
 
 /* Sleep until the queued operation wi is served, its set goes, a signal or the deadline. Nobody wakes a
- * waiter when a holder dies without its exit, so every SEM_DEAD_CHECK_NS it applies the undo records of
- * the dead holders of its set itself. A stray wake spends the sleeper: the waiter swaps in a fresh one and
- * keeps its place in the queue. Returns the result of the operation. */
-static int64_t wait_queued(lkd_task *t, uint32_t wi, struct fx_sleeper **sl, int64_t deadline)
+ * waiter when a holder dies without its exit, so the waiters of a set apply the undo records of its dead
+ * holders themselves, one of them every SEM_DEAD_CHECK_NS. Returns the result of the operation. */
+static int64_t wait_queued(lkd_task *t, uint32_t wi, struct fx_sleeper *sl, int64_t deadline)
 {
     struct sem_waiter *w = wt(wi);
+    struct sem_set *s = &g_sem->set[w->set];
     int64_t r;
     for (;;) {
         int64_t until = lkd_host_mono_ns() + SEM_DEAD_CHECK_NS;
         if (deadline >= 0 && deadline < until) until = deadline;
-        int sr = sig_shared_sleep(t, *sl, until);
+        int sr = sig_shared_sleep(t, sl, until);
         lock();
-        int early = sr == 0 && (deadline < 0 || lkd_host_mono_ns() < deadline);
-        if (early && w->status == 1) undo_reap_dead(&g_sem->set[w->set]);
+        int64_t now = lkd_host_mono_ns();
+        int early = sr == 0 && (deadline < 0 || now < deadline);
+        if (early && w->status == 1 && now - s->last_reap_ns >= SEM_DEAD_CHECK_NS) {
+            s->last_reap_ns = now;
+            undo_reap_dead(s);
+        }
         if (w->status != 1) { /* served, or the set was removed */
             r = w->status;
             break;
         }
-        if (early) { unlock(); continue; }
-        if (sr <= 0) {
+        if (sr < 0 || (sr == 0 && !early)) {
             r = sr < 0 ? -LX_EINTR : -LX_EAGAIN;
-            q_remove(&g_sem->set[w->set], wi); /* still queued: its set still exists */
+            q_remove(s, wi); /* still queued: its set still exists */
             break;
         }
+        /* Woken with the status still 1: a stray wake (a late waker of the sleeper's previous owner).
+         * Every real wake comes under the lock after the status changes, so none is lost by clearing it
+         * and sleeping again. */
+        if (sr > 0) sig_shared_sleeper_rearm(sl);
         unlock();
-        struct fx_sleeper *fresh = sig_shared_sleeper_get(t);
-        lock();
-        if (w->status != 1) {
-            r = w->status;
-            if (fresh) sig_shared_sleeper_put(fresh);
-            break;
-        }
-        if (!fresh) {
-            r = -LX_ENOMEM;
-            q_remove(&g_sem->set[w->set], wi);
-            break;
-        }
-        w->sleeper = sig_shared_sleeper_index(fresh);
-        unlock();
-        sig_shared_sleeper_put(*sl);
-        *sl = fresh;
     }
     waiter_free(w);
     unlock();
@@ -615,10 +608,10 @@ static int64_t do_semtimedop(lkd_task *t, int semid, uint64_t usops, uint64_t ns
     if (lkd_user_read(usops, sops, nsops * sizeof sops[0])) return -LX_EFAULT;
     int64_t deadline = -1;
     if (utimeout) {
-        struct lx_timespec ts;
-        if (lkd_user_read(utimeout, &ts, sizeof ts)) return -LX_EFAULT;
-        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000ll) return -LX_EINVAL;
-        if (ts.tv_sec < INT64_MAX / 4000000000ll) deadline = lkd_host_mono_ns() + ts.tv_sec * 1000000000ll + ts.tv_nsec;
+        int64_t rel;
+        int e = sig_read_timeout(utimeout, &rel);
+        if (e) return e;
+        deadline = lkd_host_mono_ns() + rel;
     }
     uint32_t max = 0;
     int undos = 0, alter = 0;
@@ -630,6 +623,7 @@ static int64_t do_semtimedop(lkd_task *t, int semid, uint64_t usops, uint64_t ns
     if (!sem_map(1)) return -LX_ENOMEM;
     int32_t pid = guest_pid(t);
     struct fx_sleeper *sl = NULL;
+    int reaped = 0;
     int64_t r;
     for (;;) {
         lock();
@@ -643,9 +637,11 @@ static int64_t do_semtimedop(lkd_task *t, int semid, uint64_t usops, uint64_t ns
         if (r) { unlock(); break; }
         uint32_t blocking = 0;
         r = perform(s, sops, (uint32_t)nsops, undo_of(un), pid, &blocking);
-        /* would block: the holder may be a process that died without its exit */
-        if ((r > 0 || r == -LX_EAGAIN) && undo_reap_dead(s))
-            r = perform(s, sops, (uint32_t)nsops, undo_of(un), pid, &blocking);
+        /* would block: the holder may be a process that died without its exit (looked for once a call) */
+        if ((r > 0 || r == -LX_EAGAIN) && !reaped) {
+            reaped = 1;
+            if (undo_reap_dead(s)) r = perform(s, sops, (uint32_t)nsops, undo_of(un), pid, &blocking);
+        }
         if (r <= 0) {
             if (!r) {
                 s->otime = now_s();
@@ -674,7 +670,7 @@ static int64_t do_semtimedop(lkd_task *t, int semid, uint64_t usops, uint64_t ns
         memcpy(wops(w), sops, nsops * sizeof sops[0]);
         q_append(s, wi);
         unlock();
-        r = wait_queued(t, wi, &sl, deadline);
+        r = wait_queued(t, wi, sl, deadline);
         break;
     }
     if (sl) sig_shared_sleeper_put(sl);
@@ -702,18 +698,20 @@ static int64_t semctl_info(int cmd, uint64_t buf)
     in.semmnu = SEM_POOL;
     in.semmap = SEM_POOL;
     in.semume = SEMOPM;
+    int used = 0, max = 0; /* ipc_get_maxidx, 0 without sets */
     lock();
+    for (int i = 0; i < SEM_SETS; i++)
+        if (g_sem->set[i].used) { used++; max = i; }
     if (cmd == LX_SEM_INFO) {
-        for (int i = 0; i < SEM_SETS; i++) in.semusz += g_sem->set[i].used ? 1 : 0;
+        in.semusz = used;
         in.semaem = g_sem->used_sems;
     } else {
         in.semusz = SEMUSZ;
         in.semaem = SEMAEM;
     }
-    int m = max_idx();
     unlock();
     if (lkd_user_write(buf, &in, sizeof in)) return -LX_EFAULT;
-    return m < 0 ? 0 : m;
+    return max;
 }
 
 static int64_t semctl_stat(lkd_task *t, int semid, int cmd, uint64_t buf)
@@ -722,12 +720,7 @@ static int64_t semctl_stat(lkd_task *t, int semid, int cmd, uint64_t buf)
     memset(&d, 0, sizeof d);
     int64_t r;
     lock();
-    struct sem_set *s;
-    if (cmd == LX_IPC_STAT) s = by_id(semid);
-    else { /* an index: ipc_obtain_object_idr keeps its low bits (ipcid_to_idx) */
-        int slot = semid % SEQ_MULT;
-        s = slot < SEM_SETS && g_sem->set[slot].used ? &g_sem->set[slot] : NULL;
-    }
+    struct sem_set *s = cmd == LX_IPC_STAT ? by_id(semid) : slot_of(semid); /* SEM_STAT*: an index */
     if (!s) r = -LX_EINVAL;
     else if (cmd != LX_SEM_STAT_ANY && ipcperms(t, s, 0444)) r = -LX_EACCES;
     else {
@@ -749,47 +742,59 @@ static int64_t semctl_stat(lkd_task *t, int semid, int cmd, uint64_t buf)
     return r;
 }
 
-/* semctl_main (ipc/sem.c): GETALL and SETALL take the whole set, the others one semaphore */
-static int64_t semctl_main(lkd_task *t, int semid, int semnum, int cmd, uint64_t arg)
+/* SETVAL and SETALL: n values from first, then the adjustments of every process for them are cleared and
+ * the queue served. Lock held. */
+static void set_vals(struct sem_set *s, int first, int n, const uint16_t *src, int32_t pid)
+{
+    for (int i = 0; i < n; i++) vals(s)[first + i] = (struct sem_val){ .val = src[i], .pid = pid };
+    undo_clear(s, n == 1 ? first : -1);
+    s->ctime = now_s();
+    update_queue(s);
+}
+
+/* GETALL and SETALL (semctl_main, ipc/sem.c). The buffer is allocated with the lock released; a set
+ * removed meanwhile is EIDRM, as in Linux. */
+static int64_t semctl_all(lkd_task *t, int semid, int cmd, uint64_t arg)
+{
+    int64_t r = 0;
+    int n = 0;
+    lock();
+    struct sem_set *s = by_id(semid);
+    if (!s) r = -LX_EINVAL;
+    else if (ipcperms(t, s, cmd == LX_SETALL ? 0222 : 0444)) r = -LX_EACCES;
+    else n = s->nsems;
+    unlock();
+    if (r) return r;
+    size_t size = (size_t)n * sizeof(uint16_t);
+    uint16_t *io = malloc(size);
+    if (!io) return -LX_ENOMEM;
+    if (cmd == LX_SETALL) {
+        if (lkd_user_read(arg, io, size)) r = -LX_EFAULT;
+        for (int i = 0; !r && i < n; i++)
+            if (io[i] > SEMVMX) r = -LX_ERANGE;
+    }
+    if (!r) {
+        lock();
+        if (!(s = by_id(semid))) r = -LX_EIDRM; /* the same id is the same set, with the same n */
+        else if (cmd == LX_SETALL) set_vals(s, 0, n, io, guest_pid(t));
+        else for (int i = 0; i < n; i++) io[i] = (uint16_t)vals(s)[i].val;
+        unlock();
+    }
+    if (!r && cmd == LX_GETALL && lkd_user_write(arg, io, size)) r = -LX_EFAULT;
+    free(io);
+    return r;
+}
+
+/* semctl_main (ipc/sem.c): GETVAL, GETPID, GETNCNT and GETZCNT read one semaphore */
+static int64_t semctl_main(lkd_task *t, int semid, int semnum, int cmd)
 {
     int64_t r = 0;
     lock();
     struct sem_set *s = by_id(semid);
-    if (!s) { unlock(); return -LX_EINVAL; }
-    if (ipcperms(t, s, cmd == LX_SETALL ? 0222 : 0444)) { unlock(); return -LX_EACCES; }
-    int nsems = s->nsems;
-    if (cmd == LX_GETALL || cmd == LX_SETALL) {
-        /* the buffer is allocated with the lock released; a set removed meanwhile is EIDRM, as in Linux */
-        unlock();
-        uint16_t *io = malloc((size_t)nsems * sizeof *io);
-        if (!io) return -LX_ENOMEM;
-        if (cmd == LX_GETALL) {
-            lock();
-            if (!(s = by_id(semid))) r = -LX_EIDRM;
-            else for (int i = 0; i < nsems; i++) io[i] = (uint16_t)vals(s)[i].val;
-            unlock();
-            if (!r && lkd_user_write(arg, io, (size_t)nsems * sizeof *io)) r = -LX_EFAULT;
-            free(io);
-            return r;
-        }
-        if (lkd_user_read(arg, io, (size_t)nsems * sizeof *io)) { free(io); return -LX_EFAULT; }
-        for (int i = 0; i < nsems; i++)
-            if (io[i] > SEMVMX) { free(io); return -LX_ERANGE; }
-        lock();
-        if (!(s = by_id(semid))) { unlock(); free(io); return -LX_EIDRM; }
-        for (int i = 0; i < nsems; i++) {
-            vals(s)[i].val = io[i];
-            vals(s)[i].pid = guest_pid(t);
-        }
-        undo_clear(s, -1);
-        s->ctime = now_s();
-        update_queue(s);
-        unlock();
-        free(io);
-        return 0;
-    }
-    if (semnum < 0 || semnum >= nsems) { unlock(); return -LX_EINVAL; }
-    switch (cmd) {
+    if (!s) r = -LX_EINVAL;
+    else if (ipcperms(t, s, 0444)) r = -LX_EACCES;
+    else if (semnum < 0 || semnum >= s->nsems) r = -LX_EINVAL;
+    else switch (cmd) {
     case LX_GETVAL: r = vals(s)[semnum].val; break;
     case LX_GETPID: r = vals(s)[semnum].pid; break;
     case LX_GETNCNT: r = count_semcnt(s, semnum, 0); break;
@@ -808,13 +813,7 @@ static int64_t semctl_setval(lkd_task *t, int semid, int semnum, int val)
     if (!s) r = -LX_EINVAL;
     else if (semnum < 0 || semnum >= s->nsems) r = -LX_EINVAL;
     else if (ipcperms(t, s, 0222)) r = -LX_EACCES;
-    else {
-        vals(s)[semnum].val = val;
-        vals(s)[semnum].pid = guest_pid(t);
-        undo_clear(s, semnum);
-        s->ctime = now_s();
-        update_queue(s);
-    }
+    else set_vals(s, semnum, 1, &(uint16_t){ (uint16_t)val }, guest_pid(t));
     unlock();
     return r;
 }
@@ -834,12 +833,13 @@ LKD_SYSCALL(semctl)
     case LX_SEM_STAT_ANY:
         return semctl_stat(t, semid, cmd, arg);
     case LX_GETALL:
+    case LX_SETALL:
+        return semctl_all(t, semid, cmd, arg);
     case LX_GETVAL:
     case LX_GETPID:
     case LX_GETNCNT:
     case LX_GETZCNT:
-    case LX_SETALL:
-        return semctl_main(t, semid, semnum, cmd, arg);
+        return semctl_main(t, semid, semnum, cmd);
     case LX_SETVAL:
         return semctl_setval(t, semid, semnum, (int)(int32_t)arg); /* little-endian: the low half */
     case LX_IPC_SET:

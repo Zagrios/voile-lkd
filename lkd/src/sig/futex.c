@@ -310,6 +310,8 @@ int sig_shared_sleep(lkd_task *t, struct fx_sleeper *s, int64_t deadline) { retu
 
 void sig_shared_sleeper_put(struct fx_sleeper *s) { atomic_store(&s->used, 0); }
 
+void sig_shared_sleeper_rearm(struct fx_sleeper *s) { atomic_fetch_and(&s->word, 0xffffffff00000000ull); }
+
 void sig_spin_lock(_Atomic uint32_t *l) { spin_lock(l); }
 void sig_spin_unlock(_Atomic uint32_t *l) { spin_unlock(l); }
 
