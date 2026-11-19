@@ -99,6 +99,7 @@ struct lkd_waitstate {
     int cohosted;                  /* guest process living inside another process' host process */
     int group_exit;                /* exit_group or fatal signal in progress */
     int group_status;              /* wait status of the group exit */
+    int exit_hooks_done;           /* the modules' process exit hooks ran */
     int zombie_done;               /* zombie record published */
     int migrated;                  /* the process moved to another host process (exec of a vfork child) */
     int exec_killing;              /* de_thread in progress */

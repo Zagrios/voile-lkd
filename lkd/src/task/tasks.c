@@ -769,8 +769,16 @@ int lkd_task_release(lkd_task *t, int *exit_status_out)
         fam_unlock();
     }
     int host_exit = 0;
-    if (last) lkd_hooks_proc_exit(t);
-    if (last || group) host_exit = proc_die(t, status);
+    if (last || group) {
+        /* A group exit ends the process while other threads are still listed, and the host process with it: the
+         * modules release what the process holds now, once, as they do after its last thread. */
+        pthread_mutex_lock(&p->lock);
+        int hooks = !p->wait->exit_hooks_done;
+        p->wait->exit_hooks_done = 1;
+        pthread_mutex_unlock(&p->lock);
+        if (hooks) lkd_hooks_proc_exit(t);
+        host_exit = proc_die(t, status);
+    }
     tasks_forget(t);
     if (exit_status_out)
         *exit_status_out = LX_WIFEXITED(status) ? LX_WEXITSTATUS(status) : 128 + LX_WTERMSIG(status);

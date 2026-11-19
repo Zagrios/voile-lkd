@@ -26,7 +26,7 @@ the objects, and waits and signals stay in the calling process.
 
 - Unit test `tests/test_sig_ntsync.c`, following the kernel selftests: state and errors of each object, WAIT_ANY,
   WAIT_ALL, alerts, wakes across threads, a signal ending a wait, sharing across a host fork and through anchors,
-  release at host exit, slot reuse.
+  release at host exit and at a group exit, slot reuse.
   - `EVENT_SET` 0.02 us ; create + close 1.4 us ; a signal ends a wait 3 to 4 ms after it is sent.
 - Wine through fexdarwin (`tests/bench/winbench.c`):
   - `WaitForSingleObject(0)` 11.8 → 0.35 us ;

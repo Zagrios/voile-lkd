@@ -1,7 +1,7 @@
 /* test_sig_ntsync.c: /dev/ntsync (sig module, src/sig/ntsync.c). Follows the kernel selftests
  * (tools/testing/selftests/drivers/ntsync/ntsync.c, Linux 6.14): object state and errors, NT_WAIT_ANY,
  * NT_WAIT_ALL, alerts, wakes across threads, a signal ending a wait, sharing across a host fork and through
- * SCM_RIGHTS anchors, and slots reused after close. */
+ * SCM_RIGHTS anchors, slots reused after close, and the release at a group exit. */
 #include <pthread.h>
 #include <sys/wait.h>
 
@@ -480,6 +480,42 @@ LT_TEST(anchors_and_slot_reuse)
     SC(T, close, (uint64_t)e);
 }
 
+/* A process ends at exit_group while another of its threads is still there: its host process exits at once, and
+ * what it held is released as after a last thread. */
+LT_TEST(group_exit_releases)
+{
+    int ev = create_event(1, 0);
+    lkd_fdobj *o = lkd_fd_get(T, ev, NULL);
+    LT_CHECK(o != NULL);
+    int h[1];
+    LT_EQ(lkd_ntsync_export(o, h, 1), 1);
+    lkd_fdobj_put(o);
+    int h2 = dup(h[0]);
+    fflush(NULL);
+    int64_t pid = SC(T, clone, LX_SIGCHLD, 0, 0, 0, 0);
+    if (pid == 0) {
+        alarm(20);
+        lkd_task *c = lkd_current();
+        lkd_fdobj *in = NULL;
+        int ok = lkd_ntsync_import(h[0], &in) == 1;      /* the child holds a counted reference */
+        ok = ok && fake_make_thread(c) != NULL;
+        SC(c, exit_group, (uint64_t)(ok ? 0 : 1));
+        int st = 0;
+        if (lkd_task_release(c, &st)) _exit(st);
+        _exit(99);
+    }
+    LT_CHECK(pid > 0);
+    close(h[0]);
+    int32_t *status = area(1);
+    *status = -1;
+    LT_EQ(SC(T, wait4, (uint64_t)pid, P(status), 0, 0), pid);
+    LT_EQ(*status, 0);
+    LT_EQ(SC(T, close, (uint64_t)ev), 0);
+    lkd_fdobj *got = NULL;
+    LT_EQ(lkd_ntsync_import(h2, &got), 0);              /* freed: the child's reference went at its exit */
+    close(h2);
+}
+
 int main(void)
 {
     procfs_fixture();
@@ -494,5 +530,6 @@ int main(void)
     LT_RUN(signal_ends_wait);
     LT_RUN(shared_across_fork);
     LT_RUN(anchors_and_slot_reuse);
+    LT_RUN(group_exit_releases);
     return lt_finish();
 }

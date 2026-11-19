@@ -422,16 +422,18 @@ static void nt_release(lkd_fdobj *o)
 {
     struct nt_file *f = o->priv;
     if (!f) return;
+    /* Out of the list and out of the slot under the list's lock: the process's exit, which another thread may run
+     * meanwhile (sig_ntsync_host_exit), then releases the slot there or leaves it to here, never neither. */
     pthread_mutex_lock(&g_files_lock);
     if (f->prev) f->prev->next = f->next;
     else if (g_files == f) g_files = f->next;
     if (f->next) f->next->prev = f->prev;
-    pthread_mutex_unlock(&g_files_lock);
     if (f->pid == getpid() && nt_map()) {
         lock();
         if (f->slot && f->slot <= NT_OBJS && obj(f->slot)->gen == f->gen) slot_put(f->slot);
         unlock();
     }
+    pthread_mutex_unlock(&g_files_lock);
     close(f->anchor);
     free(f);
     o->priv = NULL;
