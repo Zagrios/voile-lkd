@@ -13,12 +13,15 @@
  * Identity. A guest descriptor of a device or an object is an fd object whose private part names a slot and
  * its generation. Its host side is an anchor: the read end of a host pipe whose write end is closed; its
  * inode is unique while it is open. The slot records the inode and a hash finds the slot again from it, so
- * SCM_RIGHTS carries the anchor and the receiver gets the same object (lkd_ntsync_import).
+ * SCM_RIGHTS carries the anchor and the receiver gets the same object (lkd_ntsync_import). macOS gives the inode
+ * to another pipe once the anchor is closed everywhere: a new anchor takes it from a slot that outlived its own
+ * (slot_retire).
  *
  * Lifetime. A slot counts the fd objects that refer to it in every process (created, received), plus one per
  * object of a device and one per queued wait. The last release frees it. A host process does not close its
  * guest descriptors when it exits (the host kernel closes its fds), so the exit of its last guest process
- * releases what it still holds (sig_ntsync_host_exit); only a process killed outright leaks its references.
+ * releases what it still holds (sig_ntsync_host_exit); only a process killed outright leaks its references, until
+ * a new anchor gets the inode of the slot's.
  * A fork child's copies are not counted and do not release: the child execs or exits, as Wine's do; a child
  * that keeps using an object after its parent closed it finds it gone (-EINVAL). An anchor received through
  * SCM_RIGHTS must also look like one (no writer, empty), so that an ordinary pipe that happens to get the
@@ -165,11 +168,12 @@ static uint32_t hash_get(uint64_t ino)
     }
 }
 
-/* Linear probing deletion without tombstones: shift back the entries whose home lies before the hole. */
-static void hash_del(uint64_t ino)
+/* Removes the entry of slot under ino, unless a newer slot took the inode (slot_retire). Linear probing deletion
+ * without tombstones: shift back the entries whose home lies before the hole. */
+static void hash_del(uint64_t ino, uint32_t slot)
 {
     uint32_t i = hash_home(ino);
-    while (g_nt->hash[i].ino && g_nt->hash[i].ino != ino) i = (i + 1) & (NT_HASH - 1);
+    while (g_nt->hash[i].ino && (g_nt->hash[i].ino != ino || g_nt->hash[i].slot != slot)) i = (i + 1) & (NT_HASH - 1);
     if (!g_nt->hash[i].ino) return;
     for (uint32_t j = i;;) {
         j = (j + 1) & (NT_HASH - 1);
@@ -196,8 +200,26 @@ static int anchor_new(uint64_t *ino)
 
 /* ---- slots (locked) ----------------------------------------------------------------------------- */
 
+static void slot_put(uint32_t s);
+
+/* The anchor of a new slot is open, and macOS gives a pipe's inode again once the pipe is closed: a slot that
+ * still names this inode lost every descriptor with references left (a process that died without releasing its
+ * own, a wait still queued on it). A receiver of the new anchor would find that slot, and wait on an object
+ * nobody signals. So the inode goes to the new slot alone, and the old one keeps only what its queued waits hold. */
+static void slot_retire(uint64_t ino)
+{
+    uint32_t s = hash_get(ino);
+    if (!s) return;
+    struct nt_obj *o = obj(s);
+    hash_del(ino, s);
+    if (o->type == NT_DEV || o->refs <= o->nwait) return; /* a device goes with its objects */
+    o->refs = o->nwait + 1;
+    slot_put(s);
+}
+
 static uint32_t slot_alloc(uint32_t type, uint64_t ino)
 {
+    slot_retire(ino);
     uint32_t s = g_nt->free_head;
     if (s) g_nt->free_head = obj(s)->next_free;
     else if (g_nt->high < NT_OBJS) s = ++g_nt->high;
@@ -217,7 +239,7 @@ static void slot_put(uint32_t s)
 {
     struct nt_obj *o = obj(s);
     if (o->type == NT_FREE || !o->refs || --o->refs) return;
-    hash_del(o->ino);
+    hash_del(o->ino, s);
     uint32_t dev = o->dev;
     o->type = NT_FREE;
     o->next_free = g_nt->free_head;

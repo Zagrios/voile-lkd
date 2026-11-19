@@ -1,7 +1,7 @@
 /* test_sig_ntsync.c: /dev/ntsync (sig module, src/sig/ntsync.c). Follows the kernel selftests
  * (tools/testing/selftests/drivers/ntsync/ntsync.c, Linux 6.14): object state and errors, NT_WAIT_ANY,
  * NT_WAIT_ALL, alerts, wakes across threads, a signal ending a wait, sharing across a host fork and through
- * SCM_RIGHTS anchors, slots reused after close, and the release at a group exit. */
+ * SCM_RIGHTS anchors, slots reused after close, the release at a group exit, and an anchor's inode given again. */
 #include <pthread.h>
 #include <sys/wait.h>
 
@@ -516,6 +516,60 @@ LT_TEST(group_exit_releases)
     close(h2);
 }
 
+/* macOS gives the inode of a closed pipe to a later one, within a few dozen pipes. A slot left with a reference
+ * when its anchors are closed (a process that died without releasing its own) must not answer for the new anchor:
+ * its receiver would wait on an object nobody signals. */
+LT_TEST(reused_inode_names_the_new_object)
+{
+    int old = create_event(0, 0);
+    lkd_fdobj *o = lkd_fd_get(T, old, NULL);
+    LT_CHECK(o != NULL);
+    uint64_t ino = o->ino;
+    int h[1];
+    LT_EQ(lkd_ntsync_export(o, h, 1), 1);
+    lkd_fdobj_put(o);
+    fflush(NULL);
+    pid_t c = fork();
+    if (c == 0) {
+        lkd_fdobj *in = NULL;
+        _exit(lkd_ntsync_import(h[0], &in) == 1 ? 0 : 1); /* a counted reference, never released */
+    }
+    close(h[0]);
+    int st = 0;
+    LT_EQ(waitpid(c, &st, 0), c);
+    LT_CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    LT_EQ(SC(T, close, (uint64_t)old), 0);              /* no anchor is open now, and the slot is still there */
+    int made[128], n = 0, ev = -1;
+    while (ev < 0 && n < 128) {
+        int e = create_event(1, 0);
+        if (e < 0) { LT_CHECK(e >= 0); break; }
+        made[n++] = e;
+        o = lkd_fd_get(T, e, NULL);
+        if (o->ino == ino) ev = e;
+        lkd_fdobj_put(o);
+    }
+    if (ev < 0) {
+        printf("MEASURE the host did not give the inode again within %d pipes: nothing checked\n", n);
+    } else {
+        printf("MEASURE the host gave the inode again to pipe %d\n", n);
+        o = lkd_fd_get(T, ev, NULL);
+        LT_EQ(lkd_ntsync_export(o, h, 1), 1);
+        lkd_fdobj_put(o);
+        lkd_fdobj *got = NULL;
+        LT_EQ(lkd_ntsync_import(h[0], &got), 1);        /* what a receiver of the new anchor gets */
+        int ev2 = lkd_fd_alloc(T, got, 0, 1);
+        lkd_fdobj_put(got);
+        LT_CHECK(ev2 >= 0);
+        uint32_t prev, m, s;
+        LT_EQ(op1(ev, EVENT_SET, 0, &prev), 0);
+        LT_EQ(read2(ev2, EVENT_READ, &m, &s), 0);
+        LT_EQ(m, 1);                                    /* the new manual event, not the old automatic one */
+        LT_EQ(s, 1);
+        SC(T, close, (uint64_t)ev2);
+    }
+    for (int i = 0; i < n; i++) SC(T, close, (uint64_t)made[i]);
+}
+
 int main(void)
 {
     procfs_fixture();
@@ -531,5 +585,6 @@ int main(void)
     LT_RUN(shared_across_fork);
     LT_RUN(anchors_and_slot_reuse);
     LT_RUN(group_exit_releases);
+    LT_RUN(reused_inode_names_the_new_object);
     return lt_finish();
 }
