@@ -4,7 +4,8 @@
  * Wire format: wsd_protocol.h, PROTOCOL.md.
  *
  * Threading: everything runs on the main queue (AppKit + socket I/O through GCD sources), except the CoreAudio
- * calls (g_audio_queue); Metal completion/presented handlers and audio errors hop back to the main queue.
+ * calls (g_audio_queue) and the clock that reads the audio streams the device leaves unread (g_audio_clock_queue);
+ * Metal completion/presented handlers and audio errors hop back to the main queue.
  * Present path: shm fd -> mmap(MAP_SHARED) -> newBufferWithBytesNoCopy -> linear MTLTexture
  * (no CPU pixel copy) -> one render pass per display-link tick into the CAMetalLayer drawable.
  *
@@ -241,6 +242,10 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 
 static __weak WsdWindow *g_focus_wanted; /* WINDOW_FOCUS while wsd was not active: made key once it is */
 
+/* How long a started output stream waits for its device before the clock reads its ring: longer than a device that
+ * is ready takes to start a unit, shorter than a game waits for its sound to move (see audio_clock_tick). */
+#define AUDIO_PATIENCE_NS (100 * NSEC_PER_MSEC)
+
 /* Audio output stream (WSD_AUDIO_*): one default-output AudioUnit per stream, whose render callback reads the
  * client's shared ring directly (no copy in between, no message per buffer). CoreAudio converts the client format
  * and rate to the device and mixes the streams. */
@@ -250,6 +255,11 @@ struct wsd_audio_rt {
   uint32_t ring_frames, frame_bytes;
   uint8_t silence;
   _Atomic int running;
+  /* output streams only: what the clock needs to read the ring while the device does not (audio_clock_tick) */
+  uint32_t rate;
+  _Atomic uint64_t pulled_ns;   /* when the device last read the ring, or when the stream started */
+  _Atomic uint64_t patience_ns; /* how long after that the clock leaves the ring to the device */
+  uint64_t clock_ns;            /* on g_audio_clock_queue: up to when the clock has read the ring */
   /* input streams only */
   AudioComponentInstance unit; /* the callback pulls the captured frames from it */
   AudioConverterRef conv;      /* device float frames to the client's rate, channels and sample format */
@@ -266,7 +276,11 @@ static OSStatus audio_render(void *ref, AudioUnitRenderActionFlags *flags, const
   (void)ts; (void)bus;
   if (atomic_load_explicit(&rt->running, memory_order_acquire)) {
     _Atomic uint64_t *wp = (_Atomic uint64_t *)&rt->ring->write_frames, *rp = (_Atomic uint64_t *)&rt->ring->read_frames;
-    uint64_t w = atomic_load_explicit(wp, memory_order_acquire), r = atomic_load_explicit(rp, memory_order_relaxed);
+    /* the device reads the ring again: the clock waits three of its renders, at least AUDIO_PATIENCE_NS */
+    uint64_t renders = 3 * (uint64_t)frames * NSEC_PER_SEC / rt->rate;
+    atomic_store_explicit(&rt->patience_ns, renders > AUDIO_PATIENCE_NS ? renders : AUDIO_PATIENCE_NS, memory_order_relaxed);
+    atomic_store_explicit(&rt->pulled_ns, now_ns(), memory_order_release);
+    uint64_t w = atomic_load_explicit(wp, memory_order_acquire), r = atomic_load_explicit(rp, memory_order_acquire);
     uint64_t avail = w > r ? w - r : 0;
     if (avail > rt->ring_frames) avail = rt->ring_frames; /* a misbehaving client cannot make us read out of range */
     got = avail < want ? (uint32_t)avail : want;
@@ -276,7 +290,8 @@ static OSStatus audio_render(void *ref, AudioUnitRenderActionFlags *flags, const
       memcpy(out + (size_t)done * rt->frame_bytes, rt->data + (size_t)pos * rt->frame_bytes, (size_t)n * rt->frame_bytes);
       done += n;
     }
-    atomic_store_explicit(rp, r + got, memory_order_release);
+    /* fails when the clock read the ring meanwhile, on its last turn: its position stands */
+    atomic_compare_exchange_strong_explicit(rp, &r, r + got, memory_order_release, memory_order_relaxed);
     if (got < want) rt->ring->underrun_frames += want - got;
   }
   if (got < want) memset(out + (size_t)got * rt->frame_bytes, rt->silence, (size_t)(want - got) * rt->frame_bytes);
@@ -451,13 +466,74 @@ static dispatch_queue_t g_audio_queue;
   self.rt->conv = NULL;
 }
 /* The ring outlives the unit: the client holds the stream until it closes it, and each block queued on
- * g_audio_queue holds it until it ran, the teardown last. */
+ * g_audio_queue holds it until it ran, the teardown last. The clock holds a started stream until it is stopped. */
 - (void)dealloc {
   if (self.map) munmap(self.map, self.mapLen);
   if (self.rt) { free(self.rt->scratch); free(self.rt->out); }
   free(self.rt);
 }
 @end
+
+/* A started output stream is read at its rate whether the device plays it or not, as Windows reads one. The device
+ * reads the ring from its render callback, but a unit takes its time to start, about a second on a Bluetooth headset,
+ * and stops rendering while the Mac changes its output device. A game sees frames nobody reads as a dead device:
+ * Rocket League closes its stream after 0.3 s and opens another, whose unit starts no faster and waits on
+ * g_audio_queue behind the units of the streams before it, so that no stream was ever read again (2026-11-20: no
+ * sound, and a match that never finishes loading). So while the device has not read a started stream for
+ * `patience_ns`, this clock reads it instead, and what it reads is not heard. */
+static dispatch_queue_t g_audio_clock_queue;
+static dispatch_source_t g_audio_clock;         /* on g_audio_clock_queue, set while a stream is started */
+static NSMutableArray<WsdAudio *> *g_audio_run; /* on g_audio_clock_queue: the started output streams */
+
+/* On g_audio_clock_queue. */
+static void audio_clock_tick(void) {
+  uint64_t now = now_ns();
+  for (WsdAudio *a in g_audio_run) {
+    struct wsd_audio_rt *rt = a.rt;
+    uint64_t waited = atomic_load_explicit(&rt->pulled_ns, memory_order_acquire) +
+                      atomic_load_explicit(&rt->patience_ns, memory_order_relaxed);
+    /* the device has it, or a STOP is on its way here */
+    if (waited > now || !atomic_load_explicit(&rt->running, memory_order_acquire)) continue;
+    if (rt->clock_ns < waited) rt->clock_ns = waited; /* the clock reads from then on */
+    uint64_t late = now - rt->clock_ns;
+    if (late > NSEC_PER_SEC) { /* this queue was held: a second is more than a ring holds */
+      late = NSEC_PER_SEC;
+      rt->clock_ns = now - late;
+    }
+    uint64_t due = late * rt->rate / NSEC_PER_SEC;
+    if (!due) continue;
+    _Atomic uint64_t *wp = (_Atomic uint64_t *)&rt->ring->write_frames, *rp = (_Atomic uint64_t *)&rt->ring->read_frames;
+    uint64_t w = atomic_load_explicit(wp, memory_order_acquire), r = atomic_load_explicit(rp, memory_order_acquire);
+    uint64_t avail = w > r ? w - r : 0;
+    if (avail > rt->ring_frames) avail = rt->ring_frames;
+    /* fails when the device read the ring meanwhile: it has the stream again */
+    if (avail) atomic_compare_exchange_strong_explicit(rp, &r, r + (avail < due ? avail : due), memory_order_release,
+                                                        memory_order_relaxed);
+    /* the time of the frames read, not `now`, which would lose a part of a frame at each turn; an empty ring owes
+     * nothing */
+    rt->clock_ns = avail < due ? now : rt->clock_ns + due * NSEC_PER_SEC / rt->rate;
+  }
+}
+
+/* On g_audio_clock_queue: `a` started, or stopped. The clock runs while a stream is started. */
+static void audio_clock_follow(WsdAudio *a, BOOL started) {
+  [g_audio_run removeObjectIdenticalTo:a];
+  if (started) [g_audio_run addObject:a];
+  if (g_audio_run.count && !g_audio_clock) {
+    g_audio_clock = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_audio_clock_queue);
+    dispatch_source_set_timer(g_audio_clock, DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC, NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_audio_clock, ^{ audio_clock_tick(); });
+    dispatch_resume(g_audio_clock);
+  } else if (!g_audio_run.count && g_audio_clock) {
+    dispatch_source_cancel(g_audio_clock);
+    g_audio_clock = nil;
+  }
+}
+
+/* On the main queue: the clock stops reading `a`. */
+static void audio_clock_leave(WsdAudio *a) {
+  dispatch_async(g_audio_clock_queue, ^{ audio_clock_follow(a, NO); });
+}
 
 @interface WsdClient : NSObject
 @property int fd;
@@ -1357,7 +1433,10 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   for (WsdWindow *w in self.windows.allValues) [w destroy];
   [self.windows removeAllObjects];
   [self.buffers removeAllObjects]; /* textures die after in-flight command buffers release them */
-  for (WsdAudio *a in self.audio.allValues) dispatch_async(g_audio_queue, ^{ [a teardown]; });
+  for (WsdAudio *a in self.audio.allValues) {
+    audio_clock_leave(a);
+    dispatch_async(g_audio_queue, ^{ [a teardown]; });
+  }
   [self.audio removeAllObjects];
   if (g_cursor && [self.cursors.allValues containsObject:g_cursor]) {
     g_cursor = nil;
@@ -1469,6 +1548,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
   rt->frame_bytes = o->frame_bytes;
   rt->silence = o->format == WSD_AUDIO_U8 ? 0x80 : 0;
   rt->channels = o->channels;
+  rt->rate = o->rate;
   a.rt = rt;
   a.input = input;
   self.audio[@(o->stream_id)] = a;
@@ -1487,6 +1567,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
       WsdClient *c = weakSelf;
       if (c.audio[@(open.stream_id)] != a) return; /* closed meanwhile */
       [c.audio removeObjectForKey:@(open.stream_id)];
+      audio_clock_leave(a);
       [c error:type code:-EIO];
     });
   });
@@ -1761,6 +1842,11 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
     WsdAudio *a = self.audio[@(m->stream_id)];
     if (!a) { [self error:type code:-ENOENT]; break; }
     if (type == WSD_AUDIO_START) {
+      if (!a.input) { /* the device has AUDIO_PATIENCE_NS to read the ring before the clock does */
+        atomic_store_explicit(&a.rt->patience_ns, AUDIO_PATIENCE_NS, memory_order_relaxed);
+        atomic_store_explicit(&a.rt->pulled_ns, now_ns(), memory_order_release);
+        dispatch_async(g_audio_clock_queue, ^{ audio_clock_follow(a, YES); });
+      }
       atomic_store_explicit(&a.rt->running, 1, memory_order_release);
       uint32_t stream = m->stream_id;
       pid_t pid = self.pid;
@@ -1777,6 +1863,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
       });
     } else if (type == WSD_AUDIO_STOP) {
       atomic_store_explicit(&a.rt->running, 0, memory_order_release); /* silence from the next render on */
+      audio_clock_leave(a);
       dispatch_async(g_audio_queue, ^{
         if (a.unit) AudioOutputUnitStop(a.unit);
       });
@@ -1787,6 +1874,7 @@ static CGPoint warp_point(WsdClient *c, int32_t x, int32_t y) {
                             atomic_load_explicit(wp, memory_order_acquire), memory_order_release);
     } else {
       [self.audio removeObjectForKey:@(m->stream_id)];
+      audio_clock_leave(a);
       dispatch_async(g_audio_queue, ^{ [a teardown]; });
     }
     break;
@@ -2385,6 +2473,10 @@ int main(int argc, char **argv) {
     g_dev = MTLCreateSystemDefaultDevice();
     g_queue = [g_dev newCommandQueue];
     g_audio_queue = dispatch_queue_create("wsd.audio", DISPATCH_QUEUE_SERIAL);
+    /* as urgent as the game's own sound: its turns are a few loads and stores */
+    g_audio_clock_queue = dispatch_queue_create(
+        "wsd.audio.clock", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    g_audio_run = [NSMutableArray array];
     NSError *err = nil;
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:kShader options:nil error:&err];
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
