@@ -13,6 +13,7 @@
  */
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Carbon/Carbon.h> /* kVK_* */
 
@@ -41,6 +42,9 @@ static id<MTLRenderPipelineState> g_pipe;
 static BOOL g_exit_on_disconnect;
 typedef struct { double x, y; } WsdScale; /* pixels per point on each axis, see scale_at() */
 static int g_render_percent = 100; /* --render-percent, 1 to 100 (PROTOCOL.md, "Render percent") */
+static double g_render_fraction;
+static BOOL g_spatial_upscale;
+static BOOL g_frame_gen;
 static uint32_t g_mode_width_px, g_mode_height_px; /* SET_DISPLAY_MODE: the size a game switched the display to, 0: that side is not lowered */
 static __weak id g_mode_owner;          /* the client that set it, which takes it back when it goes (a WsdClient) */
 static BOOL g_injecting;       /* set while DEBUG_INJECT feeds synthetic events */
@@ -191,6 +195,24 @@ static void probe_frame(WsdBuffer *b, uint64_t client_ns, uint64_t rx_ns) {
 @property(strong) WsdView *view;
 @property(strong) CAMetalLayer *layer;
 @property(strong) CADisplayLink *link;
+@property(strong) id<MTLFXSpatialScaler> spatialScaler;
+@property(strong) id<MTLTexture> spatialInput, spatialOutput;
+@property NSUInteger spatialWidth, spatialHeight, spatialOutputWidth, spatialOutputHeight;
+@property NSUInteger spatialPresented;
+@property uint64_t spatialGpuSumNs;
+@property uint32_t spatialGpuCount;
+@property MTLPixelFormat spatialFormat;
+@property BOOL spatialDirectInput;
+@property(strong) id fgInterpolator; /* id<MTLFXFrameInterpolator> on macOS 26+ */
+@property(strong) id<MTLTexture> fgHistory0, fgHistory1, fgOutput;
+@property NSUInteger fgWidth, fgHeight;
+@property MTLPixelFormat fgFormat;
+@property int fgCurSlot;
+@property BOOL fgHasHistory, fgResetHistory, fgRealPending;
+@property uint64_t fgLastFrameNs, fgSmoothIntervalNs, fgInterpTickNs;
+@property NSUInteger fgPresented;
+@property uint64_t fgGpuSumNs;
+@property uint32_t fgGpuCount;
 /* pending (mailbox) frame */
 @property(strong) WsdBuffer *pendingBuffer;
 /* last encoded buffer, shown again (without events) when its frame was never displayed, e.g. the first frame
@@ -615,16 +637,16 @@ static NSScreen *primary_screen(void) {
  * mode". with_mode NO leaves the game's mode out: the native screen as the render percent shows it. */
 static WsdScale scale_at(NSWindow *w, BOOL with_mode) {
   BOOL moded = with_mode && (g_mode_width_px || g_mode_height_px);
-  BOOL lowered = g_render_percent < 100 || moded;
+  BOOL lowered = g_render_fraction < 1.0 || moded;
   NSScreen *primary = (!w || lowered) ? primary_screen() : nil;
   double s = w ? w.backingScaleFactor : primary.backingScaleFactor;
   s = s > 0 ? s : 1.0;
   WsdScale r = {s, s};
   if (lowered) {
     NSSize pt = primary.frame.size;
-    if (g_render_percent < 100) {
+    if (g_render_fraction < 1.0) {
       double min_scale = MAX(640.0 / pt.width, 480.0 / pt.height);
-      r.x = r.y = MIN(s, MAX(s * g_render_percent / 100.0, min_scale));
+      r.x = r.y = MIN(s, MAX(s * g_render_fraction, min_scale));
     }
     if (g_mode_width_px && moded) r.x = MIN(r.x, MAX(g_mode_width_px / pt.width, 640.0 / pt.width));
     if (g_mode_height_px && moded) r.y = MIN(r.y, MAX(g_mode_height_px / pt.height, 480.0 / pt.height));
@@ -1107,40 +1129,335 @@ static CAMetalLayer *make_metal_layer(void) {
   if (self.overlay) [self.overlay tickPlane];
 }
 
+- (CGSize)presentationSizeForWidth:(NSUInteger)bufWidth height:(NSUInteger)bufHeight {
+  if (!g_spatial_upscale || !self.isOverlay)
+    return CGSizeMake(bufWidth, bufHeight);
+  double backing = self.window.backingScaleFactor;
+  if (backing <= 0.0) backing = 1.0;
+  NSUInteger width = 0, height = 0;
+  CGSize bounds = self.layer.bounds.size;
+  if (bounds.width > 0.0 && bounds.height > 0.0) {
+    width = (NSUInteger)lround(bounds.width * backing);
+    height = (NSUInteger)lround(bounds.height * backing);
+  } else {
+    WsdScale guestScale = backing_scale_xy(self.window);
+    width = (NSUInteger)lround(bufWidth * backing / guestScale.x);
+    height = (NSUInteger)lround(bufHeight * backing / guestScale.y);
+  }
+  if (width < bufWidth || height < bufHeight ||
+      (width == bufWidth && height == bufHeight) ||
+      width > 8192 || height > 8192)
+    return CGSizeMake(bufWidth, bufHeight);
+  return CGSizeMake(width, height);
+}
+
+- (void)resetFrameGen {
+  self.fgInterpolator = nil;
+  self.fgHistory0 = nil;
+  self.fgHistory1 = nil;
+  self.fgOutput = nil;
+  self.fgWidth = 0;
+  self.fgHeight = 0;
+  self.fgFormat = MTLPixelFormatInvalid;
+  self.fgCurSlot = 0;
+  self.fgHasHistory = NO;
+  self.fgResetHistory = YES;
+  self.fgRealPending = NO;
+  self.fgLastFrameNs = 0;
+  self.fgSmoothIntervalNs = 0;
+  self.fgInterpTickNs = 0;
+  self.fgGpuSumNs = 0;
+  self.fgGpuCount = 0;
+}
+
+- (void)prepareFrameGenFor:(WsdBuffer *)buffer {
+  MTLPixelFormat format = buffer.texture.pixelFormat;
+  if (self.fgWidth == buffer.width && self.fgHeight == buffer.height && self.fgFormat == format)
+    return;
+
+  [self resetFrameGen];
+  self.fgWidth = buffer.width;
+  self.fgHeight = buffer.height;
+  self.fgFormat = format;
+  if (!buffer.width || !buffer.height || buffer.width > 4096 || buffer.height > 4096 ||
+      (format != MTLPixelFormatRGBA8Unorm && format != MTLPixelFormatBGRA8Unorm &&
+       format != MTLPixelFormatRGB10A2Unorm))
+    return;
+
+  if (@available(macOS 26.0, *)) {
+    MTLFXFrameInterpolatorDescriptor *desc = [MTLFXFrameInterpolatorDescriptor new];
+    desc.colorTextureFormat = format;
+    desc.outputTextureFormat = format;
+    desc.depthTextureFormat = MTLPixelFormatInvalid;
+    desc.motionTextureFormat = MTLPixelFormatInvalid;
+    desc.inputWidth = buffer.width;
+    desc.inputHeight = buffer.height;
+    desc.outputWidth = buffer.width;
+    desc.outputHeight = buffer.height;
+    if (@available(macOS 27.0, *)) {
+      desc.requiresPrevColorTexture = YES;
+    }
+    id<MTLFXFrameInterpolator> fi = [desc newFrameInterpolatorWithDevice:g_dev];
+    if (!fi) {
+      LOG("window %u: MetalFX FrameGen unavailable for %ux%u (fmt %lu)",
+          self.windowId, buffer.width, buffer.height, (unsigned long)format);
+      return;
+    }
+    MTLTextureDescriptor *hd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                width:buffer.width height:buffer.height mipmapped:NO];
+    hd.storageMode = MTLStorageModePrivate;
+    hd.usage = fi.colorTextureUsage | MTLTextureUsageShaderRead;
+    MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                width:buffer.width height:buffer.height mipmapped:NO];
+    od.storageMode = MTLStorageModePrivate;
+    od.usage = fi.outputTextureUsage | MTLTextureUsageShaderRead;
+    self.fgHistory0 = [g_dev newTextureWithDescriptor:hd];
+    self.fgHistory1 = [g_dev newTextureWithDescriptor:hd];
+    self.fgOutput = [g_dev newTextureWithDescriptor:od];
+    if (!self.fgHistory0 || !self.fgHistory1 || !self.fgOutput) {
+      [self resetFrameGen];
+      self.fgWidth = buffer.width;
+      self.fgHeight = buffer.height;
+      self.fgFormat = format;
+      LOG("window %u: MetalFX FrameGen texture allocation failed", self.windowId);
+      return;
+    }
+    self.fgInterpolator = fi;
+    self.fgResetHistory = YES;
+    LOG("window %u: MetalFX FrameGen configured %ux%u (fmt %lu, color-only)",
+        self.windowId, buffer.width, buffer.height, (unsigned long)format);
+  }
+}
+
+- (void)prepareSpatialScalerForTexture:(id<MTLTexture>)texture width:(NSUInteger)bufWidth height:(NSUInteger)bufHeight
+                                output:(CGSize)size {
+  MTLPixelFormat format = texture.pixelFormat;
+  if (self.spatialWidth == bufWidth && self.spatialHeight == bufHeight &&
+      self.spatialOutputWidth == (NSUInteger)size.width && self.spatialOutputHeight == (NSUInteger)size.height &&
+      self.spatialFormat == format)
+    return;
+
+  self.spatialWidth = bufWidth;
+  self.spatialHeight = bufHeight;
+  self.spatialOutputWidth = (NSUInteger)size.width;
+  self.spatialOutputHeight = (NSUInteger)size.height;
+  self.spatialFormat = format;
+  self.spatialScaler = nil;
+  self.spatialInput = nil;
+  self.spatialOutput = nil;
+  self.spatialDirectInput = NO;
+  self.spatialGpuSumNs = 0;
+  self.spatialGpuCount = 0;
+  if ((NSUInteger)size.width < bufWidth || (NSUInteger)size.height < bufHeight ||
+      ((NSUInteger)size.width == bufWidth && (NSUInteger)size.height == bufHeight) ||
+      (format != MTLPixelFormatRGBA8Unorm && format != MTLPixelFormatBGRA8Unorm &&
+       format != MTLPixelFormatRGB10A2Unorm))
+    return;
+
+  MTLFXSpatialScalerDescriptor *descriptor = [MTLFXSpatialScalerDescriptor new];
+  descriptor.inputWidth = bufWidth;
+  descriptor.inputHeight = bufHeight;
+  descriptor.outputWidth = (NSUInteger)size.width;
+  descriptor.outputHeight = (NSUInteger)size.height;
+  descriptor.colorTextureFormat = format;
+  descriptor.outputTextureFormat = MTLPixelFormatBGRA8Unorm;
+  descriptor.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+  id<MTLFXSpatialScaler> scaler = [descriptor newSpatialScalerWithDevice:g_dev];
+  if (!scaler) {
+    LOG("window %u: MetalFX Spatial unavailable for %lux%lu -> %lux%lu (fmt %lu); using linear presentation",
+        self.windowId, (unsigned long)bufWidth, (unsigned long)bufHeight, (unsigned long)descriptor.outputWidth,
+        (unsigned long)descriptor.outputHeight, (unsigned long)format);
+    return;
+  }
+
+  /* Use the input texture directly when its usage flags already satisfy
+   * the scaler; otherwise blit it into a private texture before scaling. */
+  BOOL directInput = (texture.usage & scaler.colorTextureUsage) == scaler.colorTextureUsage;
+  if (!directInput) {
+    MTLTextureDescriptor *input = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                               width:bufWidth height:bufHeight mipmapped:NO];
+    input.storageMode = MTLStorageModePrivate;
+    input.usage = scaler.colorTextureUsage;
+    self.spatialInput = [g_dev newTextureWithDescriptor:input];
+    if (!self.spatialInput) {
+      LOG("window %u: MetalFX Spatial input allocation failed; using linear presentation", self.windowId);
+      return;
+    }
+  }
+  MTLTextureDescriptor *output = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:descriptor.outputTextureFormat
+                             width:descriptor.outputWidth height:descriptor.outputHeight mipmapped:NO];
+  output.storageMode = MTLStorageModePrivate;
+  output.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+  self.spatialOutput = [g_dev newTextureWithDescriptor:output];
+  if (!self.spatialOutput) {
+    self.spatialInput = nil;
+    LOG("window %u: MetalFX Spatial output allocation failed; using linear presentation", self.windowId);
+    return;
+  }
+  self.spatialDirectInput = directInput;
+  if (!directInput) scaler.colorTexture = self.spatialInput;
+  scaler.outputTexture = self.spatialOutput;
+  scaler.inputContentWidth = bufWidth;
+  scaler.inputContentHeight = bufHeight;
+  self.spatialScaler = scaler;
+  LOG("window %u: MetalFX Spatial configured %lux%lu -> %lux%lu (fmt %lu, %s input)",
+      self.windowId, (unsigned long)bufWidth, (unsigned long)bufHeight, (unsigned long)descriptor.outputWidth,
+      (unsigned long)descriptor.outputHeight, (unsigned long)format,
+      directInput ? "direct" : "private-copy");
+}
+
 - (void)tickPlane {
   WsdBuffer *b = self.pendingBuffer;
   BOOL redisplay = NO;
-  if (!b && self.redisplay && self.lastBuffer && !self.lastBuffer.detached) { b = self.lastBuffer; redisplay = YES; }
-  if (!b || !self.window.visible) return;
+  BOOL presentHeldReal = NO;
+  uint64_t tick_ns = now_ns();
+  double maxHz = MAX((double)(self.window.screen ?: primary_screen()).maximumFramesPerSecond, 60.0);
+  double refreshNs = 1e9 / maxHz;
+
+  if (!b && g_frame_gen && self.isOverlay && self.fgRealPending && self.fgHasHistory) {
+    uint64_t halfGap = (uint64_t)(self.fgSmoothIntervalNs * 0.5);
+    uint64_t margin = (uint64_t)(refreshNs * 0.5);
+    uint64_t waitNs = halfGap > margin ? halfGap - margin : 0;
+    if (tick_ns >= self.fgInterpTickNs + waitNs) {
+      presentHeldReal = YES;
+    } else {
+      return; /* pace held real frame to midpoint between real frames */
+    }
+  }
+
+  if (!b && !presentHeldReal && self.redisplay && self.lastBuffer && !self.lastBuffer.detached) {
+    b = self.lastBuffer;
+    redisplay = YES;
+  }
+  if ((!b && !presentHeldReal) || !self.window.visible) return;
   /* A window macOS does not show (covered, on another Space, the screen locked) has its drawables no longer taken:
    * nextDrawable would hold the main queue up to a second, and every message and buffer release with it (2026-10-22:
    * a Space switch held Rocket League's frames, Neptune reported its swapchain occluded, and the game never presented
    * again, Obelisk issue #14). The frame stays pending until the window shows again; a newer one still replaces it. */
   if (!(self.window.occlusionState & NSWindowOcclusionStateVisible)) return;
-  uint64_t tick_ns = now_ns();
+
+  NSUInteger srcWidth = presentHeldReal ? self.fgWidth : b.width;
+  NSUInteger srcHeight = presentHeldReal ? self.fgHeight : b.height;
+  CGSize want = [self presentationSizeForWidth:srcWidth height:srcHeight];
+  BOOL upscaling = want.width > srcWidth || want.height > srcHeight;
+  double wantScale = upscaling ? self.window.backingScaleFactor : backing_scale(self.window);
+  if (wantScale > 0.0 && fabs(self.layer.contentsScale - wantScale) > 1e-6) self.layer.contentsScale = wantScale;
+  if (!CGSizeEqualToSize(self.layer.drawableSize, want)) self.layer.drawableSize = want;
   id<CAMetalDrawable> d = [self.layer nextDrawable];
   if (!d) return; /* keep it pending */
-  if (redisplay) self.redisplay = NO;
-  else { self.pendingBuffer = nil; self.lastBuffer = b; self.redisplayTries = 0; self.overlayGone = NO; }
-  CGSize want = CGSizeMake(b.width, b.height);
-  if (!CGSizeEqualToSize(self.layer.drawableSize, want)) self.layer.drawableSize = want;
 
+  if (presentHeldReal) {
+    self.fgRealPending = NO;
+  } else if (redisplay) {
+    self.redisplay = NO;
+  } else {
+    self.pendingBuffer = nil;
+    self.lastBuffer = b;
+    self.redisplayTries = 0;
+    self.overlayGone = NO;
+  }
+
+  id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+  id<MTLTexture> source = presentHeldReal ? (self.fgCurSlot == 0 ? self.fgHistory0 : self.fgHistory1) : b.texture;
+  BOOL ranFrameGen = NO;
+
+  if (!presentHeldReal && !redisplay && g_frame_gen && self.isOverlay) {
+    [self prepareFrameGenFor:b];
+    if (@available(macOS 26.0, *)) {
+      id<MTLFXFrameInterpolator> fi = self.fgInterpolator;
+      if (fi) {
+        uint64_t dtNs = self.fgLastFrameNs && tick_ns > self.fgLastFrameNs ? (tick_ns - self.fgLastFrameNs) : 0;
+        self.fgLastFrameNs = tick_ns;
+        if (dtNs > 0 && dtNs < 250000000ULL) {
+          self.fgSmoothIntervalNs = self.fgSmoothIntervalNs
+              ? (uint64_t)(self.fgSmoothIntervalNs * 0.8 + dtNs * 0.2)
+              : dtNs;
+        }
+        int nextSlot = self.fgHasHistory ? (1 - self.fgCurSlot) : 0;
+        id<MTLTexture> nextTex = nextSlot == 0 ? self.fgHistory0 : self.fgHistory1;
+        id<MTLTexture> prevTex = self.fgCurSlot == 0 ? self.fgHistory0 : self.fgHistory1;
+        id<MTLBlitCommandEncoder> copy = [cb blitCommandEncoder];
+        [copy copyFromTexture:b.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(b.width, b.height, 1) toTexture:nextTex
+             destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [copy endEncoding];
+
+        BOOL longGap = dtNs == 0 || dtNs >= 250000000ULL;
+        BOOL alreadyAtRefresh = dtNs > 0 && (double)dtNs < refreshNs * 1.25;
+        if (self.fgHasHistory && !longGap && !alreadyAtRefresh) {
+          fi.prevColorTexture = prevTex;
+          fi.colorTexture = nextTex;
+          fi.outputTexture = self.fgOutput;
+          fi.deltaTime = (float)MIN(MAX(dtNs / 1e9, 1.0 / 240.0), 0.25);
+          fi.shouldResetHistory = self.fgResetHistory;
+          [fi encodeToCommandBuffer:cb];
+          self.fgResetHistory = NO;
+          self.fgRealPending = YES;
+          self.fgInterpTickNs = tick_ns;
+          source = self.fgOutput;
+          ranFrameGen = YES;
+        } else {
+          self.fgResetHistory = YES;
+          self.fgRealPending = NO;
+          source = nextTex;
+        }
+        self.fgCurSlot = nextSlot;
+        self.fgHasHistory = YES;
+      }
+    }
+  }
+
+  id<MTLTexture> presented = source;
+  id<MTLFXSpatialScaler> scaler = nil;
+  if (g_spatial_upscale && self.isOverlay) {
+    [self prepareSpatialScalerForTexture:source width:srcWidth height:srcHeight
+                                  output:CGSizeMake(d.texture.width, d.texture.height)];
+    scaler = self.spatialScaler;
+    if (scaler) {
+      if (self.spatialDirectInput && (source.usage & scaler.colorTextureUsage) == scaler.colorTextureUsage) {
+        scaler.colorTexture = source;
+      } else {
+        if (!self.spatialInput) {
+          MTLTextureDescriptor *inDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
+                                          width:srcWidth height:srcHeight mipmapped:NO];
+          inDesc.storageMode = MTLStorageModePrivate;
+          inDesc.usage = scaler.colorTextureUsage;
+          self.spatialInput = [g_dev newTextureWithDescriptor:inDesc];
+        }
+        if (self.spatialInput) {
+          id<MTLBlitCommandEncoder> copy = [cb blitCommandEncoder];
+          [copy copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                     sourceSize:MTLSizeMake(srcWidth, srcHeight, 1) toTexture:self.spatialInput
+               destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+          [copy endEncoding];
+          scaler.colorTexture = self.spatialInput;
+        } else {
+          scaler = nil;
+        }
+      }
+      if (scaler) {
+        [scaler encodeToCommandBuffer:cb];
+        presented = self.spatialOutput;
+      }
+    }
+  }
   MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
   rp.colorAttachments[0].texture = d.texture;
   rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
   rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-  id<MTLCommandBuffer> cb = [g_queue commandBuffer];
   id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
   [enc setRenderPipelineState:g_pipe];
-  [enc setFragmentTexture:b.texture atIndex:0];
+  [enc setFragmentTexture:presented atIndex:0];
   [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
   [enc endEncoding];
 
-  struct wsd_ev_presented ev = {self.windowId, b.bufferId, self.pendingSerial, self.pendingClientNs,
-                                self.pendingReceivedNs, tick_ns, 0, self.replaced, 0};
-  self.replaced = 0;
-  uint64_t serial = self.pendingSerial;
+  struct wsd_ev_presented ev = {self.windowId, b ? b.bufferId : 0, b ? self.pendingSerial : 0,
+                                b ? self.pendingClientNs : 0, b ? self.pendingReceivedNs : 0,
+                                tick_ns, 0, b ? self.replaced : 0, 0};
+  if (b) self.replaced = 0;
+  uint64_t serial = b ? self.pendingSerial : 0;
   __weak WsdWindow *weakSelf = self;
+  NSUInteger drawableWidth = d.texture.width, drawableHeight = d.texture.height;
   [d addPresentedHandler:^(id<MTLDrawable> dr) {
     struct wsd_ev_presented e2 = ev;
     e2.presented_ns = (uint64_t)(dr.presentedTime * 1e9);
@@ -1148,6 +1465,14 @@ static CAMetalLayer *make_metal_layer(void) {
       WsdWindow *sw = weakSelf;
       if (e2.presented_ns) sw.nPresented++; else sw.nZero++;
       if (e2.presented_ns && !redisplay) {
+        if (ranFrameGen && sw && ((++sw.fgPresented % 120) == 1))
+          LOG("window %u: MetalFX FrameGen showed generated frame %lu (%lux%lu -> %lux%lu)", sw.windowId,
+              (unsigned long)sw.fgPresented, (unsigned long)srcWidth, (unsigned long)srcHeight,
+              (unsigned long)drawableWidth, (unsigned long)drawableHeight);
+        if (scaler && sw && ((++sw.spatialPresented % 120) == 1))
+          LOG("window %u: MetalFX Spatial showed frame %lu (%lux%lu -> %lux%lu)", sw.windowId,
+              (unsigned long)sw.spatialPresented, (unsigned long)srcWidth, (unsigned long)srcHeight,
+              (unsigned long)drawableWidth, (unsigned long)drawableHeight);
         [sw.isOverlay ? sw.base : sw frameShownAt:now_ns()];
         if (sw.statLastNs && e2.presented_ns > sw.statLastNs) {
           uint64_t d = e2.presented_ns - sw.statLastNs;
@@ -1165,18 +1490,18 @@ static CAMetalLayer *make_metal_layer(void) {
           if (++sw.statCount == 120) {
             LOG("window %u %s: 120 frames shown, present interval avg %.3f min %.3f max %.3f ms, latency submit->shown %.3f ms",
                 sw.windowId, sw.isOverlay ? "overlay" : "base", sw.statSumNs / 120 / 1e6, sw.statMinNs / 1e6,
-                sw.statMaxNs / 1e6, (e2.presented_ns > e2.client_time_ns ? e2.presented_ns - e2.client_time_ns : 0) / 1e6);
+                sw.statMaxNs / 1e6, (b && e2.presented_ns > e2.client_time_ns ? e2.presented_ns - e2.client_time_ns : 0) / 1e6);
             sw.statCount = 0; sw.statSumNs = sw.statMaxNs = sw.statMinNs = 0;
           }
         }
         sw.statLastNs = e2.presented_ns;
       }
       /* never displayed and nothing newer queued: show the same buffer again on a later tick (bounded) */
-      if (!e2.presented_ns && !sw.pendingBuffer && sw.lastBuffer == b && sw.redisplayTries < 240) {
+      if (b && !e2.presented_ns && !sw.pendingBuffer && sw.lastBuffer == b && sw.redisplayTries < 240) {
         sw.redisplayTries++;
         sw.redisplay = YES;
       }
-      if (!redisplay) [weakSelf sendEvent:WSD_EV_PRESENTED payload:&e2 len:sizeof(e2) extra:nil];
+      if (b && !redisplay) [weakSelf sendEvent:WSD_EV_PRESENTED payload:&e2 len:sizeof(e2) extra:nil];
     });
   }];
   [cb presentDrawable:d];
@@ -1186,7 +1511,48 @@ static CAMetalLayer *make_metal_layer(void) {
   CAMetalLayer *layer = self.layer;
   [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
     (void)layer;
-    if (!redisplay)
+    if (c.status != MTLCommandBufferStatusCompleted) {
+      if (ranFrameGen) {
+        LOG("window %u: MetalFX FrameGen failed: %s", ev.window_id, c.error.localizedDescription.UTF8String);
+        dispatch_async(dispatch_get_main_queue(), ^{ g_frame_gen = NO; [weakSelf resetFrameGen]; });
+      }
+      if (scaler) {
+        LOG("window %u: MetalFX presentation failed: %s", ev.window_id, c.error.localizedDescription.UTF8String);
+        dispatch_async(dispatch_get_main_queue(), ^{ g_spatial_upscale = NO; });
+      }
+    } else if (!redisplay && c.GPUEndTime > c.GPUStartTime) {
+      uint64_t gpuNs = (uint64_t)((c.GPUEndTime - c.GPUStartTime) * 1e9);
+      if (ranFrameGen) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          WsdWindow *sw = weakSelf;
+          if (!sw) return;
+          sw.fgGpuSumNs += gpuNs;
+          if (++sw.fgGpuCount == 120) {
+            LOG("window %u: MetalFX FrameGen 120 generated frames (%lux%lu -> %lux%lu%s), GPU avg %.2f ms",
+                sw.windowId, (unsigned long)srcWidth, (unsigned long)srcHeight,
+                (unsigned long)drawableWidth, (unsigned long)drawableHeight,
+                scaler ? "+spatial" : "", sw.fgGpuSumNs / 120.0 / 1e6);
+            sw.fgGpuSumNs = 0;
+            sw.fgGpuCount = 0;
+          }
+        });
+      } else if (scaler) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          WsdWindow *sw = weakSelf;
+          if (!sw) return;
+          sw.spatialGpuSumNs += gpuNs;
+          if (++sw.spatialGpuCount == 120) {
+            LOG("window %u: MetalFX Spatial 120 frames (%lux%lu -> %lux%lu, %s), GPU avg %.2f ms",
+                sw.windowId, (unsigned long)srcWidth, (unsigned long)srcHeight,
+                (unsigned long)drawableWidth, (unsigned long)drawableHeight,
+                sw.spatialDirectInput ? "direct" : "copy", sw.spatialGpuSumNs / 120.0 / 1e6);
+            sw.spatialGpuSumNs = 0;
+            sw.spatialGpuCount = 0;
+          }
+        });
+      }
+    }
+    if (b && !redisplay)
       dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf releaseBuffer:b serial:serial shown:YES]; });
   }];
   [cb commit];
@@ -1297,6 +1663,7 @@ static CAMetalLayer *make_metal_layer(void) {
   if (o.pendingBuffer) [o releaseBuffer:o.pendingBuffer serial:o.pendingSerial shown:NO];
   o.pendingBuffer = nil;
   o.lastBuffer = nil;
+  [o resetFrameGen];
   [o.layer removeFromSuperlayer];
   self.overlay = nil;
   self.overlayGone = YES;
@@ -2456,21 +2823,51 @@ static int parse_render_percent(const char *arg) {
 int main(int argc, char **argv) {
   @autoreleasepool {
     const char *dir = NULL, *render_percent = NULL;
+    int spatial_cli = -1, framegen_cli = -1;
     for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--dir") && i + 1 < argc) dir = argv[++i];
       else if (!strcmp(argv[i], "--exit-on-disconnect")) g_exit_on_disconnect = YES;
+      else if (!strcmp(argv[i], "--metalfx-spatial")) spatial_cli = 1;
+      else if (!strcmp(argv[i], "--no-metalfx-spatial")) spatial_cli = 0;
+      else if (!strcmp(argv[i], "--metalfx-framegen")) framegen_cli = 1;
+      else if (!strcmp(argv[i], "--no-metalfx-framegen")) framegen_cli = 0;
       else if (!strcmp(argv[i], "--render-percent")) /* a following option is not its value */
         render_percent = i + 1 < argc && strncmp(argv[i + 1], "--", 2) ? argv[++i] : "(no value)";
     }
     if (!dir) {
-      fprintf(stderr, "usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N]\n");
+      fprintf(stderr, "usage: wsd --dir <private-dir> [--exit-on-disconnect] [--render-percent N] [--metalfx-spatial] [--metalfx-framegen]\n");
       return 2;
     }
     setvbuf(stderr, NULL, _IOLBF, 0);
     if (render_percent) g_render_percent = parse_render_percent(render_percent);
+    NSUserDefaults *preferences = NSUserDefaults.standardUserDefaults;
+    double preferredFraction = [preferences doubleForKey:@"WsdRenderFraction"];
+    g_render_fraction = !render_percent && isfinite(preferredFraction) &&
+                        preferredFraction > 0.0 && preferredFraction <= 1.0
+                        ? preferredFraction : g_render_percent / 100.0;
     g_probe_enabled = getenv("WSD_LATENCY_PROBE") != NULL;
 
     g_dev = MTLCreateSystemDefaultDevice();
+    BOOL want_spatial = [preferences boolForKey:@"WsdMetalFXSpatial"];
+    const char *spatial_env = getenv("WSD_METALFX_SPATIAL");
+    if (spatial_env && *spatial_env) want_spatial = strcmp(spatial_env, "0") != 0;
+    if (spatial_cli >= 0) want_spatial = spatial_cli != 0;
+    if (want_spatial) {
+      g_spatial_upscale = g_dev && [MTLFXSpatialScalerDescriptor supportsDevice:g_dev];
+      LOG("MetalFX Spatial %s", g_spatial_upscale ? "enabled for upscaled presentation" : "unsupported; using linear presentation");
+    }
+    BOOL want_framegen = [preferences boolForKey:@"WsdMetalFXFrameGen"];
+    const char *framegen_env = getenv("WSD_METALFX_FRAMEGEN");
+    if (framegen_env && *framegen_env) want_framegen = strcmp(framegen_env, "0") != 0;
+    if (framegen_cli >= 0) want_framegen = framegen_cli != 0;
+    if (want_framegen) {
+      if (@available(macOS 26.0, *)) {
+        g_frame_gen = g_dev && [MTLFXFrameInterpolatorDescriptor supportsDevice:g_dev];
+      }
+      LOG("MetalFX FrameGen %s", g_frame_gen ? "enabled (2x color-only optical flow)" : "unsupported on this OS/GPU");
+    }
+    if (g_render_fraction != g_render_percent / 100.0)
+      LOG("per-application guest render fraction %.6f", g_render_fraction);
     g_queue = [g_dev newCommandQueue];
     g_audio_queue = dispatch_queue_create("wsd.audio", DISPATCH_QUEUE_SERIAL);
     /* as urgent as the game's own sound: its turns are a few loads and stores */

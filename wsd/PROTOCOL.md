@@ -168,3 +168,27 @@ display. Before this tag the raw values were shown in the display space (red 220
 
 GPU-produced buffers (DXMT shared textures) must be complete before PRESENT: today the producer
 waits for its own D3D11 completion (EVENT query). A shared fence is future work (see the report).
+
+An application can opt in to MetalFX Spatial with `--metalfx-spatial`, the `WSD_METALFX_SPATIAL=1`
+environment variable, or the `WsdMetalFXSpatial` boolean preference in its window-server bundle
+domain (precedence: CLI > environment > preference). When an overlay plane's physical pixel size
+exceeds the guest buffer size (whether via `--render-percent`, `WsdRenderFraction`, `SET_DISPLAY_MODE`,
+or an in-game lower-resolution swapchain), wsd sizes the drawable to physical display pixels, runs
+`MTLFXSpatialScaler` directly from the guest's linear texture (falling back to a GPU copy only if
+texture usage requires it) into a `BGRA8Unorm` output texture, and presents it on the same command
+buffer. All wsd buffer formats (`BGRA8`, `RGBA8`, `RGB10A2`) are supported. Buffer release and
+present notifications follow the existing protocol.
+
+The optional `WsdRenderFraction` preference is a fractional guest backing scale, such as
+`0.6666666666666666` for a 1280 × 720 guest surface in a 1920 × 1080 display area. A supplied
+`--render-percent` takes precedence. These are per-bundle preferences read at startup.
+
+An application can opt in to 2× color-only MetalFX Frame Generation (macOS 26+) with
+`--metalfx-framegen`, `WSD_METALFX_FRAMEGEN=1`, or the `WsdMetalFXFrameGen` boolean preference
+(precedence: CLI > environment > preference). On overlay planes, wsd copies each incoming guest
+buffer into a private 2-slot history ring so the guest buffer releases immediately, runs
+`MTLFXFrameInterpolator` at the guest resolution between the previous and current frame to present
+an interpolated midpoint first, and paces the held real frame on a subsequent display-link tick.
+When MetalFX Spatial is also enabled, both generated and real frames pass through the spatial
+scaler. Interpolation is automatically bypassed when real frames already arrive at display refresh
+or after pauses over 250 ms.
