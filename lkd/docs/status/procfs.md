@@ -12,7 +12,7 @@ Date: 2026-10-02. Milestone 2 reached: `/proc`, `/sys` and `/dev` are served by 
 | `file.c` | `open` of the generated files (seq_file semantics: content produced at the first read and at any read at offset 0), file object, permissions |
 | `pid.c` | all the files of `/proc/<pid>` and `task/<tid>`, access rules, `mem` object |
 | `global.c` | cpuinfo, meminfo, uptime, loadavg, version, stat, filesystems, `/proc/sys` |
-| `sysfs.c` | `/sys/devices/system/cpu` (online, possible, present, offline, kernel_max, cpuN/online, topology, cache), `clocksource0` |
+| `sysfs.c` | `/sys/devices/system/cpu` (online, possible, present, offline, kernel_max, cpuN/online, topology, cache, cpufreq), `clocksource0`, also as `/sys/bus/clocksource/devices/clocksource0` |
 | `dev.c` | `/dev`: null, zero, full, random, urandom, tty, console, ptmx, pts, fd, stdin, stdout, stderr |
 | `remote.c` | famsvc opcode 49 (`LKD_FAMSVC_OP_TASK_STATUS`), default backend, object on a received descriptor |
 | `init.c` | mounts `/proc` (proc), `/sys` (sysfs), `/dev` (devtmpfs) |
@@ -48,7 +48,7 @@ In the complete build (`cmake --build -- -k 0` then `tools/run_tests.sh`), the t
 | number of blocks | `sysctl hw.logicalcpu` (18 on this Mac, MEASURED) |
 | vendor_id, cpu family, model, stepping, fpu, cpuid level | CPUID 0 and 1 of the engine (FEX: `CPUID.cpp:429-448`) |
 | model name | CPUID 0x80000002 to 4 per CPU (FEX: MIDR of the core, `CPUID.cpp:1121`) |
-| cpu MHz, bogomips | CPUID 0x15: ecx*ebx/eax Hz; missing if eax is 0 (FEX divides by zero in that case) |
+| cpu MHz, bogomips | CPUID 0x15: ecx*ebx/eax Hz; missing if eax is 0 (FEX divides by zero in that case). cpu MHz is the host's highest clock instead when the engine gives it (`lkd_procfs_set_cpu_max_khz`), as cpufreq's `cpuinfo_max_freq` and `scaling_max_freq` |
 | cache size | largest cache of CPUID 4, in KB |
 | flags | bits of CPUID 1, 6, 7, 0xD, 0x10, 0x80000001, 0x80000007, 0x80000008, 0x8000000A, 0x8000001F, same table as FEX; always present: `art rep_good nopl xtopology cpuid tsc_known_freq`; `hypervisor` follows CPUID 1 ecx bit 31 (shown, not hidden) |
 | physical id, siblings, core id, cpu cores, apicid | flat topology: one package, N cores, one thread each (like FEX); identical to `/sys/devices/system/cpu/cpuN/topology` |

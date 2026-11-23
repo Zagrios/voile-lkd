@@ -57,6 +57,24 @@ int pf_cpuid(uint32_t leaf, uint32_t sub, int cpu, struct lkd_cpuid_regs *r)
     return fn(leaf, sub, cpu, r);
 }
 
+static _Atomic(lkd_cpu_max_khz_fn) g_cpu_max_khz_fn;
+static _Atomic(int64_t) g_cpu_max_khz = -1;   /* -1: not asked yet */
+void lkd_procfs_set_cpu_max_khz(lkd_cpu_max_khz_fn fn)
+{
+    atomic_store(&g_cpu_max_khz_fn, fn);
+    atomic_store(&g_cpu_max_khz, -1);
+}
+uint32_t pf_cpu_max_khz(void)
+{
+    int64_t v = atomic_load(&g_cpu_max_khz);
+    if (v < 0) {
+        lkd_cpu_max_khz_fn fn = atomic_load(&g_cpu_max_khz_fn);
+        v = fn ? fn() : 0;
+        atomic_store(&g_cpu_max_khz, v);
+    }
+    return (uint32_t)v;
+}
+
 int pf_inotify_present(void) { return lkd_syscall_owner(LKD_NR_inotify_init1) != NULL; }
 
 /* ---- /proc/cpuinfo ----------------------------------------------------------------------------- */
@@ -185,11 +203,13 @@ static void render_cpuinfo(struct pbuf *b)
         if (on) { pb_puts(&flags, f->name); pb_putc(&flags, ' '); }
     }
 
-    /* TSC frequency, CPUID 0x15: ecx * ebx / eax Hz. Without it the lines are omitted. */
+    /* TSC frequency, CPUID 0x15: ecx * ebx / eax Hz. Without it the lines are omitted. "cpu MHz" is the host's
+     * highest clock when the engine knows it, as cpufreq's cpuinfo_max_freq; bogomips stays on the TSC. */
     struct lkd_cpuid_regs r15;
     pf_cpuid(0x15, 0, 0, &r15);
     int have_freq = r15.eax != 0 && r15.ebx != 0 && r15.ecx != 0;
     double hz = have_freq ? (double)r15.ecx * (double)r15.ebx / (double)r15.eax : 0;
+    uint32_t max_khz = pf_cpu_max_khz();
 
     /* cache size: the largest cache reported by leaf 4, in KB. */
     uint64_t cache_kb = 0;
@@ -213,7 +233,8 @@ static void render_cpuinfo(struct pbuf *b)
         pb_printf(b, "processor\t: %d\nvendor_id\t: %s\ncpu family\t: %u\nmodel\t\t: %u\nmodel name\t: %s\n", i,
                   vendor[0] ? vendor : "unknown", fam, mod, name[0] ? name : "unknown");
         pb_printf(b, "stepping\t: %u\n", stepping);
-        if (have_freq) pb_printf(b, "cpu MHz\t\t: %.3f\n", hz / 1e6);
+        if (max_khz) pb_printf(b, "cpu MHz\t\t: %.3f\n", max_khz / 1e3);
+        else if (have_freq) pb_printf(b, "cpu MHz\t\t: %.3f\n", hz / 1e6);
         if (cache_kb) pb_printf(b, "cache size\t: %llu KB\n", (unsigned long long)cache_kb);
         /* flat topology: ncpu cores, one thread each (same view as /sys/devices/system/cpu/cpuN/topology) */
         pb_printf(b, "physical id\t: 0\nsiblings\t: %d\ncore id\t\t: %d\ncpu cores\t: %d\napicid\t\t: %d\ninitial apicid\t: %d\n",

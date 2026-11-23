@@ -22,6 +22,12 @@ struct lkd_cpuid_regs { uint32_t eax, ebx, ecx, edx; };
 typedef int (*lkd_cpuid_fn)(uint32_t leaf, uint32_t subleaf, int cpu, struct lkd_cpuid_regs *out);
 void lkd_procfs_set_cpuid(lkd_cpuid_fn fn);
 
+/* The host's highest CPU clock in kHz (the top bin of its fastest cores), 0 when unknown. Asked once per process, at
+ * the first read of a file that shows it: /proc/cpuinfo "cpu MHz" and /sys/devices/system/cpu/cpuN/cpufreq. Without a
+ * provider, "cpu MHz" comes from CPUID 0x15 and there is no cpufreq directory. */
+typedef uint32_t (*lkd_cpu_max_khz_fn)(void);
+void lkd_procfs_set_cpu_max_khz(lkd_cpu_max_khz_fn fn);
+
 /* ---- Backend (tests replace it) --------------------------------------------------------------- */
 
 /* Request of a file of another host process of the family, answered by its procfs (famsvc op

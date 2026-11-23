@@ -129,9 +129,11 @@ void fexdarwin_lkd_guard_close_all(void) {
 }
 
 // procfs (src/lkd/src/procfs/lkd_procfs.h): /proc/cpuinfo and /sys cache files are rendered from the CPUID the guest
-// itself executes, which only the engine can answer. fexdarwin_cpuid is defined in LkdGlue.cpp.
+// itself executes, which only the engine can answer. fexdarwin_cpuid is defined in LkdGlue.cpp, fexdarwin_cpu_max_khz
+// (the clock of cpufreq and "cpu MHz") in DarwinCpuClock.c.
 #include "../procfs/lkd_procfs.h"
 extern int fexdarwin_cpuid(uint32_t leaf, uint32_t subleaf, int cpu, uint32_t out[4]);
+extern uint32_t fexdarwin_cpu_max_khz(void);
 static int cpuid_trampoline(uint32_t leaf, uint32_t subleaf, int cpu, struct lkd_cpuid_regs* out) {
   uint32_t r[4];
   if (fexdarwin_cpuid(leaf, subleaf, cpu, r) != 0) return -1;
@@ -140,4 +142,5 @@ static int cpuid_trampoline(uint32_t leaf, uint32_t subleaf, int cpu, struct lkd
 }
 void fexdarwin_lkd_register_cpuid(void) {
   lkd_procfs_set_cpuid(cpuid_trampoline);
+  lkd_procfs_set_cpu_max_khz(fexdarwin_cpu_max_khz);
 }

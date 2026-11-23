@@ -62,7 +62,7 @@ enum pf_kind {
     PK_WCHAN, PK_CGROUP,
     PK_HOSTPID,             /* LKD's own lkd_host_pid, not a Linux file */
     /* /sys dynamic */
-    PK_CPUN, PK_TOPODIR, PK_TOPO, PK_CACHEDIR, PK_CACHEIDX, PK_CACHEF,
+    PK_CPUN, PK_TOPODIR, PK_TOPO, PK_CACHEDIR, PK_CACHEIDX, PK_CACHEF, PK_FREQDIR, PK_FREQ,
     /* /dev */
     PK_DEVROOT, PK_DEVNODE, PK_DEVLNK,
     /* remote-only requests (famsvc) */
@@ -172,6 +172,7 @@ int64_t pf_boot_realtime_sec(void);          /* kern.boottime */
 int64_t pf_boot_ns(void);                    /* ns since boot (CLOCK_MONOTONIC_RAW, the guest BOOTTIME) */
 int pf_cpuid(uint32_t leaf, uint32_t sub, int cpu, struct lkd_cpuid_regs *r);
 int pf_cpuid_available(void);
+uint32_t pf_cpu_max_khz(void);               /* lkd_procfs_set_cpu_max_khz, 0 when unknown */
 int pf_inotify_present(void);
 /* fs_get_root, fs_host_io and fs_stat_from_host: declared in lkd_fs.h (request procfs-4 point 1). */
 
