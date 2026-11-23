@@ -827,8 +827,15 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)otherMouseDragged:(NSEvent *)e { [self motion:e]; }
 - (void)cursorUpdate:(NSEvent *)e { [g_cursor ?: NSCursor.arrowCursor set]; }
 - (void)scrollWheel:(NSEvent *)e {
-  struct wsd_ev_wheel w = {self.ww.windowId, e.hasPreciseScrollingDeltas | [self synth], (float)e.scrollingDeltaX,
-                           (float)e.scrollingDeltaY, [self evNs:e]};
+  uint32_t flags = e.hasPreciseScrollingDeltas ? WSD_WHEEL_PRECISE : 0;
+  if (flags) {
+    if (e.phase != NSEventPhaseNone) flags |= WSD_WHEEL_GESTURE;
+    if (e.phase & (NSEventPhaseBegan | NSEventPhaseMayBegin)) flags |= WSD_WHEEL_BEGIN;
+    if (e.phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) flags |= WSD_WHEEL_END;
+    if (e.momentumPhase != NSEventPhaseNone) flags |= WSD_WHEEL_MOMENTUM;
+  }
+  struct wsd_ev_wheel w = {self.ww.windowId, flags | [self synth], (float)e.scrollingDeltaX, (float)e.scrollingDeltaY,
+                           [self evNs:e]};
   [self.ww sendEvent:WSD_EV_WHEEL payload:&w len:sizeof(w) extra:nil];
 }
 @end
