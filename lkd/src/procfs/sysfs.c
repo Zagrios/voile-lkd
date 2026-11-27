@@ -38,11 +38,11 @@ static const struct pf_tent t_system[] = {
 };
 static const struct pf_tent t_devices[] = { { "system", 'd', 0755, 0, t_system }, { NULL } };
 static const struct pf_tent t_bus_cs_devices[] = {
-    { "clocksource0", 'l', 0777, 0, NULL, clocksource_present_fn, "../../../devices/system/clocksource/clocksource0" },
+    { "clocksource0", 'l', 0777, 0, NULL, NULL, "../../../devices/system/clocksource/clocksource0" },
     { NULL },
 };
 static const struct pf_tent t_bus_cs[] = { { "devices", 'd', 0755, 0, t_bus_cs_devices }, { NULL } };
-static const struct pf_tent t_bus[] = { { "clocksource", 'd', 0755, 0, t_bus_cs, clocksource_present_fn }, { NULL } };
+static const struct pf_tent t_bus[] = { { "clocksource", 'd', 0755, 0, t_bus_cs }, { NULL } };
 const struct pf_tent pf_sys_root[] = {
     { "bus", 'd', 0755, 0, t_bus, clocksource_present_fn }, { "devices", 'd', 0755, 0, t_devices }, { NULL },
 };
