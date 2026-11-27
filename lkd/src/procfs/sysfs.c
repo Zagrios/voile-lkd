@@ -2,12 +2,15 @@
  *
  * The CPU count is the host's (hw.logicalcpu). Cache geometry comes from the guest's CPUID leaf 4, so
  * /sys and the CPUID instruction agree; without an engine CPUID provider there is no cache/ directory.
- * Everything else under /sys is absent on purpose: /sys/devices/virtual (dmi/id), /sys/class, /sys/bus
- * (pci) answer ENOENT, which is what a kernel without those devices answers (the EAC probes accept it,
+ * cpuN/cpufreq gives the host's highest clock when the engine knows it (lkd_procfs_set_cpu_max_khz).
+ * /sys/bus holds only the clock source's link, where Wine's wineboot looks before it trusts the TSC.
+ * Everything else under /sys is absent on purpose: /sys/devices/virtual (dmi/id), /sys/class, /sys/bus/pci
+ * answer ENOENT, which is what a kernel without those devices answers (the EAC probes accept it,
  * reports/eac-probes-digest.md item 17).
  *
  * Linux references: drivers/base/cpu.c (online, possible, present, kernel_max), drivers/base/topology.c,
- * drivers/base/cacheinfo.c, arch/x86/kernel/cpu/cacheinfo.c, lib/vsprintf.c (cpumask format).
+ * drivers/base/cacheinfo.c, arch/x86/kernel/cpu/cacheinfo.c, lib/vsprintf.c (cpumask format),
+ * drivers/cpufreq/cpufreq.c (cpuinfo_max_freq, scaling_max_freq), kernel/time/clocksource.c.
  */
 #include "procfs_priv.h"
 
@@ -34,7 +37,15 @@ static const struct pf_tent t_system[] = {
     { "clocksource", 'd', 0755, 0, t_cs, clocksource_present_fn }, { "cpu", 'd', 0755, 1, t_cpu }, { NULL },
 };
 static const struct pf_tent t_devices[] = { { "system", 'd', 0755, 0, t_system }, { NULL } };
-const struct pf_tent pf_sys_root[] = { { "devices", 'd', 0755, 0, t_devices }, { NULL } };
+static const struct pf_tent t_bus_cs_devices[] = {
+    { "clocksource0", 'l', 0777, 0, NULL, NULL, "../../../devices/system/clocksource/clocksource0" },
+    { NULL },
+};
+static const struct pf_tent t_bus_cs[] = { { "devices", 'd', 0755, 0, t_bus_cs_devices }, { NULL } };
+static const struct pf_tent t_bus[] = { { "clocksource", 'd', 0755, 0, t_bus_cs }, { NULL } };
+const struct pf_tent pf_sys_root[] = {
+    { "bus", 'd', 0755, 0, t_bus, clocksource_present_fn }, { "devices", 'd', 0755, 0, t_devices }, { NULL },
+};
 
 /* Topology and cache file names; node.sub is the index. */
 enum { TF_CORE_ID, TF_PKG_ID, TF_DIE_ID, TF_CORE_SIB, TF_CORE_SIB_L, TF_THR_SIB, TF_THR_SIB_L, TF_PKG_CPUS,
@@ -48,6 +59,8 @@ static const char *const g_cache[CF_N] = {
     "id", "level", "type", "size", "coherency_line_size", "number_of_sets", "ways_of_associativity",
     "physical_line_partition", "shared_cpu_map", "shared_cpu_list",
 };
+static const char *const g_freq[] = { "cpuinfo_max_freq", "scaling_max_freq" };
+#define FREQ_N ((int)(sizeof g_freq / sizeof g_freq[0]))
 
 static void leaf(struct pf_node *n, int kind, int sub)
 {
@@ -88,6 +101,10 @@ int pf_sys_cpu_lookup(int dirkind, const char *name, struct pf_node *n)
         if (!strcmp(name, "online") && n->cpu > 0) { leaf(n, PK_TOPO, TF_ONLINE); return 0; }   /* cpu0 is not hotpluggable */
         if (!strcmp(name, "topology")) { dirn(n, PK_TOPODIR); return 0; }
         if (!strcmp(name, "cache") && pf_cache_count() > 0) { dirn(n, PK_CACHEDIR); return 0; }
+        if (!strcmp(name, "cpufreq") && pf_cpu_max_khz()) { dirn(n, PK_FREQDIR); return 0; }
+        return -LX_ENOENT;
+    case PK_FREQDIR:
+        for (int i = 0; i < FREQ_N; i++) if (!strcmp(name, g_freq[i])) { leaf(n, PK_FREQ, i); return 0; }
         return -LX_ENOENT;
     case PK_TOPODIR:
         for (int i = 0; i < TF_N; i++) if (!strcmp(name, g_topo[i])) { leaf(n, PK_TOPO, i); return 0; }
@@ -114,11 +131,12 @@ int pf_sys_cpu_readdir(const struct pf_node *dir, uint64_t i, char name[256], ui
     uint8_t t = LX_DT_REG;
     switch (dir->kind) {
     case PK_CPUN: {
-        const char *l[3]; int k = 0;
-        uint8_t ty[3];
+        const char *l[4]; int k = 0;
+        uint8_t ty[4];
         if (dir->cpu > 0) { l[k] = "online"; ty[k++] = LX_DT_REG; }
         l[k] = "topology"; ty[k++] = LX_DT_DIR;
         if (pf_cache_count() > 0) { l[k] = "cache"; ty[k++] = LX_DT_DIR; }
+        if (pf_cpu_max_khz()) { l[k] = "cpufreq"; ty[k++] = LX_DT_DIR; }
         if (i < (uint64_t)k) { nm = l[i]; t = ty[i]; }
         break;
     }
@@ -127,6 +145,7 @@ int pf_sys_cpu_readdir(const struct pf_node *dir, uint64_t i, char name[256], ui
         if (i < (uint64_t)pf_cache_count()) { snprintf(name, 256, "index%d", (int)i); *dt = LX_DT_DIR; return 1; }
         break;
     case PK_CACHEIDX: if (i < CF_N) nm = g_cache[i]; break;
+    case PK_FREQDIR: if (i < (uint64_t)FREQ_N) nm = g_freq[i]; break;
     }
     if (!nm) return 0;
     snprintf(name, 256, "%s", nm);
@@ -169,6 +188,12 @@ int pf_sys_generate(const struct pf_node *n, struct pbuf *b)
         case TF_THR_SIB_L: case TF_CORE_CPUS_L: put_map(b, self, ncpu, 1); return 0;
         }
         return -LX_EINVAL;
+    case PK_FREQ: {
+        uint32_t khz = pf_cpu_max_khz();
+        if (!khz) return -LX_ENOENT;
+        pb_printf(b, "%u\n", khz);
+        return 0;
+    }
     case PK_CACHEF: {
         struct lkd_cpuid_regs c;
         if (pf_cpuid(4, (uint32_t)n->cidx, n->cpu, &c) != 0 || (c.eax & 31) == 0) return -LX_ENOENT;

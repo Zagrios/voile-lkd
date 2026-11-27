@@ -34,6 +34,7 @@ add_executable(fexdarwin-run
   src/GuestMemory.cpp
   src/ElfLoader.cpp
   src/LinuxAbi.cpp
+  src/DarwinCpuClock.c
   src/DarwinHostFeatures.cpp
   src/DarwinSignalDelegator.cpp
   src/DarwinSyscallHandler.cpp
@@ -70,7 +71,7 @@ if (FEX_ASSERTIONS)
   target_compile_definitions(fexdarwin-run PRIVATE ASSERTIONS_ENABLED=1)
 endif()
 target_compile_options(fexdarwin-run PRIVATE -Wall -Wno-trigraphs -Wno-deprecated-enum-enum-conversion -fno-strict-aliasing -fno-exceptions)
-target_link_libraries(fexdarwin-run PRIVATE ${FEX_LIBS} pthread)
+target_link_libraries(fexdarwin-run PRIVATE ${FEX_LIBS} pthread "-framework IOKit")
 # LKD holds weak default hooks and strong module code: force_load keeps the strong definitions.
 target_link_options(fexdarwin-run PRIVATE -Wl,-force_load,${LKD_LIB})
 # -force_load hides the library from ninja: declare it so a rebuilt liblkd.a relinks the host.

@@ -318,7 +318,7 @@ static int step(lkd_task *t, const struct pf_node *dir, const char *name, struct
             return pf_sys_cpu_lookup(-1, name, n);
         return -LX_ENOENT;
     }
-    case PK_CPUN: case PK_TOPODIR: case PK_CACHEDIR: case PK_CACHEIDX: {
+    case PK_CPUN: case PK_TOPODIR: case PK_CACHEDIR: case PK_CACHEIDX: case PK_FREQDIR: {
         *n = *dir;
         return pf_sys_cpu_lookup(dir->kind, name, n);
     }
@@ -432,7 +432,7 @@ static int list_entry(lkd_task *t, const struct pf_node *dir, uint64_t i, char n
         }
         return 0;
     }
-    case PK_CPUN: case PK_TOPODIR: case PK_CACHEDIR: case PK_CACHEIDX:
+    case PK_CPUN: case PK_TOPODIR: case PK_CACHEDIR: case PK_CACHEIDX: case PK_FREQDIR:
         return pf_sys_cpu_readdir(dir, i, name, dt);
     case PK_DEVROOT: {
         uint64_t ino;

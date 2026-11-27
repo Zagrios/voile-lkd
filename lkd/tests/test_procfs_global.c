@@ -43,6 +43,9 @@ static int fake_cpuid(uint32_t leaf, uint32_t sub, int cpu, struct lkd_cpuid_reg
     return 0;
 }
 
+static uint32_t fake_max_khz(void) { return 4512000; }
+static uint32_t no_max_khz(void) { return 0; }
+
 LT_TEST(cpuinfo_from_cpuid)
 {
     lkd_procfs_set_cpuid(NULL);
@@ -84,6 +87,17 @@ LT_TEST(cpuinfo_from_cpuid)
     fake_cpuid(1, 0, 0, &r);
     LT_CHECK(((r.ecx >> 31) & 1) && strstr(s, " hypervisor") != NULL);   /* the CPUID hypervisor bit is shown, not hidden */
     free(s);
+    /* the host's highest clock, when the engine knows it; bogomips stays on the TSC */
+    lkd_procfs_set_cpu_max_khz(fake_max_khz);
+    s = slurp("/proc/cpuinfo", &len);
+    LT_CHECK(s && strstr(s, "stepping\t: 1\ncpu MHz\t\t: 4512.000\ncache size\t: 2048 KB\n") != NULL);
+    LT_CHECK(s && strstr(s, "bogomips\t: 3000.00\n") != NULL);
+    free(s);
+    lkd_procfs_set_cpu_max_khz(no_max_khz);
+    s = slurp("/proc/cpuinfo", &len);
+    LT_CHECK(s && strstr(s, "cpu MHz\t\t: 1500.000\n") != NULL);
+    free(s);
+    lkd_procfs_set_cpu_max_khz(NULL);
 }
 
 LT_TEST(meminfo_uptime_loadavg)
@@ -370,17 +384,50 @@ LT_TEST(sys_cpu_tree)
     s = slurp("/sys/devices/system/clocksource/clocksource0/current_clocksource", &len);
     LT_STREQ(s, "tsc\n");
     free(s);
+    /* and through the bus, where Wine's wineboot reads it */
+    s = slurp("/sys/bus/clocksource/devices/clocksource0/current_clocksource", &len);
+    LT_STREQ(s, "tsc\n");
+    free(s);
+    char lnk[128];
+    int64_t ln = rdlink("/sys/bus/clocksource/devices/clocksource0", lnk, sizeof lnk - 1);
+    LT_EQ(ln, 48);
+    if (ln > 0) { lnk[ln] = 0; LT_STREQ(lnk, "../../../devices/system/clocksource/clocksource0"); }
+    LT_EQ(glstat("/sys/bus/clocksource/devices/clocksource0", &st), 0);
+    LT_EQ(st.st_mode & LX_S_IFMT, LX_S_IFLNK);
+    /* cpufreq: only with the host's clock */
+    LT_ERRNO(gstat("/sys/devices/system/cpu/cpu2/cpufreq", &st), LX_ENOENT);
+    lkd_procfs_set_cpu_max_khz(no_max_khz);
+    LT_ERRNO(gstat("/sys/devices/system/cpu/cpu2/cpufreq", &st), LX_ENOENT);
+    lkd_procfs_set_cpu_max_khz(fake_max_khz);
+    LT_EQ(gstat("/sys/devices/system/cpu/cpu2/cpufreq", &st), 0);
+    LT_EQ(st.st_mode, LX_S_IFDIR | 0755);
+    cc = (int)listing("/sys/devices/system/cpu/cpu2", names, 160);
+    LT_CHECK(has(names, cc, "cpufreq") && has(names, cc, "cache") && has(names, cc, "topology") && has(names, cc, "online"));
+    cc = (int)listing("/sys/devices/system/cpu/cpu2/cpufreq", names, 160);
+    LT_EQ(cc, 4);                                                     /* ., .., cpuinfo_max_freq, scaling_max_freq */
+    s = slurp("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", &len);
+    LT_STREQ(s, "4512000\n");
+    free(s);
+    snprintf(want, sizeof want, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", n - 1);
+    s = slurp(want, &len);
+    LT_STREQ(s, "4512000\n");
+    free(s);
+    LT_ERRNO(gopen("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency", LX_O_RDONLY), LX_ENOENT);
+    lkd_procfs_set_cpu_max_khz(NULL);
     /* absent on purpose: DMI, class, bus/pci (the EAC probes accept ENOENT) */
     LT_ERRNO(gopen("/sys/devices/virtual/dmi/id/board_name", LX_O_RDONLY), LX_ENOENT);
     LT_ERRNO(gopen("/sys/devices/virtual/dmi/id/product_name", LX_O_RDONLY), LX_ENOENT);
     LT_ERRNO(gopen("/sys/devices/virtual/dmi/id/sys_vendor", LX_O_RDONLY), LX_ENOENT);
     LT_ERRNO(gstat("/sys/class", &st), LX_ENOENT);
     LT_ERRNO(gstat("/sys/bus/pci", &st), LX_ENOENT);
+    cc = (int)listing("/sys/bus", names, 160);
+    LT_EQ(cc, 3);                                                     /* ., .., clocksource */
     LT_ERRNO(gopen("/proc/bus/pci/devices", LX_O_RDONLY), LX_ENOENT);
     /* without a CPUID provider there is no cache description and no clock source claim */
     lkd_procfs_set_cpuid(NULL);
     LT_ERRNO(gstat("/sys/devices/system/cpu/cpu5/cache", &st), LX_ENOENT);
     LT_ERRNO(gopen("/sys/devices/system/clocksource/clocksource0/current_clocksource", LX_O_RDONLY), LX_ENOENT);
+    LT_ERRNO(gstat("/sys/bus", &st), LX_ENOENT);
     lkd_procfs_set_cpuid(fake_cpuid);
 }
 
