@@ -553,6 +553,7 @@ static void audio_clock_leave(WsdAudio *a) {
 static void set_display_mode(WsdClient *client, uint32_t width, uint32_t height);
 
 /* The cursor is hidden while the client asks for it, unless one of its windows stopped showing frames. */
+static void apply_cursor(void);
 static void sync_cursor(void) {
   BOOL hide = g_cursor_hide_wanted;
   for (WsdClient *c in g_clients)
@@ -560,6 +561,7 @@ static void sync_cursor(void) {
       if (w.stalled) hide = NO;
   if (hide && !g_cursor_hidden) { [NSCursor hide]; g_cursor_hidden = 1; }
   if (!hide && g_cursor_hidden) { [NSCursor unhide]; g_cursor_hidden = 0; }
+  apply_cursor();
 }
 
 /* The levels of wsd's windows on the active Space, set as Wine's Mac driver sets them (-[WineApplicationController
@@ -666,15 +668,47 @@ static NSCursor *system_cursor(uint32_t cursor) {
   return nil;
 }
 
-/* Shows g_cursor at once when the pointer is over the content of one of wsd's windows; anywhere else it comes with
- * the next -cursorUpdate:, when the pointer enters a window. */
-static void apply_cursor(void) {
-  if (!NSApp.active) return;
+static BOOL pointer_over_content(void) {
   NSPoint p = NSEvent.mouseLocation;
   NSWindow *w = [NSApp windowWithWindowNumber:[NSWindow windowNumberAtPoint:p belowWindowWithWindowNumber:0]];
-  if (![w isKindOfClass:WsdNSWindow.class] || !NSPointInRect([w convertPointFromScreen:p], w.contentView.frame))
-    return;
-  [g_cursor ?: NSCursor.arrowCursor set];
+  return [w isKindOfClass:WsdNSWindow.class] && NSPointInRect([w convertPointFromScreen:p], w.contentView.frame);
+}
+
+/* While wsd hides the cursor its windows show an empty one: macOS shows the cursor again by itself (Dock, menu bar,
+ * Mission Control, screenshots) with the hide still counted. */
+static NSCursor *shown_cursor(void) {
+  static NSCursor *empty;
+  if (!g_cursor_hidden) return g_cursor ?: NSCursor.arrowCursor;
+  if (!empty) {
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:1 pixelsHigh:1
+        bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace
+        bytesPerRow:4 bitsPerPixel:32];
+    memset(rep.bitmapData, 0, 4);
+    NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(1, 1)];
+    [image addRepresentation:rep];
+    empty = [[NSCursor alloc] initWithImage:image hotSpot:NSZeroPoint];
+  }
+  return empty;
+}
+
+/* Shows the cursor at once when the pointer is over the content of one of wsd's windows; anywhere else it comes with
+ * the next -cursorUpdate:, when the pointer enters a window. */
+static void apply_cursor(void) {
+  if (NSApp.active && pointer_over_content()) [shown_cursor() set];
+}
+
+/* CGCursorIsVisible() always answers 1, so redo the empty cursor and the hide (count kept at one) on moves over wsd's
+ * windows, on activation and on key; never over another app's window. The pointer is looked up at most every 100 ms:
+ * that asks the window server, and moves come up to a thousand times a second. */
+static void reassert_cursor_hide(void) {
+  static uint64_t last;
+  uint64_t now = now_ns();
+  if (!g_cursor_hidden || !NSApp.active || now - last < 100 * NSEC_PER_MSEC) return;
+  last = now;
+  if (!pointer_over_content()) return;
+  [shown_cursor() set];
+  [NSCursor unhide];
+  [NSCursor hide];
 }
 
 /* WSD_STYLE_* to an AppKit style mask: a titled window gets the macOS title bar and buttons; borderless otherwise
@@ -776,6 +810,7 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)otherMouseUp:(NSEvent *)e { [self button:e which:(uint32_t)e.buttonNumber down:NO]; }
 - (void)motion:(NSEvent *)e {
   WsdWindow *w = self.ww;
+  if (self.window.keyWindow) reassert_cursor_hide();
   CGPoint jump = CGPointZero; /* g_warp_jump, when this is the first move after the warp */
   if (e.timestamp > g_warp_time) {
     jump = g_warp_jump;
@@ -825,7 +860,7 @@ static CAMetalLayer *make_metal_layer(void) {
 - (void)mouseDragged:(NSEvent *)e { [self motion:e]; }
 - (void)rightMouseDragged:(NSEvent *)e { [self motion:e]; }
 - (void)otherMouseDragged:(NSEvent *)e { [self motion:e]; }
-- (void)cursorUpdate:(NSEvent *)e { [g_cursor ?: NSCursor.arrowCursor set]; }
+- (void)cursorUpdate:(NSEvent *)e { [shown_cursor() set]; }
 - (void)scrollWheel:(NSEvent *)e {
   uint32_t flags = e.hasPreciseScrollingDeltas ? WSD_WHEEL_PRECISE : 0;
   if (flags) {
@@ -936,6 +971,7 @@ static CAMetalLayer *make_metal_layer(void) {
   [self sendEvent:WSD_EV_FOCUS payload:&f len:sizeof(f) extra:nil];
   [self pressHeldModifiers];
   [self syncCapsLock:(NSEvent.modifierFlags & NSEventModifierFlagCapsLock) != 0];
+  reassert_cursor_hide();
 }
 - (void)windowDidResignKey:(NSNotification *)n {
   g_warp_jump = CGPointZero; /* the next moves are no longer this window's */
@@ -2379,6 +2415,7 @@ static BOOL session_ending(void) {
   g_focus_wanted = nil;
   if (w.shown && !((WsdNSWindow *)w.window).noActivate) [w orderInFront:YES];
   adjust_levels(YES);
+  reassert_cursor_hide();
 }
 @end
 
