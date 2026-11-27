@@ -70,7 +70,7 @@ rules that the header cannot express.
 | 103 | EV_BUTTON | `wsd_ev_button`: 0 left, 1 right, 2+ `buttonNumber`; position in window pixels, top-left origin |
 | 104 | EV_MOTION | `wsd_ev_motion` absolute, window pixels; bit 0 = clamped by the clip rectangle |
 | 105 | EV_RELATIVE | `wsd_ev_relative` raw deltas (relative mode only) |
-| 106 | EV_WHEEL | `wsd_ev_wheel`: `scrollingDeltaX/Y`, bit 0 of `precise` = trackpad-precise |
+| 106 | EV_WHEEL | `wsd_ev_wheel`: `scrollingDeltaX/Y`, points with `WSD_WHEEL_PRECISE`, else lines (one event per notch); `precise` holds the `WSD_WHEEL_*` flags (wsd_protocol.h) |
 | 107 | EV_FOCUS | `wsd_window_flag`: 1 key window gained, 0 lost |
 | 108 | EV_RESIZE | `wsd_ev_resize`: content size in pixels and the effective scale (see Render percent) |
 | 109 | EV_CLOSE | `wsd_window`: close button pressed; the window stays open until WINDOW_DESTROY |

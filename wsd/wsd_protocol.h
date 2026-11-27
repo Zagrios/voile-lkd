@@ -235,6 +235,11 @@ struct wsd_ev_button {
 struct wsd_ev_motion { uint32_t window_id; uint32_t flags; float x, y; uint64_t time_ns; };
 struct wsd_ev_relative { uint32_t window_id; uint32_t flags; float dx, dy; uint64_t time_ns; };
 struct wsd_ev_wheel { uint32_t window_id; uint32_t precise; float dx, dy; uint64_t time_ns; };
+/* wsd_ev_wheel.precise: WSD_WHEEL_PRECISE for points (trackpad, Magic Mouse), else lines, one event per notch, raised by
+ * acceleration. The other bits come only with PRECISE, as older clients take any bit for it: GESTURE (phase set), BEGIN
+ * (began or may begin), END (ended or cancelled), MOMENTUM (momentumPhase set). Bit 31 is WSD_KEY_SYNTHETIC. */
+enum { WSD_WHEEL_PRECISE = 1u << 0, WSD_WHEEL_GESTURE = 1u << 1, WSD_WHEEL_BEGIN = 1u << 2, WSD_WHEEL_END = 1u << 3,
+       WSD_WHEEL_MOMENTUM = 1u << 4 };
 /* backing_scale_x1000: the effective scale, see PROTOCOL.md (Render percent) */
 struct wsd_ev_resize { uint32_t window_id; uint32_t width_px, height_px; uint32_t backing_scale_x1000; };
 struct wsd_ev_presented {
