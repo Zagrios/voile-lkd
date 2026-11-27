@@ -698,12 +698,14 @@ static void apply_cursor(void) {
 }
 
 /* CGCursorIsVisible() always answers 1, so redo the empty cursor and the hide (count kept at one) on moves over wsd's
- * windows, at most every 100 ms, on activation and on key; never over another app's window. */
+ * windows, on activation and on key; never over another app's window. The pointer is looked up at most every 100 ms:
+ * that asks the window server, and moves come up to a thousand times a second. */
 static void reassert_cursor_hide(void) {
   static uint64_t last;
   uint64_t now = now_ns();
-  if (!g_cursor_hidden || !NSApp.active || now - last < 100 * NSEC_PER_MSEC || !pointer_over_content()) return;
+  if (!g_cursor_hidden || !NSApp.active || now - last < 100 * NSEC_PER_MSEC) return;
   last = now;
+  if (!pointer_over_content()) return;
   [shown_cursor() set];
   [NSCursor unhide];
   [NSCursor hide];
